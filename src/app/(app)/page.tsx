@@ -11,7 +11,7 @@ import { q, sget, snum, type SP, stageMeta } from "@/lib/view";
 export default async function Dashboard({ searchParams }: { searchParams: SP }) {
   const me = await requireUser();
   const sp = await searchParams;
-  const d = await getDashboard(me, { from: sget(sp, "from"), to: sget(sp, "to"), employee: snum(sp, "employee"), all: sget(sp, "all") === "1" });
+  const d = await getDashboard(me, { from: sget(sp, "from"), to: sget(sp, "to"), employee: snum(sp, "employee"), all: sget(sp, "all") === "1" || (!sget(sp, "from") && !sget(sp, "to")) });
   const users = await assignableUsers();
   const teamView = can(me, "reports.view") || isManager(me);
   const today = todayYmd();

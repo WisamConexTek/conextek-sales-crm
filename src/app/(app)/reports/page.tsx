@@ -20,7 +20,7 @@ export default async function Reports({ searchParams }: { searchParams: SP }) {
   const me = await requireUser();
   const sp = await searchParams;
   const g = (["day", "week", "month"].includes(sget(sp, "g") ?? "") ? sget(sp, "g") : "day") as Granularity;
-  if (sget(sp, "all") === "1" || sget(sp, "from")) return RangeView({ me, sp });
+  if (sget(sp, "all") === "1" || sget(sp, "from") || (!sget(sp, "g") && !sget(sp, "at"))) return RangeView({ me, sp });
   const r = await getReport(me, { granularity: g, at: sget(sp, "at"), employee: snum(sp, "employee") });
   const users = await assignableUsers();
   const team = can(me, "reports.view") || isManager(me);
@@ -131,7 +131,7 @@ function UnknownNotice({ c, canFix }: { c: { leads: number; activities: number }
 }
 
 async function RangeView({ me, sp }: { me: Awaited<ReturnType<typeof requireUser>>; sp: Record<string, string | string[] | undefined> }) {
-  const all = sget(sp, "all") === "1";
+  const all = sget(sp, "all") === "1" || !sget(sp, "from");
   const r = await getRangeReport(me, { all, from: sget(sp, "from"), to: sget(sp, "to"), employee: snum(sp, "employee") });
   const users = await assignableUsers();
   const team = can(me, "reports.view") || isManager(me);
@@ -142,7 +142,7 @@ async function RangeView({ me, sp }: { me: Awaited<ReturnType<typeof requireUser
   return (
     <div className="space-y-5">
       <PageHeader title={team ? "Reports" : "My numbers"} sub={`${title} · timezone ${r.tz} · counted from logged records only`}>
-        <Link href="/reports" className="btn">Daily / weekly / monthly</Link>
+        <Link href="/reports?g=day" className="btn">Daily / weekly / monthly</Link>
         {can(me, "reports.export") && <Link href={`/export/report${exp}`} className="btn">Export CSV</Link>}
       </PageHeader>
       <RangeForm team={team} users={users} employee={r.employee} from={r.from} to={r.to} />

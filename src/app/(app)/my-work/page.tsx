@@ -22,7 +22,7 @@ export default async function MyWork({ searchParams }: { searchParams: SP }) {
   const [tasks, lists, users, leads] = await Promise.all([
     listTasks(me, { assignee, includeDemo }),
     getLists(), assignableUsers(),
-    can(me, "tasks.assign") || can(me, "tasks.create_own") ? listLeads(me, { pageSize: 200, sort: "company", includeDemo }) : Promise.resolve({ rows: [] as Row[] }),
+    can(me, "tasks.assign") || can(me, "tasks.create_own") ? listLeads(me, { pageSize: 200, sort: "company", includeDemo, includeHistorical: false }) : Promise.resolve({ rows: [] as Row[] }),
   ]);
   const back = `/my-work${q({ employee: emp, done: showDone ? 1 : undefined })}`;
   const mineView = assignee === me.id;

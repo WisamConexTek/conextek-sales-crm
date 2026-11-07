@@ -302,8 +302,8 @@ export async function listLeads(actor: Actor, f: LeadFilters) {
   const args: InValue[] = [...s.args];
   if (!f.includeDemo) where.push("l.is_demo=0");
   if (f.testOnly) where.push("l.is_demo=1");
-  // Historical-only (suppressed) entities are not outreach prospects: hidden unless asked for.
-  if (!f.includeHistorical) where.push("l.historical_only=0");
+  // Historical-only entities are listed by default (they are real records); pass includeHistorical:false to hide them (e.g. task pickers).
+  if (f.includeHistorical === false) where.push("l.historical_only=0");
   if (f.q?.trim()) {
     const like = `%${f.q.trim().toLowerCase()}%`;
     where.push(`(lower(l.company) LIKE ? OR l.domain LIKE ? OR lower(l.country) LIKE ? OR EXISTS (SELECT 1 FROM contacts c WHERE c.lead_id=l.id AND (lower(c.name) LIKE ? OR lower(c.email) LIKE ?)))`);

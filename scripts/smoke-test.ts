@@ -397,7 +397,7 @@ async function main() {
   ok(hist.committed, "historical-only suppressed entity imported with its reply");
   const sLead = (await one("SELECT * FROM leads WHERE external_id='s-1'"))!;
   ok(sLead.historical_only === 1, "entity flagged historical-only");
-  ok(!(await L.listLeads(owner, {})).rows.some((r) => r.id === sLead.id) && (await L.listLeads(owner, { includeHistorical: true })).rows.some((r) => r.id === sLead.id), "historical-only entity is hidden from default lead lists");
+  ok((await L.listLeads(owner, {})).rows.some((r) => r.id === sLead.id) && !(await L.listLeads(owner, { includeHistorical: false })).rows.some((r) => r.id === sLead.id) && (await L.listLeads(owner, { q: sLead.company ?? "" })).rows.some((r) => r.id === sLead.id), "historical-only entity is listed and searchable by default, hideable on request");
   await throws(() => T.createTask(owner, { lead_id: sLead.id, assignee_id: sara.id, title: "chase them" }), 400, "no task can be assigned on a historical-only entity");
   ok((await R.getRangeReport(owner, { from: "2025-08-05", to: "2025-08-05" })).totals.replies === 1 && (await R.getRangeReport(owner, { from: "2025-08-01", to: "2025-08-31" })).totals.leads_added === 0, "its reply counts on its date; it is not a lead added");
   const reimport = await H.importHistory(owner, { label: "reimport", employee: null, commit: true,

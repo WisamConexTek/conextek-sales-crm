@@ -11,12 +11,12 @@ export default async function LeadsPage({ searchParams }: { searchParams: SP }) 
   const me = await requireUser();
   const sp = await searchParams;
   const f = { q: sget(sp, "q"), owner: snum(sp, "owner"), market: sget(sp, "market"), segment: sget(sp, "segment"), stage: sget(sp, "stage"), channel: sget(sp, "channel"), sort: sget(sp, "sort"), page: snum(sp, "page") ?? 1 };
-  const [res, lists, users] = await Promise.all([listLeads(me, { ...f, includeDemo: await demoOn(), includeHistorical: sget(sp, "hist") === "1" }), getLists(true), assignableUsers()]);
+  const [res, lists, users] = await Promise.all([listLeads(me, { ...f, includeDemo: await demoOn(), includeHistorical: sget(sp, "hide_hist") !== "1" }), getLists(true), assignableUsers()]);
   const label = (kind: string) => Object.fromEntries(lists[kind].map((i) => [i.key, i.label]));
   const stages = label("stage"), markets = label("market");
   const flag = Object.fromEntries(lists.stage.map((i) => [i.key, i.flag]));
   const pages = Math.max(1, Math.ceil(res.total / res.pageSize));
-  const keep = { q: f.q, owner: f.owner, market: f.market, segment: f.segment, stage: f.stage, channel: f.channel, sort: f.sort, hist: sget(sp, "hist") };
+  const keep = { q: f.q, owner: f.owner, market: f.market, segment: f.segment, stage: f.stage, channel: f.channel, sort: f.sort, hide_hist: sget(sp, "hide_hist") };
 
   return (
     <div>
@@ -32,7 +32,7 @@ export default async function LeadsPage({ searchParams }: { searchParams: SP }) 
           <div><label className="label">Employee</label>
             <select name="owner" defaultValue={f.owner ?? ""} className="input"><option value="">All</option>{users.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}</select></div>
         )}
-        <label className="flex items-center gap-2 pb-2 text-sm text-slate-600" title="Companies kept only for past replies, bounces and opt-outs. Never outreach prospects."><input type="checkbox" name="hist" value="1" defaultChecked={sget(sp, "hist") === "1"} /> Include historical-only</label>
+        <label className="flex items-center gap-2 pb-2 text-sm text-slate-600" title="Companies kept only for past replies, bounces and opt-outs. Never outreach prospects."><input type="checkbox" name="hide_hist" value="1" defaultChecked={sget(sp, "hide_hist") === "1"} /> Hide historical-only</label>
         <div><label className="label">Segment</label>
           <select name="segment" defaultValue={f.segment ?? ""} className="input"><option value="">All</option>{lists.segment.filter((i) => i.active).map((i) => <option key={i.key} value={i.key}>{i.label}</option>)}</select></div>
         <div><label className="label">Market</label>
