@@ -25,18 +25,39 @@ export function now(): string {
   return new Date().toISOString();
 }
 
-async function migrate(c: Client) {
+async function migrate(c: Client): Promise<number> {
   await c.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)");
   const r = await c.execute("SELECT COALESCE(MAX(version),0) AS v FROM schema_version");
   let current = Number(r.rows[0].v);
+  const from = current;
   while (current < MIGRATIONS.length) {
     await c.executeMultiple(MIGRATIONS[current]);
     current++;
     await c.execute({ sql: "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)", args: [current, now()] });
   }
+  return from;
 }
 
-async function bootstrap(c: Client) {
+/** Old generic defaults that were replaced by ConexTek categories. Retired (never deleted) when no lead uses them. */
+const RETIRE_V2: Record<string, string[]> = {
+  market: ["uk", "us"],
+  industry: ["technology", "retail", "real_estate", "healthcare", "finance"],
+  service: ["website", "crm", "marketing", "software"],
+};
+async function upgradeListsV2(c: Client) {
+  for (const [kind, items] of Object.entries(DEFAULT_LISTS)) {
+    for (const it of items)
+      await c.execute({
+        sql: "INSERT OR IGNORE INTO lists (kind,key,label,flag,position) VALUES (?,?,?,?,(SELECT COALESCE(MAX(position),-1)+1 FROM lists WHERE kind=?))",
+        args: [kind, it.key, it.label, it.flag ?? null, kind],
+      });
+  }
+  for (const [kind, keys] of Object.entries(RETIRE_V2))
+    for (const key of keys)
+      await c.execute({ sql: `UPDATE lists SET active=0 WHERE kind=? AND key=? AND NOT EXISTS (SELECT 1 FROM leads WHERE leads.${kind}=lists.key)`, args: [kind, key] });
+}
+
+async function bootstrap(c: Client, from: number) {
   const lists = await c.execute("SELECT COUNT(*) AS n FROM lists");
   if (Number(lists.rows[0].n) === 0) {
     const stmts: { sql: string; args: InValue[] }[] = [];
@@ -49,6 +70,8 @@ async function bootstrap(c: Client) {
       );
     }
     await c.batch(stmts, "write");
+  } else if (from >= 1 && from < 2) {
+    await upgradeListsV2(c);
   }
   const users = await c.execute("SELECT COUNT(*) AS n FROM users");
   if (Number(users.rows[0].n) === 0) {
@@ -76,8 +99,8 @@ export function ready(): Promise<Client> {
   const c = client();
   if (!g.__crmReady) {
     g.__crmReady = (async () => {
-      await migrate(c);
-      await bootstrap(c);
+      const from = await migrate(c);
+      await bootstrap(c, from);
     })().catch((e) => {
       g.__crmReady = undefined;
       throw e;

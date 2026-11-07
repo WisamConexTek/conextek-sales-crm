@@ -6,6 +6,7 @@ import { assignableUsers } from "@/lib/service/users";
 import { listLeads } from "@/lib/service/leads";
 import { updateTaskAction, submitTaskAction, completeTaskAction, createTaskAction } from "@/app/actions";
 import { Card, Empty, Field, Flash, LeadLink, Opts, PageHeader, StatusBadge, DemoBadge } from "@/components/ui";
+import { Ref } from "@/components/Ref";
 import { fmtDateTime, isOverdue } from "@/lib/format";
 import { demoOn, q, sget, snum, type SP } from "@/lib/view";
 import type { Row } from "@/lib/db";
@@ -43,7 +44,7 @@ export default async function MyWork({ searchParams }: { searchParams: SP }) {
       <div className={`rounded-md border p-3 ${t.status === "changes_requested" ? "border-red-200 bg-red-50/40" : "border-slate-200"}`}>
         <div className="flex flex-wrap items-start justify-between gap-2">
           <div>
-            <div className="font-medium text-slate-900">{t.title} {t.is_demo ? <DemoBadge /> : null}</div>
+            <div className="font-medium text-slate-900"><Link href={`/tasks/${t.id}`} className="text-slate-900">{t.title}</Link> {t.is_demo ? <DemoBadge /> : null} <Ref kind="Task" id={t.id} href={`/tasks/${t.id}`} /></div>
             <div className="mt-0.5 text-xs text-slate-500">
               {t.lead_id ? <LeadLink id={t.lead_id} company={t.company} /> : "No lead"}
               {" · "}{t.assignee_name}{t.task_type ? ` · ${typeLab[t.task_type] ?? t.task_type}` : ""} · assigned by {t.created_by_name}
@@ -54,8 +55,10 @@ export default async function MyWork({ searchParams }: { searchParams: SP }) {
         </div>
         {t.instructions && <div className="mt-2 rounded bg-slate-50 p-2 text-sm whitespace-pre-wrap"><span className="text-xs font-semibold uppercase tracking-wide text-slate-500">Instructions: </span>{t.instructions}</div>}
         {t.change_request && t.status === "changes_requested" && <div className="mt-2 rounded border border-red-200 bg-red-50 p-2 text-sm whitespace-pre-wrap"><span className="text-xs font-semibold uppercase tracking-wide text-red-700">Changes requested: </span>{t.change_request}</div>}
-        {t.progress_note && <p className="mt-2 text-sm text-slate-600"><span className="text-xs font-semibold uppercase tracking-wide text-slate-500">Progress: </span>{t.progress_note}</p>}
-        {t.status === "waiting_approval" && t.pending_approval_id && <p className="mt-2 text-xs text-slate-500">Submitted — <Link href="/approvals">view in Approvals</Link></p>}
+        {t.progress_note && <p className="mt-2 text-sm text-slate-600"><span className="text-xs font-semibold uppercase tracking-wide text-slate-500">Latest progress: </span>{t.progress_note}{t.note_count > 1 && <> · <Link href={`/tasks/${t.id}`}>all {t.note_count} notes</Link></>}</p>}
+        {t.completion_note && <p className="mt-2 text-sm text-slate-600"><span className="text-xs font-semibold uppercase tracking-wide text-slate-500">Completion note: </span>{t.completion_note}</p>}
+        {t.completed_at && <p className="mt-1 text-xs text-slate-500">Completed {fmtDateTime(t.completed_at)}{t.completed_by_name ? ` by ${t.completed_by_name}` : ""}</p>}
+        {t.status === "waiting_approval" && t.pending_approval_id && <p className="mt-2 text-xs text-slate-500">Submitted — <Link href={`/approvals?id=${t.pending_approval_id}`}>view Approval #{t.pending_approval_id}</Link></p>}
 
         {editable && (mine || can(me, "tasks.assign")) && (
           <div className="mt-3 flex flex-wrap gap-2 border-t border-slate-100 pt-3">

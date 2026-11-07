@@ -24,7 +24,8 @@ export default async function NewLead({ searchParams }: { searchParams: SP }) {
             <Field label="Website"><input name="website" className="input" placeholder="https://" /></Field>
             <Field label="Industry"><select name="industry" className="input"><Opts items={L("industry")} empty="—" /></select></Field>
             <Field label="Country"><input name="country" className="input" /></Field>
-            <Field label="Target market"><select name="market" className="input"><Opts items={L("market")} empty="—" /></select></Field>
+            <Field label="Target market (geography)"><select name="market" className="input"><Opts items={L("market")} empty="—" /></select></Field>
+            <Field label="Customer segment"><select name="segment" className="input"><Opts items={L("segment")} empty="—" /></select></Field>
             <Field label="Preferred language"><select name="language" className="input"><Opts items={L("language")} empty="—" /></select></Field>
             <Field label="Lead source"><select name="source" className="input"><Opts items={L("source")} empty="—" /></select></Field>
             <Field label="Source link"><input name="source_url" className="input" placeholder="https://" /></Field>
@@ -36,7 +37,6 @@ export default async function NewLead({ searchParams }: { searchParams: SP }) {
               {!can(me, "tasks.assign") && <input type="hidden" name="owner_id" value={me.id} />}
             </Field>
             <Field label="Stage"><select name="stage" className="input"><Opts items={L("stage")} /></select></Field>
-            <div />
             <Field label="Next action" className="md:col-span-2"><input name="next_action" className="input" /></Field>
             <Field label="Due"><input type="date" name="next_due_at" className="input" /></Field>
             <Field label="Notes" className="md:col-span-3"><textarea name="notes" className="input" /></Field>
@@ -54,6 +54,9 @@ export default async function NewLead({ searchParams }: { searchParams: SP }) {
         </Card>
         <div className="flex items-center gap-3">
           <button className="btn btn-primary">Create lead</button>
+          <label className="flex items-center gap-2 text-sm text-slate-700" title="Test leads are labelled TEST and never counted in the dashboard or reports">
+            <input type="checkbox" name="is_test" /> This is test data
+          </label>
           {dup && (
             <label className="flex items-center gap-2 text-sm text-amber-800">
               <input type="checkbox" name="allow_duplicate" /> This is a different lead — create it anyway

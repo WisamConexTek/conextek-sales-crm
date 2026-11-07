@@ -14,7 +14,7 @@ const DEMO_USERS = [
 /** Demo rows carry is_demo=1: hidden by default and NEVER counted in dashboard/reports. Demo users are disabled (cannot sign in). */
 export async function seedDemo(owner: Actor) {
   if (owner.role !== "owner") throw new HttpError(403, "Only the owner can load demo data.");
-  if (await one("SELECT id FROM leads WHERE is_demo=1 LIMIT 1")) throw new HttpError(400, "Demo data is already loaded.");
+  if (await one("SELECT id FROM leads WHERE is_demo=1 AND company LIKE '[DEMO]%' LIMIT 1")) throw new HttpError(400, "Demo data is already loaded.");
   const ids: number[] = [];
   for (const u of DEMO_USERS) {
     const ex = await one("SELECT id FROM users WHERE username=?", [u.username]);
@@ -30,12 +30,12 @@ export async function seedDemo(owner: Actor) {
   const day = 86400000, ago = (d: number) => new Date(Date.now() - d * day).toISOString();
 
   const mk = (company: string, country: string, market: string, owner_id: number, extra: Record<string, unknown> = {}) =>
-    createLead(owner, { company: `[DEMO] ${company}`, website: `https://demo-${company.toLowerCase().replace(/\W+/g, "")}.example`, country, market, industry: "technology", language: "en", source: "manual_research", owner_id, ...extra }, true);
+    createLead(owner, { company: `[DEMO] ${company}`, website: `https://demo-${company.toLowerCase().replace(/\W+/g, "")}.example`, country, market, industry: "automotive", language: "en", source: "manual_research", owner_id, ...extra }, true);
 
   const a = await mk("Northwind Traders", "UAE", "uae", out.id, { contacts: [{ name: "Layla Hassan", role: "Head of Sales", email: "layla@demo-northwind.example" }], next_action: "Send follow-up", next_due_at: new Date(Date.now() + 2 * day).toISOString() });
   const b = await mk("Contoso Retail", "Saudi Arabia", "ksa", out.id, { contacts: [{ name: "Omar Aziz", role: "COO", email: "omar@demo-contoso.example" }] });
-  const c = await mk("Fabrikam Labs", "United Kingdom", "uk", res.id, { next_action: "Finish company research", next_due_at: new Date(Date.now() - day).toISOString() });
-  await mk("Tailspin Toys", "United States", "us", res.id);
+  const c = await mk("Fabrikam Labs", "Qatar", "qatar", res.id, { next_action: "Finish company research", next_due_at: new Date(Date.now() - day).toISOString() });
+  await mk("Tailspin Toys", "China", "china", res.id);
 
   const ca = (await one("SELECT id FROM contacts WHERE lead_id=?", [a]))!.id, cb = (await one("SELECT id FROM contacts WHERE lead_id=?", [b]))!.id;
   await recordActivity(res, c, { type: "research", title: "Company profile", body: "Mid-size lab; no CRM visible on site.", occurred_at: ago(3) });
@@ -61,6 +61,7 @@ export async function seedDemo(owner: Actor) {
 export async function removeDemo(owner: Actor) {
   if (owner.role !== "owner") throw new HttpError(403, "Only the owner can remove demo data.");
   await tx([
+    { sql: "DELETE FROM task_notes WHERE task_id IN (SELECT id FROM tasks WHERE is_demo=1)" },
     { sql: "DELETE FROM approvals WHERE is_demo=1" },
     { sql: "DELETE FROM activities WHERE is_demo=1" },
     { sql: "DELETE FROM tasks WHERE is_demo=1" },

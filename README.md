@@ -34,14 +34,16 @@ Notes: Vercel's free *Hobby* plan is licensed for non-commercial use — for com
 
 ## Roles & rules (enforced server-side, same for UI and API)
 - **Owner (Wisam):** everything.
-- **Chief:** assigns work, reviews, adjusts employee permissions (never beyond his own, never approval/assign rights), resets employee passwords.
+- **Chief:** assigns work, reviews, adds employees, adjusts employee permissions (never beyond his own, never approval/assign/key rights), resets employee passwords, and issues/revokes **employee** API keys (permission `keys.manage`, which the Owner can switch off). Chief never sees or touches the Owner's or another Chief's keys.
+- **Test data:** any lead can be flagged test (checkbox on creation, `is_test` in the API, or "Mark as test data" on the lead page for Owner/Chief). The lead, its tasks, history and approvals stay visible but are labelled TEST and are never counted in the dashboard or reports.
+- **Lists:** Target markets (geography) and Customer segments (e.g. NC dealers, Chinese exporters) are separate lists, editable in Settings → Lists & stages.
 - **Employees:** only leads assigned to them (unless granted *view all*) and only the actions enabled on their account. Presets (Researcher, Outreach, Read-only) + per-person toggles.
 - Nobody can approve their own submission (Chief's own submissions go to Wisam). Items needing **Wisam** can only be decided by the Owner; which task types need Wisam is configured in Settings → Lists.
 - *Approved ≠ sent.* Approval changes task status only. A send is recorded separately (`message.record_sent` permission) and only for things that already happened (no future timestamps).
 - Stage changes require a short reason. Stages, markets, channels, industries, sources, services, languages and task types are editable; task statuses and activity outcomes are fixed.
 
 ## Reports — how numbers are counted
-Only logged records; demo data excluded. First-email and follow-up counts and bounce rates are separate. Bounce rate = sends in the period with a recorded bounce ÷ sends in the period. Meetings/Won/Lost = stage changes into a stage flagged that way. "Overdue" is a live snapshot.
+Only logged records; demo and test-flagged data excluded. First-email and follow-up counts and bounce rates are separate. Bounce rate = sends in the period with a recorded bounce ÷ sends in the period. Meetings/Won/Lost = stage changes into a stage flagged that way. "Overdue" is a live snapshot.
 
 ## API
 See the in-app **API guide** (curl examples), or `GET /api/v1/lists`. Auth: `Authorization: Bearer ctk_…`. Keys act with the owning employee's exact permissions and stop working if the employee is disabled.

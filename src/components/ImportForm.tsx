@@ -19,7 +19,7 @@ export function ImportForm({ action }: { action: (p: ImportState, fd: FormData) 
           if (f) { setName(f.name); setText(await f.text()); }
         }} />
         <p className="mt-2 text-xs text-slate-500">
-          Header row required. Recognised columns: company*, website, industry, country, market, language, source, source_url, owner (username), stage, service, notes, next_action, next_due, contact_name, contact_role, contact_email, contact_phone, linkedin. Max 500 rows per file.
+          Header row required. Recognised columns: company*, website, industry, country, market, segment, language, source, source_url, owner (username), stage, service, notes, next_action, next_due, contact_name, contact_role, contact_email, contact_phone, linkedin. Max 500 rows per file.
         </p>
         <button name="mode" value="preview" className="btn btn-primary mt-3" disabled={!text || pending}>{pending ? "Checking…" : "Check file"}</button>
         {name && <span className="ml-3 text-sm text-slate-500">{name}</span>}

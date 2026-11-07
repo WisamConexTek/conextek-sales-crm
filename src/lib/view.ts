@@ -3,7 +3,8 @@ import { all } from "./db";
 import { first } from "./format";
 
 export type SP = Promise<Record<string, string | string[] | undefined>>;
-export const demoOn = async () => (await cookies()).get("crm_demo")?.value === "1";
+/** Test records are shown (clearly labelled) unless the user chose to hide them. They never count in reports. */
+export const demoOn = async () => (await cookies()).get("crm_hide_test")?.value !== "1";
 export const sget = (sp: Record<string, string | string[] | undefined>, k: string) => first(sp[k]) || undefined;
 export const snum = (sp: Record<string, string | string[] | undefined>, k: string) => {
   const v = sget(sp, k);

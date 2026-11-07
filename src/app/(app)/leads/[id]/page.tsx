@@ -1,12 +1,13 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { requireUser, can } from "@/lib/auth";
+import { requireUser, can, isManager } from "@/lib/auth";
 import { getLead } from "@/lib/service/leads";
 import { getLists } from "@/lib/service/lists";
 import { assignableUsers } from "@/lib/service/users";
 import {
-  recordActivityAction, setStageAction, updateLeadAction, addContactAction, updateContactAction, createTaskAction,
+  recordActivityAction, setStageAction, updateLeadAction, addContactAction, updateContactAction, createTaskAction, setLeadTestAction,
 } from "@/app/actions";
+import { Ref } from "@/components/Ref";
 import { RecordForm } from "@/components/RecordForm";
 import { Badge, Card, DemoBadge, EmailStatusBadge, Field, Flash, Opts, OutcomeBadge, StageBadge, StatusBadge } from "@/components/ui";
 import { fmtDate, fmtDateTime, isOverdue, toLocalInput } from "@/lib/format";
@@ -52,6 +53,13 @@ export default async function LeadPage({ params, searchParams }: { params: Promi
       <div className="text-sm"><Link href="/leads">← Leads</Link></div>
       <Flash ok={sget(sp, "ok")} err={sget(sp, "err")} />
 
+      {lead.is_demo ? (
+        <div className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+          <b>TEST DATA.</b> This lead and its tasks, history and approvals are excluded from the dashboard and all report totals.
+          {isManager(me) && <form action={setLeadTestAction} className="ml-3 inline"><input type="hidden" name="_back" value={back} /><input type="hidden" name="id" value={leadId} /><input type="hidden" name="is_test" value="0" /><button className="btn btn-sm">Mark as real data</button></form>}
+        </div>
+      ) : null}
+
       {/* ---- Summary ---- */}
       <Card>
         <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
@@ -78,6 +86,7 @@ export default async function LeadPage({ params, searchParams }: { params: Promi
           <Row k="Industry" v={lab("industry")[lead.industry] ?? lead.industry} />
           <Row k="Country" v={lead.country} />
           <Row k="Target market" v={lab("market")[lead.market] ?? lead.market} />
+          <Row k="Customer segment" v={lab("segment")[lead.segment] ?? lead.segment} />
           <Row k="Preferred language" v={lab("language")[lead.language] ?? lead.language} />
           <Row k="Lead source" v={<>{lab("source")[lead.source] ?? lead.source}{lead.source_url && <> · {ext(lead.source_url)}</>}</>} />
           <Row k="Service of interest" v={lab("service")[lead.service] ?? lead.service} />
@@ -96,7 +105,8 @@ export default async function LeadPage({ params, searchParams }: { params: Promi
               <Field label="Website"><input name="website" defaultValue={lead.website ?? ""} className="input" /></Field>
               <Field label="Country"><input name="country" defaultValue={lead.country ?? ""} className="input" /></Field>
               <Field label="Industry"><select name="industry" defaultValue={lead.industry ?? ""} className="input"><Opts items={withCurrent("industry", lead.industry)} empty="—" /></select></Field>
-              <Field label="Target market"><select name="market" defaultValue={lead.market ?? ""} className="input"><Opts items={withCurrent("market", lead.market)} empty="—" /></select></Field>
+              <Field label="Target market (geography)"><select name="market" defaultValue={lead.market ?? ""} className="input"><Opts items={withCurrent("market", lead.market)} empty="—" /></select></Field>
+              <Field label="Customer segment"><select name="segment" defaultValue={lead.segment ?? ""} className="input"><Opts items={withCurrent("segment", lead.segment)} empty="—" /></select></Field>
               <Field label="Preferred language"><select name="language" defaultValue={lead.language ?? ""} className="input"><Opts items={withCurrent("language", lead.language)} empty="—" /></select></Field>
               <Field label="Lead source"><select name="source" defaultValue={lead.source ?? ""} className="input"><Opts items={withCurrent("source", lead.source)} empty="—" /></select></Field>
               <Field label="Source link"><input name="source_url" defaultValue={lead.source_url ?? ""} className="input" /></Field>
@@ -110,6 +120,13 @@ export default async function LeadPage({ params, searchParams }: { params: Promi
               <div className="md:col-span-3"><button className="btn btn-primary">Save changes</button></div>
             </form>
           </details>
+        )}
+        {isManager(me) && !lead.is_demo && (
+          <form action={setLeadTestAction} className="mt-3 flex flex-wrap items-center gap-3 border-t border-slate-100 pt-3 text-sm text-slate-600">
+            <input type="hidden" name="_back" value={back} /><input type="hidden" name="id" value={leadId} /><input type="hidden" name="is_test" value="1" />
+            <button className="btn btn-sm">Mark as test data</button>
+            <span className="text-xs">Use for leads created while testing. It stays visible but is labelled TEST and removed from dashboard and report totals (tasks, history and approvals included).</span>
+          </form>
         )}
       </Card>
 
@@ -162,7 +179,7 @@ export default async function LeadPage({ params, searchParams }: { params: Promi
           <ul className="mb-3 divide-y divide-slate-100">
             {tasks.map((t) => (
               <li key={t.id} className="flex flex-wrap items-center justify-between gap-2 py-2">
-                <div><span className="font-medium">{t.title}</span><div className="text-xs text-slate-500">{t.assignee_name}{t.due_at ? ` · due ${fmtDate(t.due_at)}` : ""}</div></div>
+                <div><Link href={`/tasks/${t.id}`} className="font-medium">{t.title}</Link> <Ref kind="Task" id={t.id} href={`/tasks/${t.id}`} /><div className="text-xs text-slate-500">{t.assignee_name}{t.due_at ? ` · due ${fmtDate(t.due_at)}` : ""}{t.completed_at ? ` · completed ${fmtDateTime(t.completed_at)}${t.completed_by_name ? ` by ${t.completed_by_name}` : ""}` : ""}</div></div>
                 <StatusBadge status={t.status} approvalFrom={t.approval_from} />
               </li>
             ))}
@@ -214,6 +231,8 @@ export default async function LeadPage({ params, searchParams }: { params: Promi
                   {h.contact_name && <span>Contact: {h.contact_name}</span>}
                   {h.channel && <span>Channel: {lab("channel")[h.channel] ?? h.channel}</span>}
                   {h.ref && <span>Ref: <code className="rounded bg-slate-100 px-1">{h.ref}</code></span>}
+                  {h.task_id && <Link href={`/tasks/${h.task_id}`}>Task #{h.task_id}</Link>}
+                  {h.approval_id && <Link href={`/approvals?id=${h.approval_id}`}>Approval #{h.approval_id}</Link>}
                   {h.url && <a href={h.url} target="_blank" rel="noopener noreferrer">Open link ↗</a>}
                 </div>
               </li>

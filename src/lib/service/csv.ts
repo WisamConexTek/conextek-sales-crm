@@ -13,6 +13,7 @@ const ALIASES: Record<string, string[]> = {
   industry: ["industry", "sector"],
   country: ["country"],
   market: ["market", "target_market"],
+  segment: ["segment", "customer_segment"],
   language: ["language", "preferred_language"],
   source: ["source", "lead_source"],
   source_url: ["source_url", "source_link", "source_URL"],
@@ -58,7 +59,7 @@ export async function prepareImport(actor: Actor, text: string): Promise<{ rows:
   const known = new Set(Object.keys(ALIASES).flatMap((k) => ALIASES[k].map(norm)));
   const unknownColumns = [...fields].filter((f) => !known.has(f));
 
-  const R = { stage: await resolver("stage"), market: await resolver("market"), industry: await resolver("industry"), language: await resolver("language"), source: await resolver("source"), service: await resolver("service") };
+  const R = { stage: await resolver("stage"), market: await resolver("market"), segment: await resolver("segment"), industry: await resolver("industry"), language: await resolver("language"), source: await resolver("source"), service: await resolver("service") };
   const users = await all("SELECT id,username,name FROM users WHERE active=1");
   const seenDomains = new Set<string>();
   const seenCompanies = new Set<string>();
@@ -88,6 +89,7 @@ export async function prepareImport(actor: Actor, text: string): Promise<{ rows:
     const stage = R.stage(stageVal);
     if (stageVal && !stage) (messages.push(`stage "${stageVal}" unknown — set to the first stage`), extra.push(`stage: ${stageVal}`));
     const market = pick("market", "market");
+    const segment = pick("segment", "segment");
     const industry = pick("industry", "industry");
     const language = pick("language", "language");
     const service = pick("service", "service");
@@ -108,7 +110,7 @@ export async function prepareImport(actor: Actor, text: string): Promise<{ rows:
     const notes = [get("notes"), extra.length ? `[import] ${extra.join("; ")}` : ""].filter(Boolean).join("\n");
 
     const data = {
-      company, website: get("website"), industry, country: get("country"), market, language, source, source_url: get("source_url"), owner_id,
+      company, website: get("website"), industry, country: get("country"), market, segment, language, source, source_url: get("source_url"), owner_id,
       stage: stage ?? undefined, service, notes, next_action: get("next_action"), next_due_at: get("next_due_at"), contacts: contact,
     };
 
@@ -159,7 +161,7 @@ export async function leadsCsv(actor: Actor, filters: LeadFilters): Promise<stri
   for (const l of rows) {
     const c = await one("SELECT * FROM contacts WHERE lead_id=? ORDER BY is_primary DESC,id LIMIT 1", [l.id]);
     out.push({
-      company: l.company, website: l.website, industry: l.industry, country: l.country, market: l.market, language: l.language,
+      company: l.company, website: l.website, industry: l.industry, country: l.country, market: l.market, segment: l.segment, language: l.language,
       source: l.source, source_url: l.source_url, owner: l.owner_name, stage: stage[l.stage] ?? l.stage, service: l.service,
       last_activity: l.last_activity_at, next_action: l.next_action, next_due: l.next_due_at, notes: l.notes,
       contact_name: c?.name, contact_role: c?.role, contact_email: c?.email, contact_phone: c?.phone, contact_linkedin: c?.linkedin,

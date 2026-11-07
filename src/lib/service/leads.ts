@@ -57,6 +57,7 @@ const leadFields = {
   industry: optText(80),
   country: optText(80),
   market: optText(80),
+  segment: optText(80),
   language: optText(40),
   source: optText(80),
   source_url: optText(500),
@@ -71,11 +72,13 @@ const createSchema = z.object({
   stage: z.string().optional(),
   contacts: z.array(contactSchema).optional(),
   allow_duplicate: optBool.optional(),
+  is_test: optBool.optional(),
 });
 
-async function checkLists(d: { industry?: string | null; market?: string | null; language?: string | null; source?: string | null; service?: string | null; stage?: string }) {
+async function checkLists(d: { industry?: string | null; market?: string | null; segment?: string | null; language?: string | null; source?: string | null; service?: string | null; stage?: string }) {
   await assertListKey("industry", d.industry, "industry");
   await assertListKey("market", d.market, "market");
+  await assertListKey("segment", d.segment, "segment");
   await assertListKey("language", d.language, "language");
   await assertListKey("source", d.source, "source");
   await assertListKey("service", d.service, "service");
@@ -98,7 +101,8 @@ export async function createLead(actor: Actor, input: unknown, isDemo = false) {
   if (!ownerId && !isManager(actor)) ownerId = actor.id;
   if (!isDemo) await assertAssignable(ownerId);
 
-  if (!isDemo && !d.allow_duplicate) {
+  const isTest = isDemo || !!d.is_test; // test records are labelled and never counted in reports
+  if (!isDemo && !isTest && !d.allow_duplicate) {
     const dups = await findDuplicates({ company: d.company, website: d.website, emails: d.contacts?.map((c) => c.email ?? "") });
     if (dups.length) {
       const e = new HttpError(409, `Possible duplicate: ${dups.map((x) => `${x.company} (#${x.id}, ${x.reason})`).join("; ")}. Resend with allow_duplicate=true if this is a different lead.`);
@@ -109,10 +113,10 @@ export async function createLead(actor: Actor, input: unknown, isDemo = false) {
   const stage = d.stage || ((await one("SELECT key FROM lists WHERE kind='stage' AND active=1 ORDER BY position,id LIMIT 1"))!.key as string);
   const t = now();
   const r = await run(
-    `INSERT INTO leads (company,website,domain,industry,country,market,language,source,source_url,owner_id,stage,service,notes,next_action,next_due_at,is_demo,created_by,created_at,updated_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-    [d.company, d.website, domainOf(d.website), d.industry, d.country, d.market, d.language, d.source, d.source_url, ownerId, stage, d.service, d.notes,
-      d.next_action, d.next_due_at, isDemo ? 1 : 0, actor.id, t, t],
+    `INSERT INTO leads (company,website,domain,industry,country,market,segment,language,source,source_url,owner_id,stage,service,notes,next_action,next_due_at,is_demo,created_by,created_at,updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [d.company, d.website, domainOf(d.website), d.industry, d.country, d.market, d.segment, d.language, d.source, d.source_url, ownerId, stage, d.service, d.notes,
+      d.next_action, d.next_due_at, isTest ? 1 : 0, actor.id, t, t],
   );
   for (const [i, c] of (d.contacts ?? []).entries()) {
     await run(
@@ -120,7 +124,7 @@ export async function createLead(actor: Actor, input: unknown, isDemo = false) {
       [r.id, c.name, c.role, c.email, c.phone, c.linkedin, c.other_social, c.notes, i === 0 ? 1 : 0, t, t],
     );
   }
-  await audit(actor, "create_lead", "lead", r.id, { company: d.company, owner_id: ownerId });
+  await audit(actor, "create_lead", "lead", r.id, { company: d.company, owner_id: ownerId, ...(isTest ? { test: true } : {}) });
   return r.id;
 }
 
@@ -154,6 +158,26 @@ export async function updateLead(actor: Actor, leadId: number, input: Record<str
   if (!sets.length) return;
   await run(`UPDATE leads SET ${sets.join(",")}, updated_at=? WHERE id=?`, [...args, now(), leadId]);
   await audit(actor, "update_lead", "lead", leadId, changes);
+}
+
+/* ---------- test data flag ---------- */
+/**
+ * Mark a lead (and everything recorded on it: tasks, history, approvals) as test data, or back to real.
+ * Test records stay visible and labelled, but are never counted in the dashboard or reports. Owner/Chief only.
+ */
+export async function setLeadTest(actor: Actor, leadId: number, isTest: boolean) {
+  if (!isManager(actor)) throw new HttpError(403, "Only the owner or Chief can mark records as test data.");
+  const lead = await one("SELECT * FROM leads WHERE id=?", [leadId]);
+  if (!lead) throw new HttpError(404, "Lead not found.");
+  const v = isTest ? 1 : 0;
+  if (lead.is_demo === v) return;
+  await tx([
+    { sql: "UPDATE leads SET is_demo=?, updated_at=? WHERE id=?", args: [v, now(), leadId] },
+    { sql: "UPDATE tasks SET is_demo=? WHERE lead_id=?", args: [v, leadId] },
+    { sql: "UPDATE activities SET is_demo=? WHERE lead_id=?", args: [v, leadId] },
+    { sql: "UPDATE approvals SET is_demo=? WHERE lead_id=?", args: [v, leadId] },
+  ]);
+  await audit(actor, isTest ? "mark_lead_test" : "mark_lead_real", "lead", leadId, { company: lead.company });
 }
 
 /* ---------- stage ---------- */
@@ -216,7 +240,7 @@ export async function updateContact(actor: Actor, contactId: number, input: Reco
 
 /* ---------- reads ---------- */
 export type LeadFilters = {
-  q?: string; owner?: number; market?: string; stage?: string; channel?: string;
+  q?: string; owner?: number; market?: string; segment?: string; stage?: string; channel?: string; testOnly?: boolean;
   includeDemo?: boolean; page?: number; pageSize?: number; sort?: string;
 };
 
@@ -225,6 +249,7 @@ export async function listLeads(actor: Actor, f: LeadFilters) {
   const where = [s.sql];
   const args: InValue[] = [...s.args];
   if (!f.includeDemo) where.push("l.is_demo=0");
+  if (f.testOnly) where.push("l.is_demo=1");
   if (f.q?.trim()) {
     const like = `%${f.q.trim().toLowerCase()}%`;
     where.push(`(lower(l.company) LIKE ? OR l.domain LIKE ? OR lower(l.country) LIKE ? OR EXISTS (SELECT 1 FROM contacts c WHERE c.lead_id=l.id AND (lower(c.name) LIKE ? OR lower(c.email) LIKE ?)))`);
@@ -232,6 +257,7 @@ export async function listLeads(actor: Actor, f: LeadFilters) {
   }
   if (f.owner) (where.push("l.owner_id=?"), args.push(f.owner));
   if (f.market) (where.push("l.market=?"), args.push(f.market));
+  if (f.segment) (where.push("l.segment=?"), args.push(f.segment));
   if (f.stage) (where.push("l.stage=?"), args.push(f.stage));
   if (f.channel) (where.push("EXISTS (SELECT 1 FROM activities a WHERE a.lead_id=l.id AND a.channel=?)"), args.push(f.channel));
   const W = where.join(" AND ");
@@ -265,7 +291,7 @@ export async function getLead(actor: Actor, id: number) {
     [id],
   );
   const tasks = await all(
-    `SELECT t.*, u.name AS assignee_name FROM tasks t JOIN users u ON u.id=t.assignee_id WHERE t.lead_id=? ORDER BY t.created_at DESC`,
+    `SELECT t.*, u.name AS assignee_name, cu.name AS completed_by_name FROM tasks t JOIN users u ON u.id=t.assignee_id LEFT JOIN users cu ON cu.id=t.completed_by WHERE t.lead_id=? ORDER BY t.created_at DESC`,
     [id],
   );
   return { lead, contacts, history, tasks };

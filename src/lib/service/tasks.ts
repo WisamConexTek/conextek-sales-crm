@@ -3,7 +3,7 @@ import type { InValue } from "@libsql/client";
 import { all, one, run, now, tx, type Row } from "../db";
 import { HttpError, can, requirePerm, isManager, type Actor } from "../auth";
 import { OPEN_TASK_STATUSES, TASK_STATUSES, type TaskStatus } from "../constants";
-import { audit, parse, optText, optInt, optDate, reqText, assertListKey } from "./common";
+import { audit, parse, optText, optInt, optDate, optBool, reqText, assertListKey } from "./common";
 import { assertLeadAccess } from "./leads";
 
 /* ================= tasks ================= */
@@ -22,6 +22,7 @@ const createSchema = z.object({
   task_type: optText(60),
   due_at: optDate,
   approval: z.enum(["default", "chief", "wisam", "none"]).optional(),
+  is_test: optBool.optional(),
 });
 
 export async function createTask(actor: Actor, input: unknown, isDemo = false) {
@@ -33,6 +34,8 @@ export async function createTask(actor: Actor, input: unknown, isDemo = false) {
   let leadRow: Row | null = null;
   if (d.lead_id) leadRow = await assertLeadAccess(actor, d.lead_id);
   await assertListKey("task_type", d.task_type, "task_type");
+  if (d.is_test && leadRow && !leadRow.is_demo) throw new HttpError(400, "is_test: a task on a real lead is real work. Mark the lead as test data instead.");
+  const isTest = isDemo || !!d.is_test || !!leadRow?.is_demo;
 
   const base = await defaultApprover(d.task_type);
   const choice = d.approval ?? "default";
@@ -48,7 +51,7 @@ export async function createTask(actor: Actor, input: unknown, isDemo = false) {
   const r = await run(
     `INSERT INTO tasks (lead_id,assignee_id,created_by,title,instructions,task_type,approval_from,due_at,is_demo,created_at,updated_at)
      VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-    [d.lead_id, assignee, actor.id, d.title, d.instructions, d.task_type, approvalFrom, d.due_at, isDemo || leadRow?.is_demo ? 1 : 0, t, t],
+    [d.lead_id, assignee, actor.id, d.title, d.instructions, d.task_type, approvalFrom, d.due_at, isTest ? 1 : 0, t, t],
   );
   if (d.lead_id)
     await run(
@@ -74,10 +77,11 @@ export async function listTasks(actor: Actor, f: TaskFilters = {}): Promise<Row[
   if (f.overdue) (where.push(`t.due_at < ? AND t.status IN ('todo','in_progress','changes_requested','approved')`), args.push(now()));
   if (!f.includeDemo) where.push("t.is_demo=0");
   return all(
-    `SELECT t.*, l.company, u.name AS assignee_name, cb.name AS created_by_name,
-            (SELECT a.id FROM approvals a WHERE a.task_id=t.id AND a.status='pending' ORDER BY a.id DESC LIMIT 1) AS pending_approval_id
+    `SELECT t.*, l.company, u.name AS assignee_name, cb.name AS created_by_name, cu.name AS completed_by_name,
+            (SELECT a.id FROM approvals a WHERE a.task_id=t.id AND a.status='pending' ORDER BY a.id DESC LIMIT 1) AS pending_approval_id,
+            (SELECT COUNT(*) FROM task_notes n WHERE n.task_id=t.id) AS note_count
      FROM tasks t
-     JOIN users u ON u.id=t.assignee_id JOIN users cb ON cb.id=t.created_by LEFT JOIN leads l ON l.id=t.lead_id
+     JOIN users u ON u.id=t.assignee_id JOIN users cb ON cb.id=t.created_by LEFT JOIN users cu ON cu.id=t.completed_by LEFT JOIN leads l ON l.id=t.lead_id
      ${where.length ? "WHERE " + where.join(" AND ") : ""}
      ORDER BY (t.due_at IS NULL), t.due_at ASC, t.id DESC LIMIT ?`,
     [...args, f.limit ?? 300],
@@ -86,12 +90,46 @@ export async function listTasks(actor: Actor, f: TaskFilters = {}): Promise<Row[
 
 export async function getTask(actor: Actor, id: number): Promise<Row> {
   const t = await one(
-    `SELECT t.*, l.company, u.name AS assignee_name, cb.name AS created_by_name FROM tasks t
-     JOIN users u ON u.id=t.assignee_id JOIN users cb ON cb.id=t.created_by LEFT JOIN leads l ON l.id=t.lead_id WHERE t.id=?`,
+    `SELECT t.*, l.company, u.name AS assignee_name, cb.name AS created_by_name, cu.name AS completed_by_name FROM tasks t
+     JOIN users u ON u.id=t.assignee_id JOIN users cb ON cb.id=t.created_by LEFT JOIN users cu ON cu.id=t.completed_by LEFT JOIN leads l ON l.id=t.lead_id WHERE t.id=?`,
     [id],
   );
   if (!t || (t.assignee_id !== actor.id && !can(actor, "tasks.view_all") && !isManager(actor))) throw new HttpError(404, "Task not found.");
   return t;
+}
+
+/** One task with its full note history, approvals and a single chronological timeline (who did what, when). */
+export type TaskEvent = { at: string; event: string; actor: string | null; text: string | null; approval_id?: number };
+export type TaskDetail = Row & { notes: Row[]; approvals: Row[]; timeline: TaskEvent[] };
+export async function getTaskDetail(actor: Actor, id: number): Promise<TaskDetail> {
+  const task = await getTask(actor, id);
+  const notes = await all(
+    `SELECT n.id, n.kind, n.body, n.created_at, n.actor_id, u.name AS actor_name FROM task_notes n LEFT JOIN users u ON u.id=n.actor_id WHERE n.task_id=? ORDER BY n.id`,
+    [id],
+  );
+  const approvals = await all(
+    `SELECT a.id, a.kind, a.title, a.content, a.requires, a.status, a.comment,
+            a.submitted_by, s.name AS submitted_by_name, a.created_at AS submitted_at,
+            a.decided_by, d.name AS decided_by_name, a.decided_at
+     FROM approvals a JOIN users s ON s.id=a.submitted_by LEFT JOIN users d ON d.id=a.decided_by WHERE a.task_id=? ORDER BY a.id`,
+    [id],
+  );
+  const timeline: TaskEvent[] = [{ at: task.created_at, event: "task_created", actor: task.created_by_name, text: task.assignee_id === task.created_by ? "Task created" : `Assigned to ${task.assignee_name}` }];
+  for (const n of notes) if (n.kind !== "completion") timeline.push({ at: n.created_at, event: n.kind === "completion" ? "completion_note" : "progress_note", actor: n.actor_name, text: n.body });
+  for (const a of approvals) {
+    timeline.push({ at: a.submitted_at, event: "submitted", actor: a.submitted_by_name, text: `${a.kind}: ${a.title}`, approval_id: a.id });
+    if (a.decided_at) timeline.push({ at: a.decided_at, event: a.status, actor: a.decided_by_name, text: a.comment, approval_id: a.id });
+  }
+  if (task.completed_at) timeline.push({ at: task.completed_at, event: "completed", actor: task.completed_by_name, text: task.completion_note });
+  timeline.sort((x, y) => (x.at < y.at ? -1 : x.at > y.at ? 1 : 0));
+  return Object.assign(task, { notes, approvals, timeline });
+}
+
+/** One approval, for the same people who can see it in the queue. */
+export async function getApproval(actor: Actor, id: number): Promise<Row> {
+  const [a] = await listApprovals(actor, { includeDemo: true, id });
+  if (!a) throw new HttpError(404, "Approval not found.");
+  return a;
 }
 
 const updateSchema = z.object({
@@ -148,6 +186,8 @@ export async function updateTask(actor: Actor, id: number, input: Record<string,
       sql: "UPDATE approvals SET status='rejected', decided_by=?, decided_at=?, comment='Task was cancelled' WHERE task_id=? AND status='pending'",
       args: [actor.id, now(), id],
     });
+  if (d.progress_note && d.progress_note !== t.progress_note)
+    stmts.push({ sql: "INSERT INTO task_notes (task_id,kind,body,actor_id,created_at) VALUES (?,?,?,?,?)", args: [id, "progress", d.progress_note, actor.id, now()] });
   await tx(stmts);
   if (t.lead_id && d.status === "cancelled")
     await run(`INSERT INTO activities (lead_id,task_id,type,title,actor_id,occurred_at,created_at,is_demo) VALUES (?,?,?,?,?,?,?,?)`,
@@ -163,7 +203,13 @@ export async function completeTask(actor: Actor, id: number, note?: string | nul
   if (t.approval_from && t.status !== "approved")
     throw new HttpError(400, t.status === "waiting_approval" ? `Waiting for ${t.approval_from === "wisam" ? "Wisam" : "Chief"} to approve.` : "This task needs approval first — submit it for approval.");
   const ts = now();
-  await run("UPDATE tasks SET status='completed', completed_at=?, progress_note=COALESCE(?,progress_note), updated_at=? WHERE id=?", [ts, note?.trim() || null, ts, id]);
+  const cn = note?.trim() || null;
+  // The completion note is stored on its own: earlier progress notes are never overwritten.
+  const stmts: { sql: string; args: InValue[] }[] = [
+    { sql: "UPDATE tasks SET status='completed', completed_at=?, completed_by=?, completion_note=?, updated_at=? WHERE id=?", args: [ts, actor.id, cn, ts, id] },
+  ];
+  if (cn) stmts.push({ sql: "INSERT INTO task_notes (task_id,kind,body,actor_id,created_at) VALUES (?,?,?,?,?)", args: [id, "completion", cn, actor.id, ts] });
+  await tx(stmts);
   if (t.lead_id)
     await run(`INSERT INTO activities (lead_id,task_id,type,title,body,actor_id,occurred_at,created_at,is_demo) VALUES (?,?,?,?,?,?,?,?,?)`,
       [t.lead_id, id, "task", `Task completed: ${t.title}`, note?.trim() || null, actor.id, ts, ts, t.is_demo]);
@@ -215,15 +261,16 @@ export function canDecide(actor: Actor, ap: Row): { ok: boolean; reason?: string
   return { ok: true };
 }
 
-export async function listApprovals(actor: Actor, f: { status?: string; requires?: string; includeDemo?: boolean } = {}): Promise<Row[]> {
+export async function listApprovals(actor: Actor, f: { status?: string; requires?: string; includeDemo?: boolean; id?: number } = {}): Promise<Row[]> {
   const where: string[] = [];
   const args: InValue[] = [];
   if (!can(actor, "approvals.decide") && !isManager(actor)) (where.push("a.submitted_by=?"), args.push(actor.id));
   if (f.status) (where.push("a.status=?"), args.push(f.status));
   if (f.requires) (where.push("a.requires=?"), args.push(f.requires));
+  if (f.id) (where.push("a.id=?"), args.push(f.id));
   if (!f.includeDemo) where.push("a.is_demo=0");
   return all(
-    `SELECT a.*, l.company, l.stage, t.title AS task_title, t.instructions AS task_instructions, t.task_type,
+    `SELECT a.*, a.created_at AS submitted_at, l.company, l.stage, t.title AS task_title, t.instructions AS task_instructions, t.task_type,
             s.name AS submitted_by_name, d.name AS decided_by_name
      FROM approvals a JOIN tasks t ON t.id=a.task_id JOIN users s ON s.id=a.submitted_by
      LEFT JOIN users d ON d.id=a.decided_by LEFT JOIN leads l ON l.id=a.lead_id

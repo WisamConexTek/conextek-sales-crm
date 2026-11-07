@@ -7,7 +7,7 @@ export async function GET(req: Request) {
   const p = new URL(req.url).searchParams;
   const num = (k: string) => (/^\d+$/.test(p.get(k) ?? "") ? Number(p.get(k)) : undefined);
   try {
-    const csv = await leadsCsv(a, { q: p.get("q") ?? undefined, owner: num("owner"), market: p.get("market") ?? undefined, stage: p.get("stage") ?? undefined, channel: p.get("channel") ?? undefined });
+    const csv = await leadsCsv(a, { q: p.get("q") ?? undefined, owner: num("owner"), market: p.get("market") ?? undefined, segment: p.get("segment") ?? undefined, stage: p.get("stage") ?? undefined, channel: p.get("channel") ?? undefined });
     return new Response(csv, { headers: { "content-type": "text/csv; charset=utf-8", "content-disposition": `attachment; filename="leads-${new Date().toISOString().slice(0, 10)}.csv"` } });
   } catch (e) {
     return new Response(e instanceof HttpError ? e.message : "Error", { status: e instanceof HttpError ? e.status : 500 });

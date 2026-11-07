@@ -4,9 +4,10 @@ import { listApprovals, canDecide } from "@/lib/service/tasks";
 import { all } from "@/lib/db";
 import { decideApprovalAction, escalateApprovalAction } from "@/app/actions";
 import { Badge, Card, Empty, Flash, LeadLink, PageHeader, DemoBadge } from "@/components/ui";
+import { Ref } from "@/components/Ref";
 import { fmtDateTime } from "@/lib/format";
 import { ACTIVITY_TYPE_LABEL } from "@/lib/constants";
-import { demoOn, sget, type SP } from "@/lib/view";
+import { demoOn, sget, snum, type SP } from "@/lib/view";
 import type { Row } from "@/lib/db";
 
 const KIND = { draft: "Draft", findings: "Findings", other: "Work" } as Record<string, string>;
@@ -15,25 +16,26 @@ const who = (r: string) => (r === "wisam" ? "Wisam" : "Chief");
 export default async function Approvals({ searchParams }: { searchParams: SP }) {
   const me = await requireUser();
   const sp = await searchParams;
+  const oneId = snum(sp, "id");
   const tab = sget(sp, "tab") === "decided" ? "decided" : "pending";
   const includeDemo = await demoOn();
-  const all_ = await listApprovals(me, { includeDemo });
-  const rows = all_.filter((a) => (tab === "pending" ? a.status === "pending" : a.status !== "pending"));
+  const all_ = await listApprovals(me, oneId ? { includeDemo: true, id: oneId } : { includeDemo });
+  const rows = oneId ? all_ : all_.filter((a) => (tab === "pending" ? a.status === "pending" : a.status !== "pending"));
   const nPending = all_.filter((a) => a.status === "pending").length;
   const leadIds = [...new Set(rows.map((r) => r.lead_id).filter(Boolean))] as number[];
   const ctx: Record<number, Row[]> = {};
   for (const id of leadIds) ctx[id] = await all("SELECT a.type,a.title,a.body,a.occurred_at,a.message_kind,u.name AS actor_name FROM activities a JOIN users u ON u.id=a.actor_id WHERE a.lead_id=? AND a.type<>'approval' ORDER BY a.occurred_at DESC,a.id DESC LIMIT 4", [id]);
   const decisionLabel: Record<string, string> = { approved: "Approved", rejected: "Rejected", changes_requested: "Changes requested" };
-  const groups = tab === "pending" ? (["chief", "wisam"] as const).map((r) => ({ title: `Waiting on ${who(r)}`, rows: rows.filter((a) => a.requires === r) })) : [{ title: "Decided", rows }];
+  const groups = oneId ? [{ title: `Approval #${oneId}`, rows }] : tab === "pending" ? (["chief", "wisam"] as const).map((r) => ({ title: `Waiting on ${who(r)}`, rows: rows.filter((a) => a.requires === r) })) : [{ title: "Decided", rows }];
 
   return (
     <div className="space-y-5">
       <PageHeader title="Approvals" sub="Submitted work with its lead and context. Approval is a review decision — it never sends anything.">
-        <Link href="/approvals" className={`btn ${tab === "pending" ? "btn-primary" : ""}`}>Pending ({nPending})</Link>
-        <Link href="/approvals?tab=decided" className={`btn ${tab === "decided" ? "btn-primary" : ""}`}>Decided</Link>
+        <Link href="/approvals" className={`btn ${tab === "pending" && !oneId ? "btn-primary" : ""}`}>Pending ({nPending})</Link>
+        <Link href="/approvals?tab=decided" className={`btn ${tab === "decided" && !oneId ? "btn-primary" : ""}`}>Decided</Link>
       </PageHeader>
       <Flash ok={sget(sp, "ok")} err={sget(sp, "err")} />
-      {rows.length === 0 && <Card><Empty>{tab === "pending" ? "Nothing is waiting for approval." : "No decisions yet."}</Empty></Card>}
+      {rows.length === 0 && <Card><Empty>{oneId ? "That approval was not found (or you do not have access)." : tab === "pending" ? "Nothing is waiting for approval." : "No decisions yet."}</Empty></Card>}
 
       {groups.map((g) => g.rows.length > 0 && (
         <div key={g.title} className="space-y-3">
@@ -44,9 +46,9 @@ export default async function Approvals({ searchParams }: { searchParams: SP }) 
               <Card key={a.id}>
                 <div className="flex flex-wrap items-start justify-between gap-2">
                   <div>
-                    <div className="text-base font-semibold text-slate-900">{a.title} {a.is_demo ? <DemoBadge /> : null}</div>
+                    <div className="text-base font-semibold text-slate-900">{a.title} {a.is_demo ? <DemoBadge /> : null} <Ref kind="Approval" id={a.id} href={`/approvals?id=${a.id}`} /></div>
                     <div className="mt-0.5 text-xs text-slate-500">
-                      <Badge tone="gray">{KIND[a.kind]}</Badge> · submitted by <b>{a.submitted_by_name}</b> · {fmtDateTime(a.created_at)} · task: {a.task_title}
+                      <Badge tone="gray">{KIND[a.kind]}</Badge> · submitted by <b>{a.submitted_by_name}</b> · {fmtDateTime(a.created_at)} · task: <Link href={`/tasks/${a.task_id}`}>{a.task_title}</Link> <Ref kind="Task" id={a.task_id} href={`/tasks/${a.task_id}`} />
                     </div>
                   </div>
                   {a.status === "pending" ? <Badge tone={a.requires === "wisam" ? "purple" : "amber"}>Pending {who(a.requires)}</Badge>
@@ -88,7 +90,7 @@ export default async function Approvals({ searchParams }: { searchParams: SP }) 
                     {a.comment && a.requires === "wisam" && <p className="mb-2 text-sm text-slate-600"><b>Escalation note:</b> {a.comment}</p>}
                     {c.ok ? (
                       <form action={decideApprovalAction} className="space-y-2">
-                        <input type="hidden" name="id" value={a.id} /><input type="hidden" name="_back" value={`/approvals${tab === "decided" ? "?tab=decided" : ""}`} />
+                        <input type="hidden" name="id" value={a.id} /><input type="hidden" name="_back" value={oneId ? `/approvals?id=${oneId}` : `/approvals${tab === "decided" ? "?tab=decided" : ""}`} />
                         <textarea name="comment" className="input" placeholder="Comment (required to reject or request changes)" />
                         <div className="flex flex-wrap gap-2">
                           <button name="decision" value="approved" className="btn btn-ok">Approve</button>

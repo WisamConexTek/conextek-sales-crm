@@ -10,13 +10,13 @@ import { demoOn, q, sget, snum, type SP } from "@/lib/view";
 export default async function LeadsPage({ searchParams }: { searchParams: SP }) {
   const me = await requireUser();
   const sp = await searchParams;
-  const f = { q: sget(sp, "q"), owner: snum(sp, "owner"), market: sget(sp, "market"), stage: sget(sp, "stage"), channel: sget(sp, "channel"), sort: sget(sp, "sort"), page: snum(sp, "page") ?? 1 };
+  const f = { q: sget(sp, "q"), owner: snum(sp, "owner"), market: sget(sp, "market"), segment: sget(sp, "segment"), stage: sget(sp, "stage"), channel: sget(sp, "channel"), sort: sget(sp, "sort"), page: snum(sp, "page") ?? 1 };
   const [res, lists, users] = await Promise.all([listLeads(me, { ...f, includeDemo: await demoOn() }), getLists(true), assignableUsers()]);
   const label = (kind: string) => Object.fromEntries(lists[kind].map((i) => [i.key, i.label]));
   const stages = label("stage"), markets = label("market");
   const flag = Object.fromEntries(lists.stage.map((i) => [i.key, i.flag]));
   const pages = Math.max(1, Math.ceil(res.total / res.pageSize));
-  const keep = { q: f.q, owner: f.owner, market: f.market, stage: f.stage, channel: f.channel, sort: f.sort };
+  const keep = { q: f.q, owner: f.owner, market: f.market, segment: f.segment, stage: f.stage, channel: f.channel, sort: f.sort };
 
   return (
     <div>
@@ -32,6 +32,8 @@ export default async function LeadsPage({ searchParams }: { searchParams: SP }) 
           <div><label className="label">Employee</label>
             <select name="owner" defaultValue={f.owner ?? ""} className="input"><option value="">All</option>{users.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}</select></div>
         )}
+        <div><label className="label">Segment</label>
+          <select name="segment" defaultValue={f.segment ?? ""} className="input"><option value="">All</option>{lists.segment.filter((i) => i.active).map((i) => <option key={i.key} value={i.key}>{i.label}</option>)}</select></div>
         <div><label className="label">Market</label>
           <select name="market" defaultValue={f.market ?? ""} className="input"><option value="">All</option>{lists.market.filter((i) => i.active).map((i) => <option key={i.key} value={i.key}>{i.label}</option>)}</select></div>
         <div><label className="label">Stage</label>

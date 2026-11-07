@@ -75,9 +75,17 @@ export async function changePasswordAction(fd: FD) {
 }
 export async function toggleDemoAction(fd: FD) {
   const c = await cookies();
-  if (c.get("crm_demo")?.value === "1") c.delete("crm_demo");
-  else c.set("crm_demo", "1", { path: "/", httpOnly: true, sameSite: "lax", maxAge: 86400 * 30 });
+  if (c.get("crm_hide_test")?.value === "1") c.delete("crm_hide_test");
+  else c.set("crm_hide_test", "1", { path: "/", httpOnly: true, sameSite: "lax", maxAge: 86400 * 30 });
   redirect(safeBack(fd));
+}
+export async function setLeadTestAction(fd: FD) {
+  const a = await requireUser();
+  await guard(fd, async () => {
+    const on = s(fd, "is_test") === "1";
+    await Leads.setLeadTest(a, n(fd, "id"), on);
+    return on ? "Marked as test data. It is now excluded from dashboard and report totals." : "Marked as real data. It now counts in dashboard and reports.";
+  });
 }
 
 /* ---------- leads ---------- */
@@ -246,6 +254,7 @@ export async function loadDemoAction(fd: FD) {
   await guard(fd, async () => { await seedDemo(a); return "Demo data loaded. Use the sidebar toggle to show it. It is excluded from all reports."; }, "/settings");
 }
 export async function removeDemoAction(fd: FD) {
+  if (s(fd, "confirm").trim().toUpperCase() !== "DELETE") redirect(join(safeBack(fd), "err=" + encodeURIComponent("Type DELETE to confirm — removing test data is permanent.")));
   const a = await requireUser();
   await guard(fd, async () => { await removeDemo(a); return "Demo data removed."; }, "/settings");
 }

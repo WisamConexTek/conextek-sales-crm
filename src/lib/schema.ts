@@ -171,4 +171,38 @@ CREATE TABLE audit_log (
 );
 CREATE INDEX idx_audit_created ON audit_log(created_at);
 `,
+  `
+-- Migration 2: customer segment, task note history, completion actor, Chief key management.
+ALTER TABLE leads ADD COLUMN segment TEXT;
+ALTER TABLE tasks ADD COLUMN completed_by INTEGER REFERENCES users(id);
+ALTER TABLE tasks ADD COLUMN completion_note TEXT;
+
+CREATE TABLE task_notes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK (kind IN ('progress','completion')),
+  body TEXT NOT NULL,
+  actor_id INTEGER REFERENCES users(id),
+  created_at TEXT NOT NULL
+);
+CREATE INDEX idx_task_notes_task ON task_notes(task_id, id);
+
+-- Existing completed tasks: recover who completed them and the completion note from the lead history.
+UPDATE tasks SET
+  completed_by = COALESCE((SELECT a.actor_id FROM activities a WHERE a.task_id=tasks.id AND a.title LIKE 'Task completed:%' ORDER BY a.id DESC LIMIT 1), assignee_id),
+  completion_note = (SELECT a.body FROM activities a WHERE a.task_id=tasks.id AND a.title LIKE 'Task completed:%' ORDER BY a.id DESC LIMIT 1)
+WHERE status='completed';
+
+-- Keep every existing note: progress notes first, then completion notes.
+INSERT INTO task_notes (task_id,kind,body,actor_id,created_at)
+  SELECT id,'progress',progress_note,assignee_id,updated_at FROM tasks
+  WHERE progress_note IS NOT NULL AND TRIM(progress_note)<>'' AND progress_note IS NOT COALESCE(completion_note,'');
+INSERT INTO task_notes (task_id,kind,body,actor_id,created_at)
+  SELECT id,'completion',completion_note,completed_by,COALESCE(completed_at,updated_at) FROM tasks
+  WHERE completion_note IS NOT NULL AND TRIM(completion_note)<>'';
+
+-- Chiefs may issue/revoke employee API keys (the Owner can switch this off per person).
+UPDATE users SET permissions = json_insert(permissions,'$[#]','keys.manage')
+  WHERE role='chief' AND permissions NOT LIKE '%keys.manage%';
+`,
 ];

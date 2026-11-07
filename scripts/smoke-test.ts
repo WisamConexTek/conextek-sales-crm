@@ -128,7 +128,7 @@ async function main() {
   await U.updateUserProfile(owner, e1.id, { active: false });
   const k = await U.createKey(owner, e2.id, "bot");
   ok(k.startsWith("ctk_"), "api key issued");
-  await throws(() => U.createKey(chief, e2.id, "x"), 403, "chief cannot create API keys");
+  await throws(() => U.createKey(omar, e2.id, "x"), 403, "employee cannot create API keys");
   const { getApiActor } = await import("../src/lib/auth");
   ok((await getApiActor(new Request("http://x", { headers: { authorization: `Bearer ${k}` } }))).id === omar.id, "api key authenticates as employee");
   await throws(() => getApiActor(new Request("http://x", { headers: { authorization: "Bearer nope" } })), 401, "bad key rejected");
@@ -147,6 +147,65 @@ async function main() {
   const rep2 = await R.getReport(owner, { granularity: "day" });
   ok(rep2.totals.first_emails === 1 && rep2.totals.leads_added === 1, "demo records excluded from reports");
   ok((await L.listLeads(owner, {})).total === 1 && (await L.listLeads(owner, { includeDemo: true })).total === 2, "demo hidden from lists by default");
+
+  console.log("Test data flag");
+  const real1 = (await R.getReport(owner, { granularity: "day" })).totals;
+  const tl = await L.createLead(chief, { company: "Test Lead Inc", website: "https://testlead.example", is_test: true, owner_id: omar.id });
+  ok((await L.getLead(chief, tl)).lead.is_demo === 1, "lead created with is_test is flagged");
+  const tlt = await T.createTask(chief, { title: "Test task", lead_id: tl, assignee_id: omar.id, task_type: "research" });
+  ok((await T.getTask(omar, tlt)).is_demo === 1, "task on a test lead is test data");
+  await A.recordActivity(omar, tl, { type: "research", title: "Test research", body: "x" });
+  const tsub = await T.submitTask(omar, tlt, { kind: "findings", content: "test findings" });
+  ok((await T.listApprovals(chief, { includeDemo: true, id: tsub }))[0].is_demo === 1, "approval on a test lead is test data");
+  const real2 = (await R.getReport(owner, { granularity: "day" })).totals;
+  ok(JSON.stringify(real1) === JSON.stringify(real2), "test lead, task and work are not counted in report totals");
+  ok((await R.getDashboard(owner, {})).pending.chief === 0, "test approvals are not counted on the dashboard");
+  await throws(() => T.createTask(chief, { title: "x", lead_id: lid, assignee_id: omar.id, is_test: true }), 400, "cannot create a test task on a real lead");
+  await throws(() => L.setLeadTest(omar, lid, true), 403, "employee cannot flag test data");
+  await L.setLeadTest(chief, lid, true);
+  ok((await one("SELECT COUNT(*) n FROM activities WHERE lead_id=? AND is_demo=0", [lid]))!.n === 0 && (await T.getTask(omar, t1)).is_demo === 1, "marking a lead as test flags its history and tasks");
+  const real3 = (await R.getReport(owner, { granularity: "day" })).totals;
+  ok(real3.first_emails === 0, "flagged lead drops out of report totals");
+  await L.setLeadTest(chief, lid, false);
+  ok(JSON.stringify((await R.getReport(owner, { granularity: "day" })).totals) === JSON.stringify(real2), "marking it real restores the totals");
+
+  console.log("Progress notes, completion actor, approval actors");
+  const tn = await T.createTask(chief, { title: "Notes task", lead_id: lid, assignee_id: omar.id, approval: "none" });
+  await T.updateTask(omar, tn, { status: "in_progress", progress_note: "first note" });
+  await T.updateTask(omar, tn, { progress_note: "second note" });
+  await T.completeTask(omar, tn, "all done");
+  const dn = await T.getTaskDetail(omar, tn);
+  ok(dn.notes.length === 3 && dn.notes.map((n) => n.kind).join() === "progress,progress,completion", "earlier progress notes are kept after completion");
+  ok(dn.progress_note === "second note" && dn.completion_note === "all done", "completion note does not overwrite progress");
+  ok(dn.completed_by === omar.id && dn.completed_by_name === omar.name && !!dn.completed_at, "completion actor and time recorded");
+  ok(dn.timeline.some((e) => e.event === "completed" && e.actor === omar.name), "timeline shows who completed");
+  const d1 = await T.getTaskDetail(omar, t1);
+  const decided = d1.approvals.find((a) => a.status === "approved")!;
+  ok(decided.decided_by_name === chief.name && !!decided.decided_at && decided.submitted_by_name === omar.name && !!decided.submitted_at, "approval submit/decision actors and times available");
+
+  console.log("Chief manages employee API keys");
+  const kc = await U.createKey(chief, omar.id, "chief-issued");
+  ok(kc.startsWith("ctk_"), "chief issues an employee key");
+  await throws(() => U.createKey(chief, owner.id, "x"), 403, "chief cannot create an owner key");
+  await throws(() => U.createKey(chief, chief.id, "x"), 403, "chief cannot create a key for a chief");
+  await U.createKey(owner, owner.id, "owner key");
+  const seen = await U.listKeys(undefined, chief);
+  ok(seen.length > 0 && seen.every((x) => x.user_name !== owner.name), "chief never sees the owner's keys");
+  const ownerKey = (await U.listKeys(owner.id))[0];
+  await throws(() => U.revokeKey(chief, ownerKey.id as number), 403, "chief cannot revoke the owner's key");
+  const ek = (await U.listKeys(omar.id, chief)).find((x) => x.label === "chief-issued")!;
+  await U.revokeKey(chief, ek.id as number);
+  await throws(() => getApiActor(new Request("http://x", { headers: { authorization: `Bearer ${kc}` } })), 401, "chief-revoked key stops working");
+  await U.setPermissions(owner, chief.id, ((await U.getUser(chief.id))!.perms as string[]).filter((p) => p !== "keys.manage"));
+  const chief2 = await actorById(chief.id);
+  await throws(() => U.createKey(chief2, omar.id, "x"), 403, "owner can switch off Chief's key rights");
+
+  console.log("ConexTek categories");
+  const cl = await L.createLead(owner, { company: "Auto Dealer NC", market: "china", segment: "nc_dealers", industry: "automotive", service: "after_hours_bdc", source: "cars_com" });
+  ok((await L.getLead(owner, cl)).lead.segment === "nc_dealers", "segment saved separately from market");
+  await throws(() => L.createLead(owner, { company: "Bad Seg", segment: "nope" }), 400, "unknown segment rejected");
+  await throws(() => L.createLead(owner, { company: "Old Market", market: "uk" }), 400, "old generic market no longer offered");
+  ok(((await L.listLeads(owner, { segment: "nc_dealers" })).total) === 1, "filter by segment");
 
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);

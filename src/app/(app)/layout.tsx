@@ -14,8 +14,8 @@ export default async function AppLayout({ children }: { children: React.ReactNod
   const toDecide = can(me, "approvals.decide")
     ? Number((await one(`SELECT COUNT(*) n FROM approvals WHERE is_demo=0 AND status='pending' AND submitted_by<>? ${me.role === "owner" ? "" : "AND requires='chief'"}`, [me.id]))!.n)
     : 0;
-  const hasDemo = Number((await one("SELECT COUNT(*) n FROM leads WHERE is_demo=1"))!.n) > 0;
-  const demoOn = (await cookies()).get("crm_demo")?.value === "1";
+  const hasDemo = Number((await one("SELECT COUNT(*) n FROM leads WHERE is_demo=1"))!.n) + Number((await one("SELECT COUNT(*) n FROM tasks WHERE is_demo=1"))!.n) > 0;
+  const hidden = (await cookies()).get("crm_hide_test")?.value === "1";
 
   const items: NavItem[] = [
     { href: "/", label: "Dashboard" },
@@ -39,7 +39,7 @@ export default async function AppLayout({ children }: { children: React.ReactNod
           {hasDemo && (
             <form action={toggleDemoAction}>
               <input type="hidden" name="_back" value="/" />
-              <button className="btn btn-sm w-full">{demoOn ? "Hide demo data" : "Show demo data"}</button>
+              <button className="btn btn-sm w-full">{hidden ? "Show test data" : "Hide test data"}</button>
             </form>
           )}
           <div className="px-1 text-sm">
@@ -60,7 +60,7 @@ export default async function AppLayout({ children }: { children: React.ReactNod
         <div className="overflow-x-auto border-b border-slate-200 bg-white px-2 py-1 md:hidden">
           <div className="flex gap-1 whitespace-nowrap text-sm">{items.map((i) => <Link key={i.href} href={i.href} className="rounded px-2 py-1 text-slate-700">{i.label}{i.badge ? ` (${i.badge})` : ""}</Link>)}</div>
         </div>
-        {demoOn && <div className="bg-accent/90 px-6 py-1.5 text-xs font-semibold text-brand-900">Demo data is visible. It is excluded from every report and dashboard number.</div>}
+        {hasDemo && !hidden && <div className="bg-accent/90 px-6 py-1.5 text-xs font-semibold text-brand-900">Test records are shown and labelled TEST. They are excluded from every dashboard and report number.</div>}
         <main className="mx-auto max-w-[1400px] p-4 md:p-6">{children}</main>
       </div>
     </div>

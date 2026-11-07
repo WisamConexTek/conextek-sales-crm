@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
 import { requireUser, isManager } from "@/lib/auth";
-import { getUser, listKeys } from "@/lib/service/users";
+import { getUser, listKeys, canManageKeysFor, CHIEF_LOCKED } from "@/lib/service/users";
 import {
   updateUserAction, setPermsAction, applyPresetAction, resetPasswordAction, createKeyAction, keyToggleAction, keyRevokeAction,
 } from "@/app/actions";
@@ -21,9 +21,10 @@ export default async function UserPage({ params, searchParams }: { params: Promi
   const sp = await searchParams;
   const owner = me.role === "owner";
   const back = `/settings/users/${u.id}`;
-  const keys = owner ? await listKeys(u.id) : [];
+  const canKeys = canManageKeysFor(me, u);
+  const keys = canKeys ? await listKeys(u.id, me) : [];
   const isOwnerAcct = u.role === "owner";
-  const editablePerms = owner ? ALL_PERMISSIONS : ALL_PERMISSIONS.filter((p) => can(me, p) && !["approvals.decide", "tasks.assign", "tasks.view_all"].includes(p));
+  const editablePerms = owner ? ALL_PERMISSIONS : ALL_PERMISSIONS.filter((p) => can(me, p) && !CHIEF_LOCKED.includes(p));
   const canEditPerms = !isOwnerAcct && (owner || (me.role === "chief" && u.role === "employee"));
   const canReset = owner ? !isOwnerAcct || u.id === me.id : me.role === "chief" && u.role === "employee";
 
@@ -85,9 +86,9 @@ export default async function UserPage({ params, searchParams }: { params: Promi
         </Card>
       )}
 
-      {owner && (
+      {canKeys && (
         <Card title={`API access (${keys.filter((k) => k.active && !k.revoked_at).length} active)`}>
-          <p className="mb-3 text-sm text-slate-600">Each key acts as {u.name} with exactly the permissions above. Keys are shown once. Give each AI employee their own key so activity is attributed correctly.</p>
+          <p className="mb-3 text-sm text-slate-600">Each key acts as {u.name} with exactly the permissions above. Keys are shown once. Give each AI employee their own key so activity is attributed correctly. {!owner && "You can issue and revoke employees' keys; the Owner's and other Chiefs' keys are not visible to you."}</p>
           {keys.length > 0 && (
             <table className="mb-4 w-full text-sm"><thead className="border-b border-slate-200"><tr>{["Label", "Key", "Created", "Last used", "Status", ""].map((h) => <th key={h} className="th">{h}</th>)}</tr></thead>
               <tbody className="divide-y divide-slate-100">{keys.map((k) => (

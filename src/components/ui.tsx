@@ -73,7 +73,7 @@ export function EmailStatusBadge({ s }: { s: string }) {
   const tone: Record<string, string> = { unknown: "gray", ok: "green", bounced: "red", opted_out: "amber" };
   return <Badge tone={tone[s] as never}>{EMAIL_STATUS_LABEL[s] ?? s}</Badge>;
 }
-export const DemoBadge = () => <Badge tone="amber">DEMO</Badge>;
+export const DemoBadge = () => <Badge tone="amber">TEST</Badge>;
 
 export function Flash({ ok, err }: { ok?: string; err?: string }) {
   if (!ok && !err) return null;

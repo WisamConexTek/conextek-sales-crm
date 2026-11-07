@@ -87,6 +87,7 @@ export const PERMISSIONS = {
   "approvals.decide": "Decide approvals within delegated authority",
   "reports.view": "View reports and the dashboard for the whole team",
   "reports.export": "Export reports to CSV",
+  "keys.manage": "Issue and revoke API keys for employees (never for the Owner or other Chiefs)",
 } as const;
 export type Permission = keyof typeof PERMISSIONS;
 export const ALL_PERMISSIONS = Object.keys(PERMISSIONS) as Permission[];
@@ -99,7 +100,7 @@ export const PRESETS: Record<string, { label: string; role: Role; perms: Permiss
     perms: [
       "leads.view_all", "leads.create", "leads.edit", "leads.stage", "leads.import", "leads.export",
       "activity.record", "tasks.create_own", "tasks.assign", "tasks.view_all",
-      "approvals.submit", "approvals.decide", "reports.view", "reports.export",
+      "approvals.submit", "approvals.decide", "reports.view", "reports.export", "keys.manage",
     ],
   },
   researcher: {
@@ -121,11 +122,12 @@ export const PRESETS: Record<string, { label: string; role: Role; perms: Permiss
 
 /* ---------------- Default editable lists ---------------- */
 
-export type ListKind = "stage" | "market" | "channel" | "industry" | "source" | "service" | "language" | "task_type";
+export type ListKind = "stage" | "market" | "segment" | "channel" | "industry" | "source" | "service" | "language" | "task_type";
 export const LIST_KINDS: { kind: ListKind; title: string; hint: string }[] = [
   { kind: "stage", title: "Lead stages", hint: "Flags drive reports: Won / Lost / Meeting count in reports; Closed removes the lead from open pipeline." },
   { kind: "task_type", title: "Task / approval types", hint: "Choose who approves this type by default: Chief (delegated) or Wisam (owner only)." },
-  { kind: "market", title: "Target markets", hint: "" },
+  { kind: "market", title: "Target markets (geography)", hint: "Countries/regions only. Customer types such as dealers or exporters belong in Customer segments." },
+  { kind: "segment", title: "Customer segments", hint: "Who the customer is (e.g. NC dealers, Chinese exporters) — separate from the geographic market." },
   { kind: "channel", title: "Channels", hint: "" },
   { kind: "industry", title: "Industries", hint: "" },
   { kind: "source", title: "Lead sources", hint: "" },
@@ -157,11 +159,18 @@ export const DEFAULT_LISTS: Record<ListKind, { key: string; label: string; flag?
     { key: "other", label: "Other", flag: "chief" },
   ],
   market: [
+    { key: "china", label: "China" },
     { key: "uae", label: "UAE" },
     { key: "ksa", label: "Saudi Arabia" },
-    { key: "uk", label: "United Kingdom" },
-    { key: "us", label: "United States" },
+    { key: "qatar", label: "Qatar" },
+    { key: "kuwait", label: "Kuwait" },
+    { key: "bahrain", label: "Bahrain" },
+    { key: "oman", label: "Oman" },
     { key: "other", label: "Other" },
+  ],
+  segment: [
+    { key: "nc_dealers", label: "NC dealers" },
+    { key: "chinese_exporters", label: "Chinese exporters" },
   ],
   channel: [
     { key: "email", label: "Email" },
@@ -171,14 +180,15 @@ export const DEFAULT_LISTS: Record<ListKind, { key: string; label: string; flag?
     { key: "other", label: "Other" },
   ],
   industry: [
-    { key: "technology", label: "Technology" },
-    { key: "retail", label: "Retail & e-commerce" },
-    { key: "real_estate", label: "Real estate" },
-    { key: "healthcare", label: "Healthcare" },
-    { key: "finance", label: "Finance" },
+    { key: "automotive", label: "Automotive" },
+    { key: "manufacturing_export", label: "Manufacturing / Export" },
     { key: "other", label: "Other" },
   ],
   source: [
+    { key: "canton_fair", label: "Canton Fair catalogs" },
+    { key: "cars_com", label: "Cars.com" },
+    { key: "hunter", label: "Hunter" },
+    { key: "apollo", label: "Apollo" },
     { key: "manual_research", label: "Manual research" },
     { key: "linkedin", label: "LinkedIn" },
     { key: "referral", label: "Referral" },
@@ -187,10 +197,9 @@ export const DEFAULT_LISTS: Record<ListKind, { key: string; label: string; flag?
     { key: "other", label: "Other" },
   ],
   service: [
-    { key: "website", label: "Website" },
-    { key: "crm", label: "CRM / automation" },
-    { key: "marketing", label: "Digital marketing" },
-    { key: "software", label: "Custom software" },
+    { key: "customer_care", label: "Customer care" },
+    { key: "after_hours_bdc", label: "After-hours / BDC support" },
+    { key: "sales_representation", label: "Sales representation" },
   ],
   language: [
     { key: "en", label: "English" },

@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { redirect } from "next/navigation";
 import { requireUser, isManager } from "@/lib/auth";
-import { listUsers, listKeys } from "@/lib/service/users";
+import { listUsers, listKeys, canManageKeysFor } from "@/lib/service/users";
 import { getLists } from "@/lib/service/lists";
 import { all, one } from "@/lib/db";
 import { demoCount } from "@/lib/service/demo";
@@ -22,20 +22,20 @@ export default async function Settings({ searchParams }: { searchParams: SP }) {
 
   return (
     <div className="space-y-5">
-      <PageHeader title="Settings & Permissions" sub={owner ? "Full owner access" : "Chief: you can add employees, adjust their permissions and reset their passwords"} />
+      <PageHeader title="Settings & Permissions" sub={owner ? "Full owner access" : "Chief: you can add employees, adjust their permissions, reset passwords and issue or revoke employee API keys"} />
       <Flash ok={sget(sp, "ok")} err={sget(sp, "err")} />
       <div className="flex gap-1 border-b border-slate-200">
         {tabs.map(([k, l]) => <Link key={k} href={`/settings?tab=${k}`} className={`-mb-px border-b-2 px-4 py-2 text-sm no-underline hover:no-underline ${tab === k ? "border-brand-600 font-semibold text-brand-700" : "border-transparent text-slate-600"}`}>{l}</Link>)}
       </div>
-      {tab === "team" && <Team owner={owner} />}
+      {tab === "team" && <Team owner={owner} me={me} />}
       {tab === "lists" && owner && <Lists />}
       {tab === "history" && <History page={snum(sp, "page") ?? 1} action={sget(sp, "action")} />}
     </div>
   );
 }
 
-async function Team({ owner }: { owner: boolean }) {
-  const [users, keys] = await Promise.all([listUsers(), listKeys()]);
+async function Team({ owner, me }: { owner: boolean; me: Awaited<ReturnType<typeof requireUser>> }) {
+  const [users, keys] = await Promise.all([listUsers(), listKeys(undefined, me)]);
   return (
     <>
       <Card title={`Team (${users.length})`}>
@@ -52,7 +52,7 @@ async function Team({ owner }: { owner: boolean }) {
                     <td className="td capitalize">{u.role}</td>
                     <td className="td">{PRESETS[u.preset]?.label ?? u.preset ?? "Custom"}</td>
                     <td className="td">{u.role === "owner" ? "All" : u.perms.length}</td>
-                    <td className="td">{k}</td>
+                    <td className="td">{canManageKeysFor(me, u) ? k : "—"}</td>
                     <td className="td text-slate-600">{u.last_login_at ? fmtDateTime(u.last_login_at) : "Never"}</td>
                     <td className="td">{u.active ? <Badge tone="green">Active</Badge> : <Badge tone="gray">Disabled</Badge>}</td>
                   </tr>
@@ -71,7 +71,7 @@ async function Team({ owner }: { owner: boolean }) {
             <Field label="Password (min 10 chars, blank = generate)"><input name="password" type="text" autoComplete="off" minLength={10} className="input" /></Field>
             <Field label="Permission preset"><select name="preset" className="input" defaultValue="researcher">{Object.entries(PRESETS).filter(([k, p]) => k !== "owner" && (owner || p.role === "employee")).map(([k, p]) => <option key={k} value={k}>{p.label}</option>)}</select></Field>
           </SecretAction>
-          <p className="mt-3 text-xs text-slate-500">After creating the account, open it to fine-tune permissions{owner ? " and issue the employee's API key" : ". The owner issues API keys"}. New people can be added any time — nothing else needs to change.</p>
+          <p className="mt-3 text-xs text-slate-500">After creating the account, open it to fine-tune permissions and issue the employee's API key{owner ? "" : " (you can do this yourself — no need to ask the Owner)"}. New people can be added any time — nothing else needs to change.</p>
         </Card>
       )}
     </>
@@ -112,10 +112,17 @@ async function Lists() {
           <p className="mt-2 text-xs text-slate-400">Retiring an item hides it from new records but keeps existing records intact.</p>
         </Card>
       ))}
-      <Card title="Demo data">
-        <p className="mb-3 text-sm text-slate-600">Production starts empty. Demo records are labelled DEMO, hidden unless you switch them on, and never counted in the dashboard or reports.</p>
-        <form action={(await demoCount()) ? removeDemoAction : loadDemoAction}><input type="hidden" name="_back" value="/settings?tab=lists" />
-          <button className={`btn ${(await demoCount()) ? "btn-danger" : ""}`}>{(await demoCount()) ? "Remove all demo data" : "Load demo data"}</button></form>
+      <Card title="Test data">
+        <p className="mb-3 text-sm text-slate-600">Production starts empty. Anything marked <b>TEST</b> (demo samples, or real leads you flagged during testing) stays visible and labelled, but is never counted in the dashboard or reports. Owner or Chief can mark or unmark a lead on its page; the whole lead history, tasks and approvals follow it. Removing test data deletes it permanently.</p>
+        <p className="mb-3 text-sm text-slate-700"><b>{await demoCount()}</b> lead(s) currently marked as test data.</p>
+        <div className="flex flex-wrap items-end gap-2">
+          <form action={loadDemoAction}><input type="hidden" name="_back" value="/settings?tab=lists" /><button className="btn">Load sample demo data</button></form>
+          {(await demoCount()) > 0 && (
+            <form action={removeDemoAction} className="flex items-end gap-2"><input type="hidden" name="_back" value="/settings?tab=lists" />
+              <input name="confirm" className="input w-36" placeholder="Type DELETE" autoComplete="off" />
+              <button className="btn btn-danger">Remove all test data</button></form>
+          )}
+        </div>
       </Card>
       <Card title="Fixed lists">
         <p className="text-sm text-slate-600">Task statuses (To do → Cancelled) and activity outcomes (Sent, Reply received, Bounced, No response yet, Opted out) are fixed because reports and approval rules depend on them.</p>

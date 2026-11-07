@@ -7,7 +7,8 @@ import { ALL_PERMISSIONS, PRESETS, type Permission } from "../constants";
 import { audit, parse, reqText } from "./common";
 import bcrypt from "bcryptjs";
 
-const CHIEF_LOCKED: Permission[] = ["approvals.decide", "tasks.assign", "tasks.view_all"];
+/** Rights a Chief can never hand to someone else. Only the Owner can. */
+export const CHIEF_LOCKED: Permission[] = ["approvals.decide", "tasks.assign", "tasks.view_all", "keys.manage"];
 const safeCols = "id,username,name,role,preset,permissions,must_change_password,active,last_login_at,created_at";
 
 export async function listUsers(includeInactive = true): Promise<Row[]> {
@@ -76,7 +77,7 @@ export async function setPermissions(actor: Actor, id: number, perms: string[], 
   let allowed: Permission[] = ALL_PERMISSIONS;
   if (actor.role !== "owner") {
     if (actor.role !== "chief" || u.role !== "employee") throw new HttpError(403, "Not allowed to change this person's permissions.");
-    allowed = ALL_PERMISSIONS.filter((p) => can(actor, p) && !["approvals.decide", "tasks.assign", "tasks.view_all"].includes(p));
+    allowed = ALL_PERMISSIONS.filter((p) => can(actor, p) && !CHIEF_LOCKED.includes(p));
   }
   const requested = perms.filter((p): p is Permission => (ALL_PERMISSIONS as string[]).includes(p));
   const before = new Set<Permission>(u.perms);
@@ -118,17 +119,38 @@ export async function changeOwnPassword(actor: Actor, current: string, next: str
 }
 
 /* ---------- API keys ---------- */
-export async function listKeys(userId?: number): Promise<Row[]> {
+/** Owner: every key. Chief: only employees' keys — the Owner's and other Chiefs' keys are never visible to them. */
+export async function listKeys(userId?: number, actor?: Actor): Promise<Row[]> {
+  const where: string[] = [];
+  const args: (string | number)[] = [];
+  if (userId) (where.push("k.user_id=?"), args.push(userId));
+  if (actor && actor.role !== "owner") where.push("u.role='employee'");
   return all(
-    `SELECT k.id,k.user_id,k.label,k.prefix,k.active,k.last_used_at,k.created_at,k.revoked_at,u.name AS user_name
-     FROM api_keys k JOIN users u ON u.id=k.user_id ${userId ? "WHERE k.user_id=?" : ""} ORDER BY k.created_at DESC`,
-    userId ? [userId] : [],
+    `SELECT k.id,k.user_id,k.label,k.prefix,k.active,k.last_used_at,k.created_at,k.revoked_at,u.name AS user_name,cb.name AS created_by_name
+     FROM api_keys k JOIN users u ON u.id=k.user_id LEFT JOIN users cb ON cb.id=k.created_by
+     ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY k.created_at DESC`,
+    args,
   );
 }
+/** Owner may manage anyone's keys. Chief (with keys.manage) only employees' — never the Owner's or another Chief's. */
+export function canManageKeysFor(actor: Actor, target: Row | { role: string }): boolean {
+  if (actor.role === "owner") return true;
+  return actor.role === "chief" && can(actor, "keys.manage") && target.role === "employee";
+}
+async function assertKeyAccess(actor: Actor, userRole: string) {
+  if (!canManageKeysFor(actor, { role: userRole }))
+    throw new HttpError(403, actor.role === "chief" ? "Chief can manage API keys for employees only." : "Only the owner or Chief manages API access.");
+}
+async function keyOwnerRole(keyId: number): Promise<string> {
+  const k = await one("SELECT u.role FROM api_keys k JOIN users u ON u.id=k.user_id WHERE k.id=?", [keyId]);
+  if (!k) throw new HttpError(404, "Key not found.");
+  return k.role;
+}
 export async function createKey(actor: Actor, userId: number, label: string) {
-  if (actor.role !== "owner") throw new HttpError(403, "Only the owner manages API access.");
   const u = await getUser(userId);
   if (!u) throw new HttpError(404, "User not found.");
+  await assertKeyAccess(actor, u.role);
+  if (!u.active) throw new HttpError(400, "That account is disabled.");
   const k = newApiKey();
   const r = await run("INSERT INTO api_keys (user_id,label,prefix,key_hash,created_by,created_at) VALUES (?,?,?,?,?,?)", [
     userId, label.trim() || "API key", k.prefix, k.hash, actor.id, now(),
@@ -137,12 +159,12 @@ export async function createKey(actor: Actor, userId: number, label: string) {
   return k.key;
 }
 export async function setKeyActive(actor: Actor, keyId: number, active: boolean) {
-  if (actor.role !== "owner") throw new HttpError(403, "Only the owner manages API access.");
+  await assertKeyAccess(actor, await keyOwnerRole(keyId));
   await run("UPDATE api_keys SET active=? WHERE id=? AND revoked_at IS NULL", [active ? 1 : 0, keyId]);
   await audit(actor, active ? "enable_api_key" : "disable_api_key", "api_key", keyId);
 }
 export async function revokeKey(actor: Actor, keyId: number) {
-  if (actor.role !== "owner") throw new HttpError(403, "Only the owner manages API access.");
+  await assertKeyAccess(actor, await keyOwnerRole(keyId));
   await run("UPDATE api_keys SET active=0, revoked_at=? WHERE id=?", [now(), keyId]);
   await audit(actor, "revoke_api_key", "api_key", keyId);
 }

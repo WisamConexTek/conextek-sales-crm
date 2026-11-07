@@ -2,6 +2,17 @@ import { getApiActor, HttpError, type Actor } from "./auth";
 
 type Ctx<P> = { actor: Actor; req: Request; params: P; url: URL; body: () => Promise<Record<string, unknown>> };
 
+/** Internally the flag is "is_demo"; the API and UI call it test data ("is_test": true/false). */
+function publicShape(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(publicShape);
+  if (v && typeof v === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, x] of Object.entries(v)) out[k === "is_demo" ? "is_test" : k] = k === "is_demo" ? !!x : publicShape(x);
+    return out;
+  }
+  return v;
+}
+
 /** Wraps an API handler: bearer auth, JSON in/out, uniform errors. */
 export function route<P = Record<string, never>>(fn: (c: Ctx<P>) => Promise<unknown>) {
   return async (req: Request, { params }: { params: Promise<P> }) => {
@@ -13,7 +24,7 @@ export function route<P = Record<string, never>>(fn: (c: Ctx<P>) => Promise<unkn
         return j as Record<string, unknown>;
       };
       const data = await fn({ actor, req, params: await params, url: new URL(req.url), body });
-      return Response.json({ ok: true, data });
+      return Response.json({ ok: true, data: publicShape(data) });
     } catch (e) {
       if (e instanceof HttpError) {
         const dups = (e as HttpError & { duplicates?: unknown }).duplicates;
