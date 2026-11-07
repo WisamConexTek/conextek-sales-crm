@@ -1,0 +1,68 @@
+import { cookies } from "next/headers";
+import { requireUser, can, isManager } from "@/lib/auth";
+import { one } from "@/lib/db";
+import { logoutAction, toggleDemoAction } from "@/app/actions";
+import { Nav, type NavItem } from "@/components/Nav";
+import Link from "next/link";
+import Image from "next/image";
+
+export const dynamic = "force-dynamic";
+
+export default async function AppLayout({ children }: { children: React.ReactNode }) {
+  const me = await requireUser({ allowPasswordChange: true });
+  const mine = Number((await one("SELECT COUNT(*) n FROM tasks WHERE assignee_id=? AND is_demo=0 AND status IN ('todo','in_progress','changes_requested','approved')", [me.id]))!.n);
+  const toDecide = can(me, "approvals.decide")
+    ? Number((await one(`SELECT COUNT(*) n FROM approvals WHERE is_demo=0 AND status='pending' AND submitted_by<>? ${me.role === "owner" ? "" : "AND requires='chief'"}`, [me.id]))!.n)
+    : 0;
+  const hasDemo = Number((await one("SELECT COUNT(*) n FROM leads WHERE is_demo=1"))!.n) > 0;
+  const demoOn = (await cookies()).get("crm_demo")?.value === "1";
+
+  const items: NavItem[] = [
+    { href: "/", label: "Dashboard" },
+    { href: "/leads", label: "Leads" },
+    { href: "/my-work", label: "My Work", badge: mine },
+    { href: "/approvals", label: "Approvals", badge: toDecide },
+    { href: "/reports", label: can(me, "reports.view") || isManager(me) ? "Reports" : "My numbers" },
+  ];
+  if (isManager(me)) items.push({ href: "/settings", label: "Settings & Permissions" });
+  items.push({ href: "/api-docs", label: "API guide" });
+
+  return (
+    <div className="flex min-h-screen">
+      <aside className="sticky top-0 hidden h-screen w-60 shrink-0 flex-col bg-brand-600 p-3 md:flex">
+        <div className="mb-4 px-2 pt-1">
+          <Link href="/"><Image src="/logo-light.png" alt="ConexTek" width={530} height={270} priority className="h-auto w-44" /></Link>
+          <div className="mt-1 text-center text-[11px] uppercase tracking-widest text-white/70">Sales CRM</div>
+        </div>
+        <Nav items={items} />
+        <div className="mt-auto space-y-2 border-t border-white/20 pt-3">
+          {hasDemo && (
+            <form action={toggleDemoAction}>
+              <input type="hidden" name="_back" value="/" />
+              <button className="btn btn-sm w-full">{demoOn ? "Hide demo data" : "Show demo data"}</button>
+            </form>
+          )}
+          <div className="px-1 text-sm">
+            <div className="font-medium text-white">{me.name}</div>
+            <div className="text-xs capitalize text-white/70">{me.role}</div>
+          </div>
+          <div className="flex gap-2">
+            <Link href="/account" className="btn btn-sm flex-1">Account</Link>
+            <form action={logoutAction} className="flex-1"><button className="btn btn-sm w-full">Sign out</button></form>
+          </div>
+        </div>
+      </aside>
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center justify-between bg-brand-600 px-4 py-2 md:hidden">
+          <Image src="/logo-light.png" alt="ConexTek" width={530} height={270} className="h-9 w-auto" />
+          <form action={logoutAction}><button className="btn btn-sm">Sign out</button></form>
+        </div>
+        <div className="overflow-x-auto border-b border-slate-200 bg-white px-2 py-1 md:hidden">
+          <div className="flex gap-1 whitespace-nowrap text-sm">{items.map((i) => <Link key={i.href} href={i.href} className="rounded px-2 py-1 text-slate-700">{i.label}{i.badge ? ` (${i.badge})` : ""}</Link>)}</div>
+        </div>
+        {demoOn && <div className="bg-accent/90 px-6 py-1.5 text-xs font-semibold text-brand-900">Demo data is visible. It is excluded from every report and dashboard number.</div>}
+        <main className="mx-auto max-w-[1400px] p-4 md:p-6">{children}</main>
+      </div>
+    </div>
+  );
+}

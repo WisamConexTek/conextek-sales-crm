@@ -1,0 +1,15 @@
+node_modules
+.next
+.env
+.env.local
+.dev.vars
+.wrangler
+.demo-state
+data/
+*.db
+*.db-*
+.DS_Store
+next-env.d.ts
+*.tsbuildinfo
+.vercel
+.dev.vars.example

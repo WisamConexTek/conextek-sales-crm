@@ -1,0 +1,17 @@
+import { TZ } from "./db";
+
+const fmt = (o: Intl.DateTimeFormatOptions, iso?: string | null) =>
+  iso ? new Intl.DateTimeFormat("en-GB", { timeZone: TZ(), ...o }).format(new Date(iso)) : "—";
+
+export const fmtDateTime = (iso?: string | null) => fmt({ day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", hour12: false }, iso);
+export const fmtDate = (iso?: string | null) => fmt({ day: "numeric", month: "short", year: "numeric" }, iso);
+export const fmtShort = (iso?: string | null) => fmt({ day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", hour12: false }, iso);
+/** Value for <input type="datetime-local"> in app timezone. */
+export function toLocalInput(iso?: string | null): string {
+  if (!iso) return "";
+  const p = new Intl.DateTimeFormat("sv-SE", { timeZone: TZ(), year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(new Date(iso));
+  return p.replace(" ", "T");
+}
+export const isOverdue = (iso?: string | null) => !!iso && new Date(iso).getTime() < Date.now();
+export const pct = (r: number | null) => (r == null ? "—" : `${(r * 100).toFixed(1)}%`);
+export const first = <T,>(v: T | T[] | undefined): T | undefined => (Array.isArray(v) ? v[0] : v);

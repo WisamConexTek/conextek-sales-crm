@@ -1,0 +1,280 @@
+import { z } from "zod";
+import type { InValue } from "@libsql/client";
+import { all, one, run, now, tx, type Row } from "../db";
+import { HttpError, can, requirePerm, isManager, type Actor } from "../auth";
+import { OPEN_TASK_STATUSES, TASK_STATUSES, type TaskStatus } from "../constants";
+import { audit, parse, optText, optInt, optDate, reqText, assertListKey } from "./common";
+import { assertLeadAccess } from "./leads";
+
+/* ================= tasks ================= */
+
+async function defaultApprover(taskType: string | null): Promise<"chief" | "wisam"> {
+  if (!taskType) return "chief";
+  const r = await one("SELECT flag FROM lists WHERE kind='task_type' AND key=?", [taskType]);
+  return r?.flag === "wisam" ? "wisam" : "chief";
+}
+
+const createSchema = z.object({
+  title: reqText(200),
+  instructions: optText(8000),
+  lead_id: optInt,
+  assignee_id: optInt,
+  task_type: optText(60),
+  due_at: optDate,
+  approval: z.enum(["default", "chief", "wisam", "none"]).optional(),
+});
+
+export async function createTask(actor: Actor, input: unknown, isDemo = false) {
+  const d = parse(createSchema, input);
+  const assignee = d.assignee_id ?? actor.id;
+  if (assignee !== actor.id) requirePerm(actor, "tasks.assign");
+  else if (!can(actor, "tasks.create_own") && !can(actor, "tasks.assign")) requirePerm(actor, "tasks.create_own");
+  if (!isDemo && !(await one("SELECT id FROM users WHERE id=? AND active=1", [assignee]))) throw new HttpError(400, "assignee_id: unknown or disabled employee.");
+  let leadRow: Row | null = null;
+  if (d.lead_id) leadRow = await assertLeadAccess(actor, d.lead_id);
+  await assertListKey("task_type", d.task_type, "task_type");
+
+  const base = await defaultApprover(d.task_type);
+  const choice = d.approval ?? "default";
+  let approvalFrom: "chief" | "wisam" | null;
+  if (choice === "none") {
+    requirePerm(actor, "tasks.assign");
+    approvalFrom = null;
+  } else if (choice === "wisam") approvalFrom = "wisam";
+  else if (choice === "chief") approvalFrom = base === "wisam" && actor.role !== "owner" ? "wisam" : "chief";
+  else approvalFrom = base;
+
+  const t = now();
+  const r = await run(
+    `INSERT INTO tasks (lead_id,assignee_id,created_by,title,instructions,task_type,approval_from,due_at,is_demo,created_at,updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+    [d.lead_id, assignee, actor.id, d.title, d.instructions, d.task_type, approvalFrom, d.due_at, isDemo || leadRow?.is_demo ? 1 : 0, t, t],
+  );
+  if (d.lead_id)
+    await run(
+      `INSERT INTO activities (lead_id,task_id,type,title,body,actor_id,occurred_at,created_at,is_demo) VALUES (?,?,?,?,?,?,?,?,?)`,
+      [d.lead_id, r.id, "task", assignee === actor.id ? `Task created: ${d.title}` : `Task assigned: ${d.title}`, d.instructions, actor.id, t, t, leadRow?.is_demo ?? 0],
+    );
+  await audit(actor, "create_task", "task", r.id, { assignee, lead_id: d.lead_id, approval_from: approvalFrom });
+  return r.id;
+}
+
+export type TaskFilters = {
+  assignee?: number; status?: string; lead?: number; overdue?: boolean; open?: boolean; includeDemo?: boolean; limit?: number;
+};
+export async function listTasks(actor: Actor, f: TaskFilters = {}): Promise<Row[]> {
+  const where: string[] = [];
+  const args: InValue[] = [];
+  const viewAll = can(actor, "tasks.view_all") || isManager(actor);
+  const assignee = viewAll ? f.assignee : actor.id;
+  if (assignee) (where.push("t.assignee_id=?"), args.push(assignee));
+  if (f.status && (TASK_STATUSES as readonly string[]).includes(f.status)) (where.push("t.status=?"), args.push(f.status));
+  if (f.lead) (where.push("t.lead_id=?"), args.push(f.lead));
+  if (f.open) where.push(`t.status IN (${OPEN_TASK_STATUSES.map(() => "?").join(",")})`), args.push(...OPEN_TASK_STATUSES);
+  if (f.overdue) (where.push(`t.due_at < ? AND t.status IN ('todo','in_progress','changes_requested','approved')`), args.push(now()));
+  if (!f.includeDemo) where.push("t.is_demo=0");
+  return all(
+    `SELECT t.*, l.company, u.name AS assignee_name, cb.name AS created_by_name,
+            (SELECT a.id FROM approvals a WHERE a.task_id=t.id AND a.status='pending' ORDER BY a.id DESC LIMIT 1) AS pending_approval_id
+     FROM tasks t
+     JOIN users u ON u.id=t.assignee_id JOIN users cb ON cb.id=t.created_by LEFT JOIN leads l ON l.id=t.lead_id
+     ${where.length ? "WHERE " + where.join(" AND ") : ""}
+     ORDER BY (t.due_at IS NULL), t.due_at ASC, t.id DESC LIMIT ?`,
+    [...args, f.limit ?? 300],
+  );
+}
+
+export async function getTask(actor: Actor, id: number): Promise<Row> {
+  const t = await one(
+    `SELECT t.*, l.company, u.name AS assignee_name, cb.name AS created_by_name FROM tasks t
+     JOIN users u ON u.id=t.assignee_id JOIN users cb ON cb.id=t.created_by LEFT JOIN leads l ON l.id=t.lead_id WHERE t.id=?`,
+    [id],
+  );
+  if (!t || (t.assignee_id !== actor.id && !can(actor, "tasks.view_all") && !isManager(actor))) throw new HttpError(404, "Task not found.");
+  return t;
+}
+
+const updateSchema = z.object({
+  status: z.enum(["todo", "in_progress", "cancelled"]).optional(),
+  progress_note: optText(4000).optional(),
+  title: reqText(200).optional(),
+  instructions: optText(8000).optional(),
+  due_at: optDate.optional(),
+  assignee_id: optInt.optional(),
+});
+
+export async function updateTask(actor: Actor, id: number, input: Record<string, unknown>) {
+  const t = await getTask(actor, id);
+  const d = parse(updateSchema, Object.fromEntries(Object.entries(input).filter(([k]) => k in updateSchema.shape)));
+  const isAssignee = t.assignee_id === actor.id;
+  const canManage = can(actor, "tasks.assign");
+  const isCreator = t.created_by === actor.id;
+  if (!isAssignee && !canManage) throw new HttpError(403, "This task is not assigned to you.");
+  if (["completed", "cancelled"].includes(t.status)) throw new HttpError(400, `Task is already ${t.status}.`);
+
+  const sets: string[] = [];
+  const args: InValue[] = [];
+  const changes: Record<string, unknown> = {};
+  const set = (k: string, v: InValue) => {
+    if (v !== t[k]) (sets.push(`${k}=?`), args.push(v), (changes[k] = { from: t[k], to: v }));
+  };
+
+  if (d.progress_note !== undefined) set("progress_note", d.progress_note);
+  if (d.status) {
+    if (d.status === "cancelled") {
+      if (!canManage && !isCreator) throw new HttpError(403, "Only the person who assigned a task (or a manager) can cancel it.");
+      set("status", "cancelled");
+    } else {
+      if (!["todo", "in_progress", "changes_requested"].includes(t.status))
+        throw new HttpError(400, `A task that is "${t.status}" can't be moved to ${d.status} by hand.`);
+      set("status", d.status);
+    }
+  }
+  if (d.title !== undefined || d.instructions !== undefined || d.due_at !== undefined || d.assignee_id !== undefined) {
+    if (!canManage && !(isCreator && isAssignee)) throw new HttpError(403, "Only a manager can change the task's details, due date or assignee.");
+    if (d.title !== undefined) set("title", d.title);
+    if (d.instructions !== undefined) set("instructions", d.instructions);
+    if (d.due_at !== undefined) set("due_at", d.due_at);
+    if (d.assignee_id !== undefined && d.assignee_id !== null) {
+      if (!canManage) throw new HttpError(403, "Only a manager can reassign tasks.");
+      if (!(await one("SELECT id FROM users WHERE id=? AND active=1", [d.assignee_id]))) throw new HttpError(400, "assignee_id: unknown or disabled employee.");
+      set("assignee_id", d.assignee_id);
+    }
+  }
+  if (!sets.length) return;
+  const stmts = [{ sql: `UPDATE tasks SET ${sets.join(",")}, updated_at=? WHERE id=?`, args: [...args, now(), id] as InValue[] }];
+  if (d.status === "cancelled")
+    stmts.push({
+      sql: "UPDATE approvals SET status='rejected', decided_by=?, decided_at=?, comment='Task was cancelled' WHERE task_id=? AND status='pending'",
+      args: [actor.id, now(), id],
+    });
+  await tx(stmts);
+  if (t.lead_id && d.status === "cancelled")
+    await run(`INSERT INTO activities (lead_id,task_id,type,title,actor_id,occurred_at,created_at,is_demo) VALUES (?,?,?,?,?,?,?,?)`,
+      [t.lead_id, id, "task", `Task cancelled: ${t.title}`, actor.id, now(), now(), t.is_demo]);
+  await audit(actor, "update_task", "task", id, changes);
+}
+
+/** Employee says: the work is done (outside the CRM). Tasks that need approval must be approved first. */
+export async function completeTask(actor: Actor, id: number, note?: string | null) {
+  const t = await getTask(actor, id);
+  if (t.assignee_id !== actor.id && !can(actor, "tasks.assign")) throw new HttpError(403, "This task is not assigned to you.");
+  if (["completed", "cancelled"].includes(t.status)) throw new HttpError(400, `Task is already ${t.status}.`);
+  if (t.approval_from && t.status !== "approved")
+    throw new HttpError(400, t.status === "waiting_approval" ? `Waiting for ${t.approval_from === "wisam" ? "Wisam" : "Chief"} to approve.` : "This task needs approval first — submit it for approval.");
+  const ts = now();
+  await run("UPDATE tasks SET status='completed', completed_at=?, progress_note=COALESCE(?,progress_note), updated_at=? WHERE id=?", [ts, note?.trim() || null, ts, id]);
+  if (t.lead_id)
+    await run(`INSERT INTO activities (lead_id,task_id,type,title,body,actor_id,occurred_at,created_at,is_demo) VALUES (?,?,?,?,?,?,?,?,?)`,
+      [t.lead_id, id, "task", `Task completed: ${t.title}`, note?.trim() || null, actor.id, ts, ts, t.is_demo]);
+  await audit(actor, "complete_task", "task", id);
+}
+
+/* ================= approvals ================= */
+
+const submitSchema = z.object({
+  kind: z.enum(["draft", "findings", "other"]),
+  title: optText(200),
+  content: z.string().trim().min(3, "describe the draft or findings you are submitting").max(30000),
+});
+
+export async function submitTask(actor: Actor, taskId: number, input: unknown) {
+  requirePerm(actor, "approvals.submit");
+  const t = await getTask(actor, taskId);
+  if (t.assignee_id !== actor.id) throw new HttpError(403, "Only the assignee can submit this task.");
+  if (!["todo", "in_progress", "changes_requested"].includes(t.status)) throw new HttpError(400, `Can't submit a task that is "${t.status}".`);
+  if (!t.approval_from) throw new HttpError(400, "This task does not need approval — record the work and mark it complete.");
+  const d = parse(submitSchema, input);
+  // A Chief can't approve their own work: it goes to Wisam.
+  const requires = t.approval_from === "chief" && actor.role === "chief" ? "wisam" : t.approval_from;
+  const ts = now();
+  const title = d.title || t.title;
+  const r = await run(
+    `INSERT INTO approvals (task_id,lead_id,submitted_by,kind,title,content,requires,is_demo,created_at) VALUES (?,?,?,?,?,?,?,?,?)`,
+    [taskId, t.lead_id, actor.id, d.kind, title, d.content, requires, t.is_demo, ts],
+  );
+  await tx([
+    { sql: "UPDATE tasks SET status='waiting_approval', approval_from=?, change_request=NULL, updated_at=? WHERE id=?", args: [requires, ts, taskId] },
+  ]);
+  if (t.lead_id) {
+    if (d.kind !== "other")
+      await run(`INSERT INTO activities (lead_id,task_id,approval_id,type,title,body,actor_id,occurred_at,created_at,is_demo) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+        [t.lead_id, taskId, r.id, d.kind === "draft" ? "draft" : "research", title, d.content, actor.id, ts, ts, t.is_demo]);
+    await run(`INSERT INTO activities (lead_id,task_id,approval_id,type,title,actor_id,occurred_at,created_at,is_demo) VALUES (?,?,?,?,?,?,?,?,?)`,
+      [t.lead_id, taskId, r.id, "approval", `Submitted for approval (${requires === "wisam" ? "Wisam" : "Chief"})`, actor.id, ts, ts, t.is_demo]);
+  }
+  await audit(actor, "submit_for_approval", "approval", r.id, { task_id: taskId, requires });
+  return r.id;
+}
+
+export function canDecide(actor: Actor, ap: Row): { ok: boolean; reason?: string } {
+  if (!can(actor, "approvals.decide")) return { ok: false, reason: "Your account can't decide approvals." };
+  if (ap.status !== "pending") return { ok: false, reason: "Already decided." };
+  if (ap.submitted_by === actor.id && actor.role !== "owner") return { ok: false, reason: "You can't approve your own submission." };
+  if (ap.requires === "wisam" && actor.role !== "owner") return { ok: false, reason: "Pending Wisam — only the owner can decide this." };
+  return { ok: true };
+}
+
+export async function listApprovals(actor: Actor, f: { status?: string; requires?: string; includeDemo?: boolean } = {}): Promise<Row[]> {
+  const where: string[] = [];
+  const args: InValue[] = [];
+  if (!can(actor, "approvals.decide") && !isManager(actor)) (where.push("a.submitted_by=?"), args.push(actor.id));
+  if (f.status) (where.push("a.status=?"), args.push(f.status));
+  if (f.requires) (where.push("a.requires=?"), args.push(f.requires));
+  if (!f.includeDemo) where.push("a.is_demo=0");
+  return all(
+    `SELECT a.*, l.company, l.stage, t.title AS task_title, t.instructions AS task_instructions, t.task_type,
+            s.name AS submitted_by_name, d.name AS decided_by_name
+     FROM approvals a JOIN tasks t ON t.id=a.task_id JOIN users s ON s.id=a.submitted_by
+     LEFT JOIN users d ON d.id=a.decided_by LEFT JOIN leads l ON l.id=a.lead_id
+     ${where.length ? "WHERE " + where.join(" AND ") : ""}
+     ORDER BY (a.status='pending') DESC, a.created_at DESC LIMIT 200`,
+    args,
+  );
+}
+
+const decisionSchema = z.object({
+  decision: z.enum(["approved", "rejected", "changes_requested"]),
+  comment: optText(4000),
+});
+
+export async function decideApproval(actor: Actor, approvalId: number, input: unknown) {
+  const d = parse(decisionSchema, input);
+  const ap = await one("SELECT * FROM approvals WHERE id=?", [approvalId]);
+  if (!ap) throw new HttpError(404, "Approval not found.");
+  const c = canDecide(actor, ap);
+  if (!c.ok) throw new HttpError(403, c.reason!);
+  if (d.decision !== "approved" && !d.comment) throw new HttpError(400, "comment: explain what is wrong / what to change.");
+  const ts = now();
+  const taskStatus: TaskStatus = d.decision === "approved" ? "approved" : d.decision === "rejected" ? "cancelled" : "changes_requested";
+  await tx([
+    { sql: "UPDATE approvals SET status=?, decided_by=?, decided_at=?, comment=? WHERE id=?", args: [d.decision, actor.id, ts, d.comment, approvalId] },
+    {
+      sql: "UPDATE tasks SET status=?, change_request=?, completed_at=NULL, updated_at=? WHERE id=?",
+      args: [taskStatus, d.decision === "changes_requested" ? d.comment : null, ts, ap.task_id],
+    },
+  ]);
+  const label = d.decision === "approved" ? "Approved" : d.decision === "rejected" ? "Rejected" : "Changes requested";
+  if (ap.lead_id)
+    await run(`INSERT INTO activities (lead_id,task_id,approval_id,type,title,body,actor_id,occurred_at,created_at,is_demo) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      [ap.lead_id, ap.task_id, approvalId, "approval", `${label}: ${ap.title}`, d.comment, actor.id, ts, ts, ap.is_demo]);
+  await audit(actor, `approval_${d.decision}`, "approval", approvalId, { task_id: ap.task_id, comment: d.comment });
+}
+
+/** Chief hands a pending item up to Wisam. */
+export async function escalateApproval(actor: Actor, approvalId: number, comment: string) {
+  const ap = await one("SELECT * FROM approvals WHERE id=?", [approvalId]);
+  if (!ap) throw new HttpError(404, "Approval not found.");
+  if (ap.status !== "pending") throw new HttpError(400, "Already decided.");
+  if (ap.requires === "wisam") throw new HttpError(400, "Already waiting for Wisam.");
+  if (!can(actor, "approvals.decide")) throw new HttpError(403, "Your account can't act on approvals.");
+  const ts = now();
+  await tx([
+    { sql: "UPDATE approvals SET requires='wisam', comment=? WHERE id=?", args: [comment?.trim() || null, approvalId] },
+    { sql: "UPDATE tasks SET approval_from='wisam', updated_at=? WHERE id=?", args: [ts, ap.task_id] },
+  ]);
+  if (ap.lead_id)
+    await run(`INSERT INTO activities (lead_id,task_id,approval_id,type,title,body,actor_id,occurred_at,created_at,is_demo) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      [ap.lead_id, ap.task_id, approvalId, "approval", `Escalated to Wisam: ${ap.title}`, comment?.trim() || null, actor.id, ts, ts, ap.is_demo]);
+  await audit(actor, "approval_escalated", "approval", approvalId, { comment });
+}
