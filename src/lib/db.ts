@@ -152,6 +152,28 @@ export function localMidnight(ymd: string, tz = TZ()): Date {
   t = guess - tzOffsetMs(new Date(t), tz);
   return new Date(t);
 }
+/**
+ * Convert a zone-less wall-clock time ("2026-10-24 04:12" in `tz`) to a UTC instant using the offset that applies AT THAT
+ * INSTANT (never the offset of local midnight — they differ on a DST change day).
+ *  ok          -> exactly one instant
+ *  ambiguous   -> the clock time happens twice (clocks go back); `instant` = the earlier one
+ *  nonexistent -> the clock time is skipped (clocks go forward); `instant` = shifted forward by the gap
+ */
+export function localInstant(ymd: string, h: number, mi: number, sec = 0, tz = TZ()): { instant: number; status: "ok" | "ambiguous" | "nonexistent"; all: number[] } {
+  const [y, m, d] = ymd.split("-").map(Number);
+  const wall = Date.UTC(y, m - 1, d, h, mi, sec);
+  const before = tzOffsetMs(new Date(wall - 86400000), tz);
+  const after = tzOffsetMs(new Date(wall + 86400000), tz);
+  const valid: number[] = [];
+  for (const o of new Set([before, after])) {
+    const u = wall - o;
+    if (tzOffsetMs(new Date(u), tz) === o) valid.push(u);
+  }
+  valid.sort((a, b) => a - b);
+  if (valid.length === 1) return { instant: valid[0], status: "ok", all: valid };
+  if (valid.length > 1) return { instant: valid[0], status: "ambiguous", all: valid };
+  return { instant: wall - before, status: "nonexistent", all: [] };
+}
 export function todayYmd(tz = TZ(), at = new Date()): string {
   return new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).format(at);
 }

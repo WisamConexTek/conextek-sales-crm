@@ -36,6 +36,7 @@ export default async function ApiDocs() {
     ["GET", "/leads/duplicates?company=&website=&email=", "Check before creating a lead."],
     ["POST", "/leads", "Create a lead (with optional contacts[] and lead_date)."],
     ["POST", "/import/history", "Historical import: leads, messages, replies, bounces, do_not_contact. Dry run unless commit:true. Needs history.import."],
+    ["POST", "/import/activity-times", "Correct only the event time of existing activities (dry run unless commit:true). Needs history.import."],
     ["POST", "/import/reconcile-activities", "Attach external_id (and optionally correct the original employee) on existing activities. Dry run unless commit:true. Needs history.import."],
     ["GET", "/reports?all=1 | from=&to= | period=&at=&employee=", "Dashboard/report totals with timezone, unknown counts and counting rules."],
     ["POST", "/import/lead-dates", "Bulk-correct original lead dates of existing leads. Dry run unless commit:true. Needs history.import."],
@@ -65,7 +66,7 @@ export default async function ApiDocs() {
           <li><b>An approved draft is not a sent message.</b> Record a send (<code>type: "message"</code>) only after it really went out — and only if your key has <code>message.record_sent</code>.</li>
           <li>You cannot approve your own submission. Items marked <i>Wisam</i> can only be decided by Wisam. CRM approval does not override Wisam's rules about who may send or approve.</li>
           <li>Stage changes must reflect what actually happened and carry a short <code>reason</code>.</li>
-          <li><b>Dates are the real dates.</b> <code>occurred_at</code> (and <code>lead_date</code> on leads) is when it <i>happened</i>, never the future. <code>"2025-03-14"</code> = that day, no hour; <code>"2025-03-14T09:30"</code> = exact time (APP_TIMEZONE); omitted <code>occurred_at</code> = just now; <code>"unknown"</code> = date not known. Unknown is kept as unknown — it is never turned into today, and is left out of period reports. Reports count each thing on the day it happened, not the day it was entered.</li>
+          <li><b>Dates are the real dates.</b> <code>occurred_at</code> (and <code>lead_date</code> on leads) is when it <i>happened</i>, never the future. <code>"2025-03-14"</code> = that day, no hour; <code>"2025-03-14T09:30"</code> = exact time read in APP_TIMEZONE; <code>"2025-03-14T09:30:00Z"</code> or <code>"2025-03-14T17:30:00+08:00"</code> = that exact instant (see Timestamps); omitted <code>occurred_at</code> = just now; <code>"unknown"</code> = date not known. Unknown is kept as unknown — it is never turned into today, and is left out of period reports. Reports count each thing on the day it happened, not the day it was entered.</li>
           <li><b>Test data:</b> records with <code>"is_test": true</code> are labelled TEST in the app and are never counted in the dashboard or reports. Create a test lead with <code>"is_test": true</code>; its tasks, history and approvals follow it.</li>
           <li><b>IDs are shared:</b> the task and approval numbers you get here are the same ones shown in the app as “Task #12” / “Approval #5” (with a Copy link button). Quote them when you talk to the team.</li>
         </ul>
@@ -168,7 +169,7 @@ export default async function ApiDocs() {
           <li><b>No duplicates.</b> Give each record a stable <code>external_id</code> (e.g. <code>"hunter-2025-0412"</code>). A record with an external_id already imported is skipped. Leads are also matched on website, company name or contact email; messages and replies on lead + channel + date + employee + contact + subject. Re-sending a chunk is safe.</li>
           <li><b>Do-not-contact is preserved.</b> Contacts with <code>email_status</code> <code>opted_out</code>/<code>bounced</code> (or <code>"do_not_contact": true</code>) keep that state, also on leads that already exist. A state is only ever made stricter, never relaxed.</li>
           <li><b>Unknown dates stay unknown</b> (omit the date or send <code>"unknown"</code>). Such records need an <code>external_id</code> and are not placed in any period.</li>
-          <li>Max 200 records per request. Send leads before the messages that refer to them (or in the same request). References to a lead: <code>{`{"external_id":"…"}`}</code>, <code>{`{"id":12}`}</code>, <code>{`{"website":"…"}`}</code> or <code>{`{"company":"…"}`}</code>.</li>
+          <li>Max 200 records per request, <b>recommended 100</b> (see Batch size). Send leads before the messages that refer to them (or in the same request). References to a lead: <code>{`{"external_id":"…"}`}</code>, <code>{`{"id":12}`}</code>, <code>{`{"website":"…"}`}</code> or <code>{`{"company":"…"}`}</code>.</li>
           <li><b>Original employee.</b> <code>employee</code> = who did the original work: a username, or <code>null</code> (also <code>"unknown"</code>) when it is not known. Set it once at the top level and/or per record (a record value wins; <code>"employee": null</code> on a record overrides a named top-level value). It is <b>required</b> somewhere — leaving it out is an error, so unknown is always a deliberate choice. Unknown is stored as empty: it is never replaced by the importer, the lead owner or the assignee. <code>imported_by</code> is always filled from the API key owner. Unknown-actor records show as “Unknown original employee”, are included in all totals and credited to nobody. Replies and bounces that omit <code>employee</code> inherit the original employee of the message they belong to (even if that is unknown). <code>do_not_contact[]</code> follows the same rule.</li>
           <li>Lists accept the key or the label.</li>
         </ul>
@@ -225,6 +226,35 @@ export default async function ApiDocs() {
                { "activity_id": 452, "external_id": "boya-reply-2026-11-04",      "lead_id": 90, "type": "reply" } ]
 }'
 # Correct only the original employee of a lead / its dates use POST /import/lead-dates (employee: "sara" | null).`}</Code>
+
+
+        <H>Timestamps (read this before importing logs)</H>
+        <ul className="mb-2 list-disc space-y-1 pl-5 text-sm text-slate-700">
+          <li><b>Always send an explicit instant when you know the source’s zone.</b> Every event-date field (<code>lead_date</code>, <code>sent_at</code>, <code>received_at</code>, <code>bounced_at</code>, <code>at</code>, <code>occurred_at</code>) accepts ISO 8601 with <code>Z</code> or a numeric offset: <code>2026-10-24T02:12:00Z</code>, <code>2026-10-24T10:12:00+08:00</code>, <code>…+0800</code>, <code>…+08</code>; seconds and milliseconds are kept. That exact instant is stored; APP_TIMEZONE is not involved. A Shanghai log line “10:12” is therefore sent as <code>2026-10-24T10:12:00+08:00</code>.</li>
+          <li><b>Zone-less</b> <code>YYYY-MM-DDTHH:mm[:ss]</code> is read in APP_TIMEZONE using the UTC offset that applies <i>at that moment</i> (not the offset at midnight). If that clock time does not exist or happens twice because of a clock change, it is <b>rejected</b> with an explanation instead of guessed — resend it with an explicit offset.</li>
+          <li><b>Date-only</b> (<code>YYYY-MM-DD</code>) = that local day, no hour (stored as local midnight, precision day). <b>Unknown</b> stays unknown. Reports group by local day in APP_TIMEZONE; the stored instant is never changed by grouping.</li>
+          <li>Other formats (e.g. “Oct 24 2026 10:12”, <code>14/03/2025</code>) are refused.</li>
+          <li><b>What went wrong before:</b> zone-less times were computed as local midnight plus the clock time, which is one hour off on a day when the clock changes (Asia/Hebron went back from UTC+3 to UTC+2 at 2026-10-24 02:00 local, so 04:12 became 01:12Z instead of 02:12Z). Fixed; covered by regression tests for Oct 23, 24, 31 and Nov 7.</li>
+        </ul>
+        <H>Correct the time of activities already imported</H>
+        <P>Changes <b>only</b> <code>occurred_at</code> (marking it an exact time). IDs, external ids, parents, actors, importers, texts, <code>created_at</code>, lead and type are untouched; nothing is created or deleted, so corrected records are not new sends. Optional <code>from</code> = the timestamp you expect to find now (the record is refused if it differs); <code>lead_id</code>, <code>type</code> and <code>external_id</code> are optional safety checks. Dry run unless <code>"commit": true</code>; any error blocks the whole commit; running it again reports <code>unchanged</code>. Every change is audited with the old and new time. Needs <code>history.import</code>.</P>
+        <Code>{`curl -X POST ${HD} ${base}/import/activity-times -d '{
+  "label": "Fix Oct 24 Shanghai sends", "commit": false,
+  "records": [
+    { "activity_id": 469, "occurred_at": "2026-10-24T10:12:00+08:00", "from": "2026-10-24T01:12:00.000Z", "type": "message" },
+    { "activity_id": 470, "occurred_at": "2026-10-24T10:30:00+08:00", "from": "2026-10-24T01:30:00.000Z", "type": "message" },
+    { "activity_id": 471, "occurred_at": "2026-10-24T10:39:00+08:00", "from": "2026-10-24T01:39:00.000Z", "type": "message" },
+    { "activity_id": 472, "occurred_at": "2026-10-24T10:48:00+08:00", "from": "2026-10-24T01:48:00.000Z", "type": "message" }
+  ]
+}'
+# → counts { will_change: 4 } and per-record from/to. Send again with "commit": true to apply.`}</Code>
+        <H>Batch size and performance</H>
+        <ul className="mb-2 list-disc space-y-1 pl-5 text-sm text-slate-700">
+          <li>The import now loads contacts and past activities once and checks everything in memory; it makes roughly <b>one database call per record it creates</b> (it used to make about eight). Records that already exist cost nothing, so retries are fast. The response includes <code>stats.database_calls</code>, <code>stats.milliseconds</code> and <code>stats.records</code>.</li>
+          <li>Send at most <b>100 records per request</b> (hard limit 200). A dry run costs about the same as the real import, because it performs the writes inside a transaction and rolls it back.</li>
+          <li>If a request cannot finish in about 40 seconds it stops and answers <b>HTTP 413</b> “batch too large”, saving nothing — instead of an opaque 504. Halve the batch and retry; re-sending is always safe.</li>
+          <li>The database region should be close to the Vercel function region; every call is a network round trip.</li>
+        </ul>
 
         <H>Lead dates: keeping unknown dates unknown</H>
         <P>In <code>/import/lead-dates</code>, <code>"lead_date": "unknown"</code> (or <code>null</code>) means “still unknown”: a lead that is already unknown comes back <code>unchanged</code>. Never send the first-email date, a file date or the import date as a lead date. <code>employee</code> alone (without <code>lead_date</code>) corrects only the original employee (<code>null</code> = unknown); the previous value is kept as <code>imported_by</code>. <code>created_at</code> never changes.</P>

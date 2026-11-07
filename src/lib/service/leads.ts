@@ -2,7 +2,7 @@ import { z } from "zod";
 import type { InValue } from "@libsql/client";
 import { all, one, run, now, tx, type Row } from "../db";
 import { HttpError, can, requirePerm, isManager, type Actor } from "../auth";
-import { audit, parse, optText, reqText, optDate, optBool, domainOf, assertListKey, optInt, parseEventDate, eventDateText, type EventDate } from "./common";
+import { audit, parse, optText, reqText, optDate, optBool, domainOf, assertListKey, optInt, parseEventDate, eventDateText, dateProblem, type EventDate } from "./common";
 
 /* ---------- access ---------- */
 export function leadScope(actor: Actor, alias = "l"): { sql: string; args: InValue[] } {
@@ -90,7 +90,7 @@ function leadDateFrom(v: unknown, fallbackNow: string, unknownByDefault: boolean
   const blank = v == null || (typeof v === "string" && v.trim() === "");
   if (blank) return unknownByDefault ? { at: null, precision: "unknown" } : { at: fallbackNow, precision: "time" };
   const e = parseEventDate(v);
-  if (e === "invalid") throw new HttpError(400, 'lead_date: use YYYY-MM-DD (date only), YYYY-MM-DDTHH:mm, or "unknown".');
+  if (typeof e === "string") throw new HttpError(400, dateProblem(e, "lead_date"));
   if (e.at && new Date(e.at).getTime() > Date.now() + 5 * 60000) throw new HttpError(400, "lead_date: cannot be in the future.");
   return e;
 }
@@ -164,7 +164,7 @@ export async function updateLead(actor: Actor, leadId: number, input: Record<str
   let dateChange: EventDate | null = null;
   if ("lead_date" in input) {
     const e = parseEventDate(input.lead_date);
-    if (e === "invalid") throw new HttpError(400, 'lead_date: use YYYY-MM-DD (date only), YYYY-MM-DDTHH:mm, or "unknown".');
+    if (typeof e === "string") throw new HttpError(400, dateProblem(e, "lead_date"));
     if (e.at && new Date(e.at).getTime() > Date.now() + 5 * 60000) throw new HttpError(400, "lead_date: cannot be in the future.");
     dateChange = e;
     // A date-only value that equals the day we already hold (e.g. an edit form that was not touched) keeps the exact time.

@@ -9,7 +9,7 @@
     "typecheck": "tsc --noEmit",
     "db:migrate": "tsx scripts/migrate.ts",
     "seed:demo": "tsx scripts/seed-demo.ts",
-    "test": "tsx scripts/smoke-test.ts"
+    "test": "tsx scripts/smoke-test.ts && tsx scripts/time-test.ts"
   },
   "dependencies": {
     "@libsql/client": "^0.18.0",

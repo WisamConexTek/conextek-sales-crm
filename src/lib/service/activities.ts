@@ -2,7 +2,7 @@ import { z } from "zod";
 import { one, run, now, tx } from "../db";
 import { HttpError, requirePerm, isManager, type Actor } from "../auth";
 import { MESSAGE_KINDS, RECORDABLE_TYPES } from "../constants";
-import { parse, optText, optInt, assertListKey, parseEventDate } from "./common";
+import { parse, optText, optInt, assertListKey, parseEventDate, dateProblem } from "./common";
 import { assertLeadAccess } from "./leads";
 
 const schema = z.object({
@@ -34,7 +34,7 @@ export async function recordActivity(actor: Actor, leadId: number, input: unknow
   // Omitted = it just happened. A date without hour is kept as that day. "unknown" stays unknown (never turned into today).
   const blank = d.occurred_at == null || (typeof d.occurred_at === "string" && d.occurred_at.trim() === "");
   const ev = blank ? ({ at: now(), precision: "time" } as const) : parseEventDate(d.occurred_at);
-  if (ev === "invalid") throw new HttpError(400, 'occurred_at: use YYYY-MM-DD (date only), YYYY-MM-DDTHH:mm, an ISO time, or "unknown".');
+  if (typeof ev === "string") throw new HttpError(400, dateProblem(ev, "occurred_at"));
   if (ev.at && new Date(ev.at).getTime() > Date.now() + 5 * 60000) throw new HttpError(400, "occurred_at: cannot be in the future — record work only after it happened.");
   const unknownDate = ev.precision === "unknown";
   const occurred = ev.at ?? now(); // for unknown dates this is only the registration time, flagged by occurred_precision

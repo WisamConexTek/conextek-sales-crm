@@ -1,7 +1,7 @@
 import type { InValue, Transaction } from "@libsql/client";
 import { all, one, run, now, ready, todayYmd, localMidnight, addDays } from "../db";
 import { HttpError, requirePerm, type Actor } from "../auth";
-import { audit, domainOf, parseEventDate, eventDateText, type EventDate } from "./common";
+import { audit, domainOf, parseEventDate, eventDateText, dateProblem, type EventDate } from "./common";
 
 /**
  * Historical import + original-date corrections.
@@ -92,7 +92,7 @@ export async function importHistory(actor: Actor, body: Rec) {
   };
   const dateOf = (v: unknown, field: string, mustKnow: boolean): EventDate => {
     const e = parseEventDate(v);
-    if (e === "invalid") throw new Error(`${field}: use YYYY-MM-DD (date only), YYYY-MM-DDTHH:mm, an ISO time, or omit/"unknown" if the date is not known.`);
+    if (typeof e === "string") throw new Error(dateProblem(e, field));
     if (e.at && new Date(e.at).getTime() > Date.now() + 5 * 60000) throw new Error(`${field}: cannot be in the future.`);
     if (mustKnow && !e.at) throw new Error(`${field}: required.`);
     return e;
@@ -110,7 +110,19 @@ export async function importHistory(actor: Actor, body: Rec) {
     byCompany.set(l.company.toLowerCase(), [...(byCompany.get(l.company.toLowerCase()) ?? []), l]);
   };
   leadRows.forEach(addLead);
-  const emailToLead = new Map<string, number>(); // in-batch contact emails -> lead
+  // Contacts are preloaded once (one query) and kept in memory; every lookup below is free of round trips.
+  type C = { id: number; lead_id: number; email: string | null; status: string };
+  const contactById = new Map<number, C>(), contactByKey = new Map<string, C>(), contactCount = new Map<number, number>();
+  const emailToLead = new Map<string, number>(); // contact email -> a real (non-test) lead
+  for (const r of await all("SELECT c.id,c.lead_id,lower(c.email) AS email,c.email_status AS status,l.is_demo FROM contacts c JOIN leads l ON l.id=c.lead_id")) {
+    const cc: C = { id: r.id, lead_id: r.lead_id, email: r.email, status: r.status };
+    contactById.set(cc.id, cc);
+    contactCount.set(cc.lead_id, (contactCount.get(cc.lead_id) ?? 0) + 1);
+    if (cc.email) {
+      contactByKey.set(`${cc.lead_id}|${cc.email}`, cc);
+      if (!r.is_demo && !emailToLead.has(cc.email)) emailToLead.set(cc.email, cc.lead_id);
+    }
+  }
   const unique = (xs: L[] | undefined, what: string): L | null => {
     if (!xs || !xs.length) return null;
     if (new Set(xs.map((x) => x.id)).size > 1) throw new Error(`${what} matches more than one lead (${xs.map((x) => "#" + x.id).join(", ")}) — use lead.id or lead.external_id.`);
@@ -128,53 +140,68 @@ export async function importHistory(actor: Actor, body: Rec) {
     return l;
   };
 
+  // Activities are preloaded once too (text columns excluded): duplicate / parent / bounce checks are then in-memory.
+  type Act = { id: number; type: string; lead_id: number; contact_id: number | null; message_kind: string | null; actor_id: number | null; occurred_at: string; precision: string; channel: string | null; title: string | null; external_id: string | null };
+  const toAct = (r: Rec): Act => ({ id: Number(r.id), type: String(r.type), lead_id: Number(r.lead_id), contact_id: r.contact_id == null ? null : Number(r.contact_id), message_kind: (r.message_kind as string | null) ?? null, actor_id: r.actor_id == null ? null : Number(r.actor_id), occurred_at: String(r.occurred_at), precision: String(r.precision), channel: (r.channel as string | null) ?? null, title: (r.title as string | null) ?? null, external_id: (r.external_id as string | null) ?? null });
+  const actByExt = new Map<string, Act>(), actById = new Map<number, Act>(), actsByLead = new Map<number, Act[]>(), bounceOf = new Map<number, number>();
+  const addAct = (a: Act) => {
+    actById.set(a.id, a);
+    if (a.external_id) actByExt.set(a.external_id, a);
+    const l = actsByLead.get(a.lead_id);
+    if (l) l.push(a); else actsByLead.set(a.lead_id, [a]);
+  };
+  for (const r of await all("SELECT id,type,lead_id,contact_id,message_kind,actor_id,occurred_at,occurred_precision AS precision,channel,title,external_id,parent_id,outcome FROM activities WHERE type IN ('message','reply','outcome','note')")) {
+    addAct(toAct(r));
+    if (r.type === "outcome" && r.outcome === "bounced" && r.parent_id != null) bounceOf.set(Number(r.parent_id), Number(r.id));
+  }
+  const loadAct = (ext: string) => actByExt.get(ext) ?? null;
+  const loadActById = (id: number) => actById.get(id) ?? null;
+
   const c = await ready();
   const t: Transaction = await c.transaction("write");
-  const q = async (sql: string, args: InValue[] = []) => (await t.execute({ sql, args })).rows.map((r) => ({ ...r }) as Rec);
+  const started = Date.now();
+  const stats = { queries: 0 };
+  const q = async (sql: string, args: InValue[] = []) => (stats.queries++, (await t.execute({ sql, args })).rows.map((r) => ({ ...r }) as Rec));
   const x = async (sql: string, args: InValue[] = []) => {
+    stats.queries++;
     const r = await t.execute({ sql, args });
     return Number(r.lastInsertRowid ?? 0);
+  };
+  /** Stop with a clear message long before the platform's own timeout turns the request into an opaque 504. */
+  const BUDGET_MS = Number(process.env.IMPORT_TIME_BUDGET_MS) || 40000;
+  const tick = () => {
+    if (Date.now() - started > BUDGET_MS)
+      throw new HttpError(413, `This batch is too large for one request (still working after ${Math.round(BUDGET_MS / 1000)}s; ${stats.queries} database calls so far). Nothing was saved. Send fewer records per request — re-sending is safe.`);
   };
   const at = now();
   let batchId: number | null = null;
   const ensureBatch = async () => (batchId ??= await x("INSERT INTO import_batches (kind,label,imported_by,created_at) VALUES ('history',?,?,?)", [label, actor.id, at]));
-
-  type Act = { id: number; type: string; lead_id: number; contact_id: number | null; message_kind: string | null; actor_id: number | null; occurred_at: string; precision: string };
-  const toAct = (r: Rec): Act => ({ id: Number(r.id), type: String(r.type), lead_id: Number(r.lead_id), contact_id: r.contact_id == null ? null : Number(r.contact_id), message_kind: r.message_kind as string | null, actor_id: r.actor_id == null ? null : Number(r.actor_id), occurred_at: String(r.occurred_at), precision: String(r.precision) });
-  const actByExt = new Map<string, Act>();
-  const loadAct = async (ext: string) => {
-    if (actByExt.has(ext)) return actByExt.get(ext)!;
-    const [r] = await q("SELECT id,type,lead_id,contact_id,message_kind,actor_id,occurred_at,occurred_precision AS precision FROM activities WHERE external_id=?", [ext]);
-    if (!r) return null;
-    const v = toAct(r);
-    actByExt.set(ext, v);
-    return v;
-  };
-  const loadActById = async (id: number) => {
-    const [r] = await q("SELECT id,type,lead_id,contact_id,message_kind,actor_id,occurred_at,occurred_precision AS precision FROM activities WHERE id=?", [id]);
-    return r ? toAct(r) : null;
-  };
+  const lastAct = new Map<number, string>(); // lead -> latest dated event; written once per lead at the end
 
   /** Find a lead's contact by email (optionally creating one). Never lowers a deliverability state. */
   const contactFor = async (leadId: number, email: unknown, create: { status?: string; name?: string | null } | false) => {
     const e = str(email)?.toLowerCase();
     if (!e) return null;
     if (!EMAIL.test(e)) throw new Error(`contact_email: "${e}" is not a valid email.`);
-    const [row] = await q("SELECT id,email_status FROM contacts WHERE lead_id=? AND lower(email)=?", [leadId, e]);
-    if (row) return { id: Number(row.id), status: String(row.email_status) };
+    const row = contactByKey.get(`${leadId}|${e}`);
+    if (row) return { id: row.id, status: row.status };
     if (!create) return null;
     const status = create.status && CONTACT_STATUSES.includes(create.status) ? create.status : "unknown";
-    const primary = Number((await q("SELECT COUNT(*) AS n FROM contacts WHERE lead_id=?", [leadId]))[0].n) === 0 ? 1 : 0;
+    const primary = (contactCount.get(leadId) ?? 0) === 0 ? 1 : 0;
     const id = await x(
       "INSERT INTO contacts (lead_id,name,email,email_status,is_primary,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
       [leadId, create.name || e, e, status, primary, at, at],
     );
-    emailToLead.set(e, leadId);
+    const cc: C = { id, lead_id: leadId, email: e, status };
+    contactById.set(id, cc); contactByKey.set(`${leadId}|${e}`, cc); contactCount.set(leadId, (contactCount.get(leadId) ?? 0) + 1);
+    if (!byId.get(leadId)?.is_demo && !emailToLead.has(e)) emailToLead.set(e, leadId);
     return { id, status };
   };
   const escalate = async (contactId: number, current: string, next: string) => {
     if ((STATUS_RANK[next] ?? 0) > (STATUS_RANK[current] ?? 0)) {
       await x("UPDATE contacts SET email_status=?, updated_at=? WHERE id=?", [next, at, contactId]);
+      const cc = contactById.get(contactId);
+      if (cc) cc.status = next;
       return true;
     }
     return false;
@@ -189,6 +216,7 @@ export async function importHistory(actor: Actor, body: Rec) {
   try {
     /* ---------------- leads ---------------- */
     for (const [i, r] of sections.leads.entries()) {
+      tick();
       const ext = str(r.external_id, 120);
       try {
         // Same external_id already imported -> skip.
@@ -222,7 +250,7 @@ export async function importHistory(actor: Actor, body: Rec) {
           if (!dup)
             for (const cc of cs) {
               if (!cc.email) continue;
-              const hit = emailToLead.get(cc.email) ?? ((await q("SELECT c.lead_id FROM contacts c JOIN leads l ON l.id=c.lead_id WHERE lower(c.email)=? AND l.is_demo=0 LIMIT 1", [cc.email]))[0]?.lead_id as number | undefined);
+              const hit = emailToLead.get(cc.email);
               if (hit && byId.get(Number(hit))) { dup = byId.get(Number(hit))!; reason = `same contact email (${cc.email})`; break; }
             }
         }
@@ -255,11 +283,17 @@ export async function importHistory(actor: Actor, body: Rec) {
             ld.at, ld.precision === "unknown" ? null : ld.precision, ext, actor.id, bid, r.historical_only === true ? 1 : 0],
         );
         for (const [k, cc] of cs.entries()) {
-          await x(
+          const cid = await x(
             "INSERT INTO contacts (lead_id,name,role,email,phone,linkedin,email_status,is_primary,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
             [id, cc.name, cc.role, cc.email, cc.phone, cc.linkedin, cc.status, k === 0 ? 1 : 0, at, at],
           );
-          if (cc.email) emailToLead.set(cc.email, id);
+          const nc: C = { id: cid, lead_id: id, email: cc.email, status: cc.status };
+          contactById.set(cid, nc);
+          if (cc.email) {
+            contactByKey.set(`${id}|${cc.email}`, nc);
+            if (!makeTest && r.is_test !== true && !emailToLead.has(cc.email)) emailToLead.set(cc.email, id);
+          }
+          contactCount.set(id, (contactCount.get(id) ?? 0) + 1);
         }
         const nl: L = { id, company, domain: dom, external_id: ext, is_demo: makeTest || r.is_test === true ? 1 : 0 };
         addLead(nl);
@@ -282,9 +316,12 @@ export async function importHistory(actor: Actor, body: Rec) {
         [a.lead.id, a.contactId ?? null, a.parentId ?? null, a.type, a.kind ?? null, a.channel ?? null, a.outcome ?? null, a.title ?? null, a.body ?? null, a.ref ?? null, a.url ?? null,
           a.employee, occurred, at, a.lead.is_demo, a.when.precision, a.ext, actor.id, bid],
       );
-      if (a.when.at) await x("UPDATE leads SET last_activity_at = CASE WHEN last_activity_at IS NULL OR last_activity_at < ? THEN ? ELSE last_activity_at END WHERE id=?", [occurred, occurred, a.lead.id]);
+      addAct({ id, type: a.type, lead_id: a.lead.id, contact_id: a.contactId ?? null, message_kind: a.kind ?? null, actor_id: a.employee, occurred_at: occurred, precision: a.when.precision, channel: a.channel ?? null, title: a.title ?? null, external_id: a.ext });
+      if (a.type === "outcome" && a.outcome === "bounced" && a.parentId) bounceOf.set(a.parentId, id);
+      if (a.when.at && (!lastAct.has(a.lead.id) || lastAct.get(a.lead.id)! < occurred)) lastAct.set(a.lead.id, occurred);
       return id;
     };
+
     /**
      * Duplicate detection for activities, in this order (never guessing):
      *  1. same external_id                       -> "exists"
@@ -306,39 +343,36 @@ export async function importHistory(actor: Actor, body: Rec) {
       notIds: number[] = [],
     ): Promise<number | null> => {
       if (ext) {
-        const e = await loadAct(ext);
+        const e = loadAct(ext);
         if (e) return e.id;
       }
       if (!key.when.at) return null; // unknown date: only external_id can identify it (enforced earlier)
-      const [r] = await q(
-        `SELECT id FROM activities WHERE lead_id=? AND type=? AND COALESCE(channel,'')=COALESCE(?,'') AND COALESCE(message_kind,'')=COALESCE(?,'')
-           AND occurred_at=? AND occurred_precision=? AND COALESCE(contact_id,0)=COALESCE(?,0) AND COALESCE(title,'')=COALESCE(?,'') LIMIT 1`,
-        [key.lead, key.type, key.channel, key.kind, key.when.at, key.when.precision, key.contact, key.title],
+      const mine = (actsByLead.get(key.lead) ?? []).filter((a) => a.type === key.type && a.precision !== "unknown");
+      const strict = mine.find(
+        (a) => (a.channel ?? "") === (key.channel ?? "") && (a.message_kind ?? "") === (key.kind ?? "") && a.occurred_at === key.when.at && a.precision === key.when.precision &&
+          (a.contact_id ?? 0) === (key.contact ?? 0) && (a.title ?? "") === (key.title ?? ""),
       );
-      if (r) return Number(r.id);
+      if (strict) return strict.id;
       const day = todayYmd(undefined, new Date(key.when.at));
-      const near = (await q(
-        `SELECT id,type,occurred_at,occurred_precision,channel,message_kind,title,contact_id FROM activities
-          WHERE lead_id=? AND type=? AND external_id IS NULL AND occurred_precision<>'unknown' AND occurred_at>=? AND occurred_at<?`,
-        [key.lead, key.type, localMidnight(day).toISOString(), localMidnight(addDays(day, 1)).toISOString()],
-      )).filter(
+      const from = localMidnight(day).toISOString(), to = localMidnight(addDays(day, 1)).toISOString();
+      const near = mine.filter(
         (c) =>
-          !notIds.includes(Number(c.id)) &&
+          !c.external_id && c.occurred_at >= from && c.occurred_at < to && !notIds.includes(c.id) &&
           (key.kind == null || c.message_kind == null || c.message_kind === key.kind) &&
           (key.channel == null || c.channel == null || c.channel === key.channel) &&
-          (key.contact == null || c.contact_id == null || Number(c.contact_id) === key.contact) &&
+          (key.contact == null || c.contact_id == null || c.contact_id === key.contact) &&
           (key.title == null || c.title == null || c.title === key.title),
       );
       if (near.length)
         throw new Error(
-          `Possible match with existing ${key.type} ${near.map((c) => `#${c.id} (${c.occurred_precision === "day" ? String(c.occurred_at).slice(0, 10) : c.occurred_at})`).join(", ")} recorded without an external_id. ` +
+          `Possible match with existing ${key.type} ${near.map((c) => `#${c.id} (${c.precision === "day" ? c.occurred_at.slice(0, 10) : c.occurred_at})`).join(", ")} recorded without an external_id. ` +
             `If it is the same event, attach this external_id to it with POST /api/v1/import/reconcile-activities; if it is a different event, add its id to "not_activity_ids" on this record. Nothing was guessed.`,
         );
       return null;
     };
     const resolveMessage = async (extId: unknown, idVal: unknown, field: string): Promise<Act | null> => {
       const e = str(extId, 120);
-      const a = e ? await loadAct(e) : idVal != null ? await loadActById(Number(idVal)) : null;
+      const a = e ? loadAct(e) : idVal != null ? loadActById(Number(idVal)) : null;
       if (!a) return null;
       if (a.type !== "message") throw new Error(`${field}: that record is a ${a.type}, not a sent message.`);
       return a;
@@ -346,6 +380,7 @@ export async function importHistory(actor: Actor, body: Rec) {
 
     /* ---------------- sent messages ---------------- */
     for (const [i, r] of sections.messages.entries()) {
+      tick();
       const ext = str(r.external_id, 120);
       try {
         const lead = resolveLead(r.lead);
@@ -363,7 +398,6 @@ export async function importHistory(actor: Actor, body: Rec) {
         if (dupId) { out.messages.push({ index: i, external_id: ext, status: "exists", id: dupId, lead_id: lead.id, message: "Already recorded." }); continue; }
         if (contact && contact.status !== "unknown" && contact.status !== "ok") warnings.push(`messages[${i}]: contact is marked ${contact.status}. Recorded as history only.`);
         const id = await insertActivity({ lead, type: "message", kind, outcome: "sent", channel, title: subject, body: text, ref, url, contactId: contact?.id, employee, when, ext });
-        if (ext) actByExt.set(ext, { id, type: "message", lead_id: lead.id, contact_id: contact?.id ?? null, message_kind: kind, actor_id: employee, occurred_at: when.at ?? at, precision: when.precision });
         out.messages.push({ index: i, external_id: ext, status: "created", id, lead_id: lead.id });
       } catch (e) {
         fail("messages", i, ext, e);
@@ -372,6 +406,7 @@ export async function importHistory(actor: Actor, body: Rec) {
 
     /* ---------------- replies ---------------- */
     for (const [i, r] of sections.replies.entries()) {
+      tick();
       const ext = str(r.external_id, 120);
       try {
         const replyTo = str(r.in_reply_to, 120);
@@ -391,10 +426,9 @@ export async function importHistory(actor: Actor, body: Rec) {
         const dupId = await sameAsExisting(ext, { lead: lead.id, type: "reply", channel, kind: null, when, contact: contact?.id ?? null, title: subject }, parseIds(r.not_activity_ids, "not_activity_ids"));
         if (dupId) { out.replies.push({ index: i, external_id: ext, status: "exists", id: dupId, lead_id: lead.id, message: "Already recorded." }); continue; }
         const id = await insertActivity({ lead, type: "reply", outcome: "reply_received", channel, title: subject, body: text, ref, url, contactId: contact?.id, parentId: parent?.id, employee, when, ext });
-        if (ext) actByExt.set(ext, { id, type: "reply", lead_id: lead.id, contact_id: contact?.id ?? null, message_kind: null, actor_id: employee, occurred_at: when.at ?? at, precision: when.precision });
         if (contact) {
-          const [cr] = await q("SELECT email_status FROM contacts WHERE id=?", [contact.id]);
-          if (cr?.email_status === "unknown") await x("UPDATE contacts SET email_status='ok', updated_at=? WHERE id=?", [at, contact.id]);
+          const cr = contactById.get(contact.id);
+          if (cr?.status === "unknown") { await x("UPDATE contacts SET email_status='ok', updated_at=? WHERE id=?", [at, contact.id]); cr.status = "ok"; }
         }
         out.replies.push({ index: i, external_id: ext, status: "created", id, lead_id: lead.id });
       } catch (e) {
@@ -404,6 +438,7 @@ export async function importHistory(actor: Actor, body: Rec) {
 
     /* ---------------- bounces ---------------- */
     for (const [i, r] of sections.bounces.entries()) {
+      tick();
       const ext = str(r.external_id, 120);
       try {
         const parent = await resolveMessage(r.message_external_id, r.message_id, "message_external_id");
@@ -416,15 +451,14 @@ export async function importHistory(actor: Actor, body: Rec) {
         // Chronology is only checked when BOTH dates are known; an unknown send date never blocks a dated bounce.
         if (when.at && parent.precision !== "unknown" && when.at < parent.occurred_at && eventDayBefore(when, parent)) throw new Error("bounced_at: a bounce cannot be earlier than the message it belongs to.");
         const employee = employeeOf(r, { v: parent.actor_id });
-        const already = ext ? await loadAct(ext) : null;
-        const [dupB] = already ? [{ id: already.id }] : await q("SELECT id FROM activities WHERE parent_id=? AND outcome='bounced' LIMIT 1", [parent.id]);
+        const already = ext ? loadAct(ext) : null;
+        const dupB = already ? { id: already.id } : bounceOf.has(parent.id) ? { id: bounceOf.get(parent.id)! } : null;
         if (dupB) { out.bounces.push({ index: i, external_id: ext, status: "exists", id: Number(dupB.id), lead_id: lead.id, message: "A bounce is already recorded for that message." }); continue; }
         const id = await insertActivity({ lead, type: "outcome", kind: parent.message_kind, outcome: "bounced", body: str(r.note, 2000), contactId: parent.contact_id, parentId: parent.id, employee, when, ext, channel: null });
         if (parent.contact_id) {
-          const [cr] = await q("SELECT email_status FROM contacts WHERE id=?", [parent.contact_id]);
-          if (cr && (await escalate(parent.contact_id, String(cr.email_status), "bounced"))) contactsEscalated++;
+          const cr = contactById.get(parent.contact_id);
+          if (cr && (await escalate(parent.contact_id, cr.status, "bounced"))) contactsEscalated++;
         }
-        if (ext) actByExt.set(ext, { id, type: "outcome", lead_id: lead.id, contact_id: parent.contact_id, message_kind: parent.message_kind, actor_id: employee, occurred_at: when.at ?? at, precision: when.precision });
         out.bounces.push({ index: i, external_id: ext, status: "created", id, lead_id: lead.id });
       } catch (e) {
         fail("bounces", i, ext, e);
@@ -433,6 +467,7 @@ export async function importHistory(actor: Actor, body: Rec) {
 
     /* ---------------- do-not-contact / opt-outs ---------------- */
     for (const [i, r] of sections.do_not_contact.entries()) {
+      tick();
       const ext = str(r.external_id, 120);
       try {
         const lead = resolveLead(r.lead);
@@ -442,7 +477,7 @@ export async function importHistory(actor: Actor, body: Rec) {
         if (!["opted_out", "bounced"].includes(status)) throw new Error("status: opted_out (default) or bounced.");
         const when = dateOf(r.at, "at", false);
         const employee = employeeOf(r);
-        if (ext && (await loadAct(ext))) { out.do_not_contact.push({ index: i, external_id: ext, status: "exists", lead_id: lead.id, message: "Already recorded." }); continue; }
+        if (ext && loadAct(ext)) { out.do_not_contact.push({ index: i, external_id: ext, status: "exists", lead_id: lead.id, message: "Already recorded." }); continue; }
         const contact = (await contactFor(lead.id, email, { status, name: str(r.contact_name, 120) }))!;
         const changed = await escalate(contact.id, contact.status, status);
         if (changed) contactsEscalated++;
@@ -452,7 +487,6 @@ export async function importHistory(actor: Actor, body: Rec) {
         const dupId = await sameAsExisting(ext, { lead: lead.id, type: "note", channel: null, kind: null, when, contact: contact.id, title });
         if (dupId) { out.do_not_contact.push({ index: i, external_id: ext, status: "exists", id: dupId, lead_id: lead.id, message: changed ? "Contact status updated; note already existed." : "Already recorded." }); continue; }
         const id = await insertActivity({ lead, type: "note", title, body: note, contactId: contact.id, employee, when, ext });
-        if (ext) actByExt.set(ext, { id, type: "note", lead_id: lead.id, contact_id: contact.id, message_kind: null, actor_id: employee, occurred_at: when.at ?? at, precision: when.precision });
         out.do_not_contact.push({ index: i, external_id: ext, status: "created", id, lead_id: lead.id });
       } catch (e) {
         fail("do_not_contact", i, ext, e);
@@ -466,6 +500,10 @@ export async function importHistory(actor: Actor, body: Rec) {
     const created = Object.values(counts).reduce((n, c) => n + c.created, 0);
     const willCommit = commit && errors === 0;
     if (willCommit) {
+      if (lastAct.size) {
+        stats.queries++;
+        await t.batch([...lastAct].map(([lead, when]) => ({ sql: "UPDATE leads SET last_activity_at = CASE WHEN last_activity_at IS NULL OR last_activity_at < ? THEN ? ELSE last_activity_at END WHERE id=?", args: [when, when, lead] })));
+      }
       if (batchId) await t.execute({ sql: "UPDATE import_batches SET summary=? WHERE id=?", args: [JSON.stringify({ counts, contacts_escalated: contactsEscalated, warnings: warnings.length }), batchId] });
       await t.commit();
     } else await t.rollback();
@@ -482,6 +520,7 @@ export async function importHistory(actor: Actor, body: Rec) {
             ? "Saved."
             : "Saved — everything was already in the CRM, so nothing new was created.",
       counts, contacts_escalated: contactsEscalated, warnings, results: out,
+      stats: { database_calls: stats.queries, milliseconds: Date.now() - started, records: total },
     };
   } catch (e) {
     await t.rollback().catch(() => undefined);
@@ -543,7 +582,7 @@ export async function correctLeadDates(actor: Actor, body: Rec) {
       let ev: EventDate | null = null;
       if (hasDate) {
         const p = r.lead_date === null ? ({ at: null, precision: "unknown" } as EventDate) : parseEventDate(r.lead_date);
-        if (p === "invalid") throw new Error('lead_date: use YYYY-MM-DD, YYYY-MM-DDTHH:mm, "unknown" or null.');
+        if (typeof p === "string") throw new Error(dateProblem(p, "lead_date"));
         if (p.at && new Date(p.at).getTime() > Date.now() + 5 * 60000) throw new Error("lead_date: cannot be in the future.");
         ev = p;
       }
@@ -702,6 +741,87 @@ export async function reconcileActivities(actor: Actor, body: Rec) {
   return {
     committed: !!batchId, dry_run: !commit, batch_id: batchId,
     note: !commit ? 'Dry run — nothing was changed. Send the same body with "commit": true to apply.' : errors ? "Nothing was changed because some records have errors." : batchId ? "Reconciled." : "Nothing needed changing.",
+    counts: { changed: c("changed"), will_change: c("will_change"), unchanged: c("unchanged"), errors },
+    results: out,
+  };
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+/*  Correct the event time of activities that already exist                                        */
+/* ---------------------------------------------------------------------------------------------- */
+export type TimeFixRow = {
+  index: number;
+  status: "will_change" | "changed" | "unchanged" | "error";
+  activity_id?: number;
+  from?: string;
+  to?: string;
+  message?: string;
+};
+
+/**
+ * Change ONLY occurred_at (and mark it as an exact time) of existing activities. Ids, external ids, parents, actors, importers,
+ * texts, created_at, lead and type are never touched; nothing is created or deleted, so corrected records are not new sends.
+ * record: { activity_id*, occurred_at* (ISO with Z / numeric offset, or zone-less = application timezone),
+ *           from? (the timestamp you expect to find now — the record is refused if it differs), lead_id?, type?, external_id? (safety checks) }
+ */
+export async function correctActivityTimes(actor: Actor, body: Rec) {
+  requirePerm(actor, "history.import");
+  const recs = body.records;
+  if (!Array.isArray(recs) || !recs.length || recs.some((r) => !isObj(r))) throw new HttpError(400, 'records: a non-empty array, e.g. {"activity_id":469,"occurred_at":"2026-10-24T10:12:00+08:00","from":"2026-10-24T01:12:00.000Z"}.');
+  if (recs.length > 200) throw new HttpError(400, "Send at most 200 records per request.");
+  const commit = body.commit === true;
+  const label = str(body.label, 200) ?? "Correct activity times";
+  const out: TimeFixRow[] = [];
+  const plan: { row: TimeFixRow; a: Rec; at: string }[] = [];
+  const seen = new Set<number>();
+  for (const [index, r] of (recs as Rec[]).entries()) {
+    try {
+      const id = Number(r.activity_id);
+      if (!Number.isInteger(id) || id < 1) throw new Error("activity_id: required.");
+      if (seen.has(id)) throw new Error(`activity_id ${id} appears twice in this request.`);
+      seen.add(id);
+      const a = await one("SELECT * FROM activities WHERE id=?", [id]);
+      if (!a) throw new Error(`activity_id: no activity #${id}.`);
+      if (r.lead_id != null && Number(r.lead_id) !== a.lead_id) throw new Error(`lead_id: activity #${id} belongs to lead ${a.lead_id}, not ${r.lead_id}.`);
+      if (str(r.type) && str(r.type) !== a.type) throw new Error(`type: activity #${id} is a "${a.type}", not "${str(r.type)}".`);
+      if (str(r.external_id) && str(r.external_id) !== a.external_id) throw new Error(`external_id: activity #${id} has "${a.external_id ?? ""}", not "${str(r.external_id)}".`);
+      const e = parseEventDate(r.occurred_at);
+      if (typeof e === "string") throw new Error(dateProblem(e, "occurred_at"));
+      if (e.precision !== "time" || !e.at) throw new Error("occurred_at: an exact time is required (ISO with Z or an offset, or YYYY-MM-DDTHH:mm). This operation does not set date-only or unknown dates.");
+      if (new Date(e.at).getTime() > Date.now() + 5 * 60000) throw new Error("occurred_at: cannot be in the future.");
+      if (r.from != null && r.from !== "") {
+        const f = parseEventDate(r.from);
+        if (typeof f === "string" || !f.at) throw new Error(dateProblem(typeof f === "string" ? f : "invalid", "from"));
+        if (f.at !== a.occurred_at) throw new Error(`from: activity #${id} is stored as ${a.occurred_at}, not ${f.at}. Nothing was changed.`);
+      }
+      const same = a.occurred_at === e.at && a.occurred_precision === "time";
+      const row: TimeFixRow = { index, activity_id: id, from: a.occurred_precision === "unknown" ? "unknown" : a.occurred_at, to: e.at, status: same ? "unchanged" : "will_change" };
+      out.push(row);
+      if (!same) plan.push({ row, a, at: e.at });
+    } catch (e) {
+      out.push({ index, status: "error", message: e instanceof Error ? e.message : String(e) });
+    }
+  }
+  const errors = out.filter((r) => r.status === "error").length;
+  let batchId: number | null = null;
+  if (commit && errors === 0 && plan.length) {
+    const t = now();
+    batchId = (await run("INSERT INTO import_batches (kind,label,imported_by,summary,created_at) VALUES ('time_fix',?,?,?,?)", [label, actor.id, JSON.stringify({ changed: plan.length }), t])).id;
+    for (const p of plan) {
+      await run("UPDATE activities SET occurred_at=?, occurred_precision='time' WHERE id=?", [p.at, p.a.id as number]);
+      // The lead's "last activity" follows only when it was pointing at this very event.
+      await run("UPDATE leads SET last_activity_at=? WHERE id=? AND last_activity_at=?", [p.at, p.a.lead_id as number, p.a.occurred_at as string]);
+      await audit(actor, "correct_activity_time", "activity", p.a.id as number, {
+        batch_id: batchId, label, occurred_at: { from: p.row.from, to: p.at }, precision: { from: p.a.occurred_precision, to: "time" },
+        note: "Only the event time changed; id, external_id, parent, actor, importer, text and created_at are unchanged.",
+      });
+      p.row.status = "changed";
+    }
+  }
+  const c = (s: TimeFixRow["status"]) => out.filter((r) => r.status === s).length;
+  return {
+    committed: !!batchId, dry_run: !commit, batch_id: batchId,
+    note: !commit ? 'Dry run — nothing was changed. Send the same body with "commit": true to apply.' : errors ? "Nothing was changed because some records have errors." : batchId ? "Times corrected." : "Nothing needed changing.",
     counts: { changed: c("changed"), will_change: c("will_change"), unchanged: c("unchanged"), errors },
     results: out,
   };
