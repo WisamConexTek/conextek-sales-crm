@@ -207,6 +207,114 @@ async function main() {
   await throws(() => L.createLead(owner, { company: "Old Market", market: "uk" }), 400, "old generic market no longer offered");
   ok(((await L.listLeads(owner, { segment: "nc_dealers" })).total) === 1, "filter by segment");
 
+  console.log("Original dates, unknown dates, historical import");
+  const H = await import("../src/lib/service/history");
+  const { addDays, todayYmd, all: dbAll } = await import("../src/lib/db");
+  const today0 = todayYmd();
+  const past = addDays(today0, -40);
+  const base0 = (await R.getRangeReport(owner, { all: true })).totals;
+  // A lead found 40 days ago, entered today: counted in its own month, not today.
+  const old = await L.createLead(owner, { company: "Old Found Ltd", lead_date: past });
+  const oldRow = (await L.getLead(owner, old)).lead;
+  ok(oldRow.lead_date_precision === "day" && oldRow.created_at.slice(0, 10) === new Date().toISOString().slice(0, 10), "lead keeps its original date; entry date is separate");
+  const todayRep = (await R.getRangeReport(owner, { from: today0, to: today0 })).totals;
+  const pastRep = (await R.getRangeReport(owner, { from: past, to: past })).totals;
+  ok(pastRep.leads_added === 1, "lead is counted on its original date");
+  ok(todayRep.leads_added === (await R.getReport(owner, { granularity: "day" })).totals.leads_added, "range report and daily report agree for today");
+  await throws(() => L.createLead(owner, { company: "Future Ltd", lead_date: addDays(today0, 3) }), 400, "future lead date rejected");
+  await throws(() => L.createLead(owner, { company: "Bad Date Ltd", lead_date: "14/03/2025" }), 400, "ambiguous date format rejected");
+
+  // CSV-style import without a date: unknown, never "today".
+  const unk = await L.createLead(owner, { company: "Unknown Date Ltd" }, false, { unknownDateByDefault: true });
+  const unkRow = (await L.getLead(owner, unk)).lead;
+  ok(unkRow.lead_date === null, "import without a date leaves the lead date unknown");
+  const beforeAll = (await R.getRangeReport(owner, { all: true }));
+  ok(beforeAll.totals.leads_added === base0.leads_added + 2 && beforeAll.unknown!.leads_added >= 1, "all-data view includes dated and unknown leads");
+  ok((await R.getRangeReport(owner, { from: past, to: today0 })).totals.leads_added === (await R.getRangeReport(owner, { from: past, to: today0 })).buckets.reduce((n, b) => n + b.m.leads_added, 0), "custom period counts only dated leads");
+
+  // Activities: day-only, unknown, bounce date.
+  const tline = await L.createLead(owner, { company: "Timeline Co", lead_date: past });
+  const sent = await A.recordActivity(owner, tline, { type: "message", message_kind: "first_email", channel: "email", title: "Hi", body: "x", occurred_at: past });
+  const sentRow = await one("SELECT * FROM activities WHERE id=?", [sent.id]);
+  ok(sentRow!.occurred_precision === "day", "date without hour is kept as a day");
+  const bounce = await A.recordActivity(owner, tline, { type: "outcome", outcome: "bounced", parent_id: sent.id, occurred_at: addDays(past, 1) });
+  const dPast = (await R.getRangeReport(owner, { from: past, to: past })).totals;
+  const dNext = (await R.getRangeReport(owner, { from: addDays(past, 1), to: addDays(past, 1) })).totals;
+  ok(dPast.first_emails === 1 && dPast.first_email_bounces === 0, "send counted on the day it was sent");
+  ok(dNext.first_email_bounces === 1 && dNext.first_emails === 0, "bounce counted on the day it happened");
+  const repsBefore = (await R.getRangeReport(owner, { from: today0, to: today0 })).totals.replies;
+  const allBefore = (await R.getRangeReport(owner, { all: true })).totals.replies;
+  const ua = await A.recordActivity(owner, tline, { type: "reply", body: "hello", occurred_at: "unknown" });
+  const uaRow = await one("SELECT * FROM activities WHERE id=?", [ua.id]);
+  ok(uaRow!.occurred_precision === "unknown", "unknown activity date stays unknown");
+  const repToday = (await R.getRangeReport(owner, { from: today0, to: today0 })).totals;
+  const repAll = (await R.getRangeReport(owner, { all: true })).totals;
+  ok(repToday.replies === repsBefore && repAll.replies === allBefore + 1, "unknown-date reply is not counted in a period, only in all data");
+  await throws(() => A.recordActivity(owner, tline, { type: "note", body: "x", occurred_at: addDays(today0, 2) }), 400, "future activity date rejected");
+
+  // Bulk correction of existing leads.
+  const dry = await H.correctLeadDates(owner, { records: [{ id: unk, lead_date: "2025-03-14" }, { website: "nobody.example", lead_date: "2025-03-14" }] });
+  ok(dry.dry_run && dry.counts.will_change === 1 && dry.counts.not_found === 1, "correction dry run changes nothing and reports unmatched rows");
+  ok((await L.getLead(owner, unk)).lead.lead_date === null, "dry run left the lead untouched");
+  const leadsBefore = Number((await one("SELECT COUNT(*) AS n FROM leads"))!.n);
+  const fixed = await H.correctLeadDates(owner, { commit: true, label: "test fix", records: [{ id: unk, lead_date: "2025-03-14", employee: "sara" }] });
+  const fx = (await L.getLead(owner, unk)).lead;
+  ok(fixed.committed && fx.lead_date_precision === "day" && fx.created_by === sara.id, "correction applied with original employee");
+  ok(fx.created_at === unkRow.created_at && Number((await one("SELECT COUNT(*) AS n FROM leads"))!.n) === leadsBefore, "entry date unchanged and nothing created or deleted");
+  const au = await one("SELECT * FROM audit_log WHERE action='correct_lead_date' AND entity_id=?", [String(unk)]);
+  ok(!!au && String(au.detail).includes("unknown") && String(au.detail).includes("2025-03-14"), "correction is audited with old and new date");
+  await throws(() => H.correctLeadDates(sara, { records: [{ id: unk, lead_date: "2025-01-01" }] }), 403, "employee cannot correct dates");
+  await throws(() => H.correctLeadDates(chief, { records: [{ id: unk, lead_date: "2025-01-01" }] }), 403, "chief cannot correct dates unless granted");
+
+  // Historical import.
+  const payload = () => ({
+    label: "test history", employee: "sara",
+    leads: [{ external_id: "h-1", company: "History Motors", website: "history.example", market: "china", lead_date: "2025-04-15",
+              contacts: [{ name: "Jo", email: "jo@history.example" }, { email: "stop@history.example", do_not_contact: true }] }],
+    messages: [{ external_id: "h-1-m1", lead: { external_id: "h-1" }, channel: "email", kind: "first_email", sent_at: "2025-04-16T09:30", contact_email: "jo@history.example", subject: "Hello", body: "text" }],
+    replies: [{ external_id: "h-1-r1", lead: { external_id: "h-1" }, in_reply_to: "h-1-m1", channel: "email", received_at: "2025-04-18", body: "Send pricing" }],
+    bounces: [{ external_id: "h-1-b1", message_external_id: "h-1-m1", bounced_at: "2025-04-17" }],
+  });
+  await throws(() => H.importHistory(sara, payload()), 403, "employee cannot import history");
+  const hd = await H.importHistory(owner, payload());
+  ok(hd.dry_run && !hd.committed && hd.counts.leads.created === 1 && hd.counts.messages.created === 1, "history dry run validates the whole chain");
+  ok(!(await one("SELECT id FROM leads WHERE external_id='h-1'")), "history dry run saves nothing");
+  const hc = await H.importHistory(owner, { ...payload(), commit: true });
+  ok(hc.committed && hc.counts.leads.created === 1 && hc.counts.replies.created === 1 && hc.counts.bounces.created === 1, "history import saved");
+  const hl = (await one("SELECT * FROM leads WHERE external_id='h-1'"))!;
+  const hm = (await one("SELECT * FROM activities WHERE external_id='h-1-m1'"))!;
+  ok(hl.created_by === sara.id && hl.imported_by === owner.id && hl.lead_date_precision === "day", "original employee kept apart from importer (lead)");
+  ok(hm.actor_id === sara.id && hm.imported_by === owner.id && hm.occurred_at.startsWith("2025-04-16") && hm.created_at > "2026", "original employee/date kept apart from importer/entry date (message)");
+  const dnc = await one("SELECT email_status FROM contacts WHERE lead_id=? AND email='stop@history.example'", [hl.id]);
+  ok(dnc!.email_status === "opted_out", "do-not-contact state saved");
+  const bc = await one("SELECT email_status FROM contacts WHERE lead_id=? AND email='jo@history.example'", [hl.id]);
+  ok(bc!.email_status === "bounced", "bounce marks the contact bounced");
+  const again = await H.importHistory(owner, { ...payload(), commit: true });
+  ok(again.counts.leads.exists === 1 && again.counts.messages.exists === 1 && again.counts.replies.exists === 1 && again.counts.bounces.exists === 1 && again.batch_id === null, "re-sending the same history creates nothing");
+  ok(Number((await one("SELECT COUNT(*) AS n FROM leads WHERE company='History Motors'"))!.n) === 1, "no duplicate lead");
+  // Same lead arriving under a new external id: duplicate by website, suppression still carried over.
+  const dupLead = await H.importHistory(owner, { label: "dup", employee: "sara", commit: true, leads: [{ external_id: "h-2", company: "History Motors Inc", website: "https://www.history.example", contacts: [{ email: "jo@history.example" }, { email: "new-optout@history.example", email_status: "opted_out" }] }] });
+  ok(dupLead.counts.leads.duplicate === 1 && Number((await one("SELECT COUNT(*) AS n FROM leads WHERE domain='history.example'"))!.n) === 1, "duplicate lead skipped");
+  ok(!!(await one("SELECT id FROM contacts WHERE lead_id=? AND email='new-optout@history.example' AND email_status='opted_out'", [hl.id])), "do-not-contact carried over to the existing lead");
+  // Reports use the original dates.
+  ok((await R.getRangeReport(owner, { from: "2025-04-15", to: "2025-04-15" })).totals.leads_added === 1, "imported lead counted on its original date");
+  const r16 = (await R.getRangeReport(owner, { from: "2025-04-16", to: "2025-04-16" })).totals;
+  const r17 = (await R.getRangeReport(owner, { from: "2025-04-17", to: "2025-04-17" })).totals;
+  const r18 = (await R.getRangeReport(owner, { from: "2025-04-18", to: "2025-04-18" })).totals;
+  ok(r16.first_emails === 1 && r17.first_email_bounces === 1 && r18.replies === 1, "imported send, bounce and reply counted on the days they happened");
+  ok((await R.getReport(owner, { granularity: "day" })).totals.first_emails === (await R.getRangeReport(owner, { from: today0, to: today0 })).totals.first_emails, "importing does not add to today's numbers");
+  // Errors block the commit.
+  const bad = payload();
+  bad.leads[0].external_id = "h-9"; bad.leads[0].company = "Bad Employee Co"; bad.leads[0].website = "bad.example"; bad.leads[0].contacts = [];
+  const badRes = await H.importHistory(owner, { ...bad, messages: [{ external_id: "h-9-m", lead: { external_id: "h-9" }, channel: "carrier_pigeon", kind: "first_email", sent_at: "2025-04-16", subject: "x" }], replies: [], bounces: [], commit: true });
+  ok(!badRes.committed && badRes.counts.messages.errors === 1 && !(await one("SELECT id FROM leads WHERE external_id='h-9'")), "an error blocks the whole commit");
+  const unkMsg = await H.importHistory(owner, { label: "unk", employee: "sara", commit: true, messages: [{ lead: { external_id: "h-1" }, channel: "email", kind: "follow_up", subject: "no date" }] });
+  ok(unkMsg.counts.messages.errors === 1, "unknown send date requires an external_id");
+  const unkMsg2 = await H.importHistory(owner, { label: "unk", employee: "sara", commit: true, messages: [{ external_id: "h-1-m2", lead: { external_id: "h-1" }, channel: "email", kind: "follow_up", subject: "no date" }] });
+  const um = (await one("SELECT * FROM activities WHERE external_id='h-1-m2'"))!;
+  ok(unkMsg2.committed && um.occurred_precision === "unknown", "unknown-date history stays unknown");
+  void dbAll;
+
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 }

@@ -43,7 +43,12 @@ Notes: Vercel's free *Hobby* plan is licensed for non-commercial use — for com
 - Stage changes require a short reason. Stages, markets, channels, industries, sources, services, languages and task types are editable; task statuses and activity outcomes are fixed.
 
 ## Reports — how numbers are counted
-Only logged records; demo and test-flagged data excluded. First-email and follow-up counts and bounce rates are separate. Bounce rate = sends in the period with a recorded bounce ÷ sends in the period. Meetings/Won/Lost = stage changes into a stage flagged that way. "Overdue" is a live snapshot.
+Only logged records; demo and test-flagged data excluded. Everything is counted on the date it **happened**, not the date it was entered: leads on `lead_date` (original date), sends/replies/stage changes on `occurred_at`, bounces on the bounce's own date. Bounce rate = bounces in the period ÷ sends in the period (first emails and follow-ups kept separate). Records with an **unknown** date are never placed in a period (never "today"); they only appear in the **All data** view (dashboard and reports), which also exists next to a custom from → to period. "Overdue" is a live snapshot.
+
+## Historical data & original dates
+- `leads.lead_date` (+ `lead_date_precision` day|time, NULL = unknown) is separate from `created_at` (entry day). Activities have `occurred_precision` (time|day|unknown). Leads existing before this feature have an unknown lead date until corrected.
+- **Correct dates in bulk:** Historical data page (CSV: `lead_date` + id/external_id/website/company, optional `employee`) or `POST /api/v1/import/lead-dates`. Dry run first; only updates existing leads; each change audited (old → new); `created_at` untouched.
+- **Import past records:** `POST /api/v1/import/history` (leads, messages, replies, bounces, do_not_contact). Dry run unless `"commit": true`; any error blocks the commit; duplicates skipped via `external_id` / website / company / email / natural key; do-not-contact and bounced states preserved (only ever escalated); original employee (`actor`/`created_by`) kept apart from `imported_by`; every import is an `import_batches` row plus an audit entry. Needs the `history.import` permission (Owner by default; Chief cannot grant it).
 
 ## API
 See the in-app **API guide** (curl examples), or `GET /api/v1/lists`. Auth: `Authorization: Bearer ctk_…`. Keys act with the owning employee's exact permissions and stop working if the employee is disabled.

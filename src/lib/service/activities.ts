@@ -2,7 +2,7 @@ import { z } from "zod";
 import { one, run, now, tx } from "../db";
 import { HttpError, requirePerm, isManager, type Actor } from "../auth";
 import { MESSAGE_KINDS, RECORDABLE_TYPES } from "../constants";
-import { parse, optText, optInt, optDate, assertListKey } from "./common";
+import { parse, optText, optInt, assertListKey, parseEventDate } from "./common";
 import { assertLeadAccess } from "./leads";
 
 const schema = z.object({
@@ -17,7 +17,7 @@ const schema = z.object({
   contact_id: optInt,
   task_id: optInt,
   parent_id: optInt,
-  occurred_at: optDate,
+  occurred_at: z.unknown().optional(),
 });
 
 /**
@@ -31,8 +31,13 @@ export async function recordActivity(actor: Actor, leadId: number, input: unknow
   const d = parse(schema, { ...raw, message_kind: raw?.message_kind || null, outcome: raw?.outcome || null });
   const warnings: string[] = [];
 
-  const occurred = d.occurred_at ?? now();
-  if (new Date(occurred).getTime() > Date.now() + 5 * 60000) throw new HttpError(400, "occurred_at: cannot be in the future — record work only after it happened.");
+  // Omitted = it just happened. A date without hour is kept as that day. "unknown" stays unknown (never turned into today).
+  const blank = d.occurred_at == null || (typeof d.occurred_at === "string" && d.occurred_at.trim() === "");
+  const ev = blank ? ({ at: now(), precision: "time" } as const) : parseEventDate(d.occurred_at);
+  if (ev === "invalid") throw new HttpError(400, 'occurred_at: use YYYY-MM-DD (date only), YYYY-MM-DDTHH:mm, an ISO time, or "unknown".');
+  if (ev.at && new Date(ev.at).getTime() > Date.now() + 5 * 60000) throw new HttpError(400, "occurred_at: cannot be in the future — record work only after it happened.");
+  const unknownDate = ev.precision === "unknown";
+  const occurred = ev.at ?? now(); // for unknown dates this is only the registration time, flagged by occurred_precision
   if (d.channel) await assertListKey("channel", d.channel, "channel");
 
   let contact = null as Record<string, unknown> | null;
@@ -88,10 +93,10 @@ export async function recordActivity(actor: Actor, leadId: number, input: unknow
 
   const t = now();
   const r = await run(
-    `INSERT INTO activities (lead_id,contact_id,task_id,parent_id,type,message_kind,channel,outcome,title,body,ref,url,actor_id,occurred_at,created_at,is_demo)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    `INSERT INTO activities (lead_id,contact_id,task_id,parent_id,type,message_kind,channel,outcome,title,body,ref,url,actor_id,occurred_at,created_at,is_demo,occurred_precision)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     [leadId, (contact?.id as number) ?? d.contact_id ?? null, d.task_id ?? null, parentId, d.type, kind, d.channel, outcome, d.title, d.body, d.ref, d.url,
-      actor.id, occurred, t, lead.is_demo],
+      actor.id, occurred, t, lead.is_demo, ev.precision],
   );
 
   // Contact deliverability follows what actually happened.
@@ -101,7 +106,8 @@ export async function recordActivity(actor: Actor, leadId: number, input: unknow
     if (d.type === "outcome" && outcome === "opted_out") stmts.push({ sql: "UPDATE contacts SET email_status='opted_out', updated_at=? WHERE id=?", args: [t, cid] });
     if (d.type === "reply" && contact.email_status === "unknown") stmts.push({ sql: "UPDATE contacts SET email_status='ok', updated_at=? WHERE id=?", args: [t, cid] });
   }
-  stmts.push({
+  if (unknownDate) stmts.push({ sql: "UPDATE leads SET updated_at=? WHERE id=?", args: [t, leadId] });
+  else stmts.push({
     sql: "UPDATE leads SET last_activity_at = CASE WHEN last_activity_at IS NULL OR last_activity_at < ? THEN ? ELSE last_activity_at END, updated_at=? WHERE id=?",
     args: [occurred, occurred, t, leadId],
   });

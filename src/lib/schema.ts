@@ -205,4 +205,33 @@ INSERT INTO task_notes (task_id,kind,body,actor_id,created_at)
 UPDATE users SET permissions = json_insert(permissions,'$[#]','keys.manage')
   WHERE role='chief' AND permissions NOT LIKE '%keys.manage%';
 `,
+  `
+-- Migration 3: original lead dates, event-date precision, historical import tracking.
+-- lead_date: when the lead really came into existence (NOT when it was entered). NULL = unknown (never assumed).
+-- lead_date_precision: 'day' (date only) or 'time'. created_at keeps meaning "when it was registered here".
+ALTER TABLE leads ADD COLUMN lead_date TEXT;
+ALTER TABLE leads ADD COLUMN lead_date_precision TEXT;
+ALTER TABLE leads ADD COLUMN external_id TEXT;
+ALTER TABLE leads ADD COLUMN imported_by INTEGER REFERENCES users(id);
+ALTER TABLE leads ADD COLUMN import_batch_id INTEGER;
+
+-- occurred_precision: 'time' | 'day' | 'unknown'. For 'unknown' occurred_at only holds the registration time and is ignored by period reports.
+ALTER TABLE activities ADD COLUMN occurred_precision TEXT NOT NULL DEFAULT 'time';
+ALTER TABLE activities ADD COLUMN external_id TEXT;
+ALTER TABLE activities ADD COLUMN imported_by INTEGER REFERENCES users(id);
+ALTER TABLE activities ADD COLUMN import_batch_id INTEGER;
+
+CREATE UNIQUE INDEX idx_leads_external ON leads(external_id) WHERE external_id IS NOT NULL;
+CREATE UNIQUE INDEX idx_act_external ON activities(external_id) WHERE external_id IS NOT NULL;
+CREATE INDEX idx_leads_lead_date ON leads(lead_date);
+
+CREATE TABLE import_batches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL,
+  label TEXT NOT NULL,
+  imported_by INTEGER NOT NULL REFERENCES users(id),
+  summary TEXT,
+  created_at TEXT NOT NULL
+);
+`,
 ];

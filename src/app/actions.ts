@@ -10,6 +10,8 @@ import * as Leads from "@/lib/service/leads";
 import * as Tasks from "@/lib/service/tasks";
 import { recordActivity } from "@/lib/service/activities";
 import { prepareImport, commitImport } from "@/lib/service/csv";
+import { correctLeadDates, type DateFixRow } from "@/lib/service/history";
+import Papa from "papaparse";
 import { seedDemo, removeDemo } from "@/lib/service/demo";
 import { ALL_PERMISSIONS, PRESETS } from "@/lib/constants";
 
@@ -243,6 +245,34 @@ export async function importAction(_p: ImportState, fd: FD): Promise<ImportState
     }
     const r = await prepareImport(a, text);
     return { step: "preview", ...r, text };
+  } catch (e) {
+    unstable_rethrow(e);
+    return { step: "error", error: msgOf(e) };
+  }
+}
+
+/* ---------- bulk correction of original lead dates (CSV: id | external_id | website | company, lead_date, optional employee) ---------- */
+export type DateFixState =
+  | { step: "preview"; rows: DateFixRow[]; counts: Record<string, number>; text: string }
+  | { step: "done"; rows: DateFixRow[]; counts: Record<string, number> }
+  | { step: "error"; error: string }
+  | null;
+export async function dateFixAction(_p: DateFixState, fd: FD): Promise<DateFixState> {
+  const a = await getSessionActor();
+  if (!a) return { step: "error", error: "Please sign in again." };
+  try {
+    const text = s(fd, "text");
+    const norm = (h: string) => h.trim().toLowerCase().replace(/[\s-]+/g, "_");
+    const parsed = Papa.parse<Record<string, string>>(text.replace(/^\uFEFF/, ""), { header: true, skipEmptyLines: "greedy", transformHeader: norm });
+    if (!parsed.meta.fields?.length) return { step: "error", error: "The file has no header row." };
+    const f = new Set(parsed.meta.fields);
+    if (!f.has("lead_date")) return { step: "error", error: 'No "lead_date" column. Needed: lead_date plus one of id, external_id, website or company.' };
+    if (!["id", "lead_id", "external_id", "website", "company"].some((c) => f.has(c))) return { step: "error", error: "No column to find the lead by: add id, external_id, website or company." };
+    const records = parsed.data.map((r) => ({ id: r.id || r.lead_id || undefined, external_id: r.external_id, website: r.website, company: r.company, lead_date: r.lead_date, employee: r.employee }));
+    const commit = s(fd, "mode") === "commit";
+    const r = await correctLeadDates(a, { records, commit, label: s(fd, "label") || "Lead date correction (CSV)" });
+    if (commit) revalidatePath("/", "layout");
+    return commit ? { step: "done", rows: r.results, counts: r.counts } : { step: "preview", rows: r.results, counts: r.counts, text };
   } catch (e) {
     unstable_rethrow(e);
     return { step: "error", error: msgOf(e) };

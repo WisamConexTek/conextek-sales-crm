@@ -2,7 +2,7 @@ import { z } from "zod";
 import type { InValue } from "@libsql/client";
 import { all, one, run, now, tx, type Row } from "../db";
 import { HttpError, can, requirePerm, isManager, type Actor } from "../auth";
-import { audit, parse, optText, reqText, optDate, optBool, domainOf, assertListKey, optInt } from "./common";
+import { audit, parse, optText, reqText, optDate, optBool, domainOf, assertListKey, optInt, parseEventDate, eventDateText, type EventDate } from "./common";
 
 /* ---------- access ---------- */
 export function leadScope(actor: Actor, alias = "l"): { sql: string; args: InValue[] } {
@@ -73,7 +73,27 @@ const createSchema = z.object({
   contacts: z.array(contactSchema).optional(),
   allow_duplicate: optBool.optional(),
   is_test: optBool.optional(),
+  lead_date: z.unknown().optional(),
 });
+
+/** Extra, internal options for imports (never taken from user input). */
+export type CreateOpts = {
+  /** A lead with no lead_date is "unknown" (imports) instead of "found today" (hand-entered). */
+  unknownDateByDefault?: boolean;
+  /** The person who really found the lead (reports credit them); the actor stays the importer. */
+  originalEmployeeId?: number | null;
+  externalId?: string | null;
+  batchId?: number | null;
+};
+
+function leadDateFrom(v: unknown, fallbackNow: string, unknownByDefault: boolean): EventDate {
+  const blank = v == null || (typeof v === "string" && v.trim() === "");
+  if (blank) return unknownByDefault ? { at: null, precision: "unknown" } : { at: fallbackNow, precision: "time" };
+  const e = parseEventDate(v);
+  if (e === "invalid") throw new HttpError(400, 'lead_date: use YYYY-MM-DD (date only), YYYY-MM-DDTHH:mm, or "unknown".');
+  if (e.at && new Date(e.at).getTime() > Date.now() + 5 * 60000) throw new HttpError(400, "lead_date: cannot be in the future.");
+  return e;
+}
 
 async function checkLists(d: { industry?: string | null; market?: string | null; segment?: string | null; language?: string | null; source?: string | null; service?: string | null; stage?: string }) {
   await assertListKey("industry", d.industry, "industry");
@@ -92,7 +112,7 @@ async function assertAssignable(ownerId: number | null | undefined) {
 }
 
 /* ---------- create / update ---------- */
-export async function createLead(actor: Actor, input: unknown, isDemo = false) {
+export async function createLead(actor: Actor, input: unknown, isDemo = false, opts: CreateOpts = {}) {
   requirePerm(actor, "leads.create");
   const d = parse(createSchema, input);
   await checkLists(d);
@@ -112,11 +132,16 @@ export async function createLead(actor: Actor, input: unknown, isDemo = false) {
   }
   const stage = d.stage || ((await one("SELECT key FROM lists WHERE kind='stage' AND active=1 ORDER BY position,id LIMIT 1"))!.key as string);
   const t = now();
+  const ld = leadDateFrom(d.lead_date, t, !!opts.unknownDateByDefault);
+  const original = opts.originalEmployeeId ?? actor.id;
+  const imported = original !== actor.id || opts.batchId || opts.unknownDateByDefault ? actor.id : null;
   const r = await run(
-    `INSERT INTO leads (company,website,domain,industry,country,market,segment,language,source,source_url,owner_id,stage,service,notes,next_action,next_due_at,is_demo,created_by,created_at,updated_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    `INSERT INTO leads (company,website,domain,industry,country,market,segment,language,source,source_url,owner_id,stage,service,notes,next_action,next_due_at,is_demo,created_by,created_at,updated_at,
+                        lead_date,lead_date_precision,external_id,imported_by,import_batch_id)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     [d.company, d.website, domainOf(d.website), d.industry, d.country, d.market, d.segment, d.language, d.source, d.source_url, ownerId, stage, d.service, d.notes,
-      d.next_action, d.next_due_at, isTest ? 1 : 0, actor.id, t, t],
+      d.next_action, d.next_due_at, isTest ? 1 : 0, original, t, t,
+      ld.at, ld.precision === "unknown" ? null : ld.precision, opts.externalId ?? null, imported, opts.batchId ?? null],
   );
   for (const [i, c] of (d.contacts ?? []).entries()) {
     await run(
@@ -124,7 +149,7 @@ export async function createLead(actor: Actor, input: unknown, isDemo = false) {
       [r.id, c.name, c.role, c.email, c.phone, c.linkedin, c.other_social, c.notes, i === 0 ? 1 : 0, t, t],
     );
   }
-  await audit(actor, "create_lead", "lead", r.id, { company: d.company, owner_id: ownerId, ...(isTest ? { test: true } : {}) });
+  await audit(actor, "create_lead", "lead", r.id, { company: d.company, owner_id: ownerId, ...(isTest ? { test: true } : {}), ...(ld.at ? { lead_date: ld.at, precision: ld.precision } : { lead_date: "unknown" }) });
   return r.id;
 }
 
@@ -136,6 +161,15 @@ export async function updateLead(actor: Actor, leadId: number, input: Record<str
   // Only fields actually present are changed.
   const present = Object.keys(input).filter((k) => k in leadFields);
   const d = parse(updateSchema, Object.fromEntries(present.map((k) => [k, input[k]])));
+  let dateChange: EventDate | null = null;
+  if ("lead_date" in input) {
+    const e = parseEventDate(input.lead_date);
+    if (e === "invalid") throw new HttpError(400, 'lead_date: use YYYY-MM-DD (date only), YYYY-MM-DDTHH:mm, or "unknown".');
+    if (e.at && new Date(e.at).getTime() > Date.now() + 5 * 60000) throw new HttpError(400, "lead_date: cannot be in the future.");
+    dateChange = e;
+    // A date-only value that equals the day we already hold (e.g. an edit form that was not touched) keeps the exact time.
+    if (e.precision === "day" && lead.lead_date && lead.lead_date_precision === "time" && eventDateText(lead.lead_date, "day") === eventDateText(e.at, "day")) dateChange = null;
+  }
   if ("company" in d && !d.company) throw new HttpError(400, "company: required");
   await checkLists(Object.fromEntries(present.filter((k) => d[k] !== lead[k]).map((k) => [k, d[k]])) as never);
   if ("owner_id" in d && d.owner_id !== lead.owner_id) {
@@ -154,6 +188,11 @@ export async function updateLead(actor: Actor, leadId: number, input: Record<str
       sets.push("domain=?");
       args.push(domainOf(d.website as string | null));
     }
+  }
+  if (dateChange && (dateChange.at !== lead.lead_date || (dateChange.precision === "unknown" ? null : dateChange.precision) !== lead.lead_date_precision)) {
+    sets.push("lead_date=?", "lead_date_precision=?");
+    args.push(dateChange.at, dateChange.precision === "unknown" ? null : dateChange.precision);
+    changes.lead_date = { from: lead.lead_date ? { at: lead.lead_date, precision: lead.lead_date_precision } : "unknown", to: dateChange.at ? { at: dateChange.at, precision: dateChange.precision } : "unknown" };
   }
   if (!sets.length) return;
   await run(`UPDATE leads SET ${sets.join(",")}, updated_at=? WHERE id=?`, [...args, now(), leadId]);
@@ -279,14 +318,14 @@ export async function listLeads(actor: Actor, f: LeadFilters) {
 export async function getLead(actor: Actor, id: number) {
   await assertLeadAccess(actor, id);
   const lead = (await one(
-    `SELECT l.*, u.name AS owner_name, cb.name AS created_by_name FROM leads l
-     LEFT JOIN users u ON u.id=l.owner_id LEFT JOIN users cb ON cb.id=l.created_by WHERE l.id=?`,
+    `SELECT l.*, u.name AS owner_name, cb.name AS created_by_name, ib.name AS imported_by_name FROM leads l
+     LEFT JOIN users u ON u.id=l.owner_id LEFT JOIN users cb ON cb.id=l.created_by LEFT JOIN users ib ON ib.id=l.imported_by WHERE l.id=?`,
     [id],
   ))!;
   const contacts = await all("SELECT * FROM contacts WHERE lead_id=? ORDER BY is_primary DESC, id", [id]);
   const history = await all(
-    `SELECT a.*, u.name AS actor_name, c.name AS contact_name
-     FROM activities a JOIN users u ON u.id=a.actor_id LEFT JOIN contacts c ON c.id=a.contact_id
+    `SELECT a.*, u.name AS actor_name, c.name AS contact_name, ib.name AS imported_by_name
+     FROM activities a JOIN users u ON u.id=a.actor_id LEFT JOIN contacts c ON c.id=a.contact_id LEFT JOIN users ib ON ib.id=a.imported_by
      WHERE a.lead_id=? ORDER BY a.occurred_at DESC, a.id DESC`,
     [id],
   );

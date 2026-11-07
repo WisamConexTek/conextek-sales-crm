@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { run, now, all, localMidnight, addDays } from "../db";
+import { run, now, all, localMidnight, addDays, todayYmd } from "../db";
 import { HttpError, type Actor } from "../auth";
 
 /** Write an entry to the read-only change history. */
@@ -40,6 +40,30 @@ export function parseWhen(v: unknown): string | null | "invalid" {
   const d = new Date(s);
   return isNaN(d.getTime()) ? "invalid" : d.toISOString();
 }
+/**
+ * Date of something that HAPPENED (a lead's origin, a send, a reply, a bounce).
+ *  - "YYYY-MM-DD"           -> that day, no hour (stored as local midnight, precision "day")
+ *  - "YYYY-MM-DDTHH:mm" / full ISO -> exact moment (precision "time")
+ *  - empty / null / "unknown"      -> unknown (never replaced by today)
+ */
+export type EventDate = { at: string | null; precision: "day" | "time" | "unknown" };
+export function parseEventDate(v: unknown): EventDate | "invalid" {
+  if (v == null) return { at: null, precision: "unknown" };
+  const s = String(v).trim();
+  if (s === "" || /^unknown$/i.test(s)) return { at: null, precision: "unknown" };
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    const d = localMidnight(s);
+    return isNaN(d.getTime()) || todayYmd(undefined, d) !== s ? "invalid" : { at: d.toISOString(), precision: "day" };
+  }
+  const w = parseWhen(s);
+  return w === "invalid" || w === null ? "invalid" : { at: w, precision: "time" };
+}
+/** Show an event date the way it was recorded: day-only dates carry no hour. */
+export function eventDateText(at: string | null | undefined, precision: string | null | undefined): string {
+  if (!at || precision === "unknown") return "";
+  return precision === "day" ? todayYmd(undefined, new Date(at)) : at;
+}
+
 export const optDate = z.preprocess(parseWhen, z.string().nullable().refine((v) => v !== "invalid", "invalid date"));
 
 export function domainOf(website?: string | null): string | null {

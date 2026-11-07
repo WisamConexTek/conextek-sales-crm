@@ -37,6 +37,7 @@ export default async function NewLead({ searchParams }: { searchParams: SP }) {
               {!can(me, "tasks.assign") && <input type="hidden" name="owner_id" value={me.id} />}
             </Field>
             <Field label="Stage"><select name="stage" className="input"><Opts items={L("stage")} /></select></Field>
+            <Field label="Lead date (when it was really found)"><input type="date" name="lead_date" className="input" /><span className="text-xs text-slate-500">Leave empty = found today.</span></Field>
             <Field label="Next action" className="md:col-span-2"><input name="next_action" className="input" /></Field>
             <Field label="Due"><input type="date" name="next_due_at" className="input" /></Field>
             <Field label="Notes" className="md:col-span-3"><textarea name="notes" className="input" /></Field>

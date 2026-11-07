@@ -10,7 +10,7 @@ import {
 import { Ref } from "@/components/Ref";
 import { RecordForm } from "@/components/RecordForm";
 import { Badge, Card, DemoBadge, EmailStatusBadge, Field, Flash, Opts, OutcomeBadge, StageBadge, StatusBadge } from "@/components/ui";
-import { fmtDate, fmtDateTime, isOverdue, toLocalInput } from "@/lib/format";
+import { fmtDate, fmtDateTime, fmtEvent, isOverdue, toLocalInput, toDateInput } from "@/lib/format";
 import { ACTIVITY_TYPE_LABEL, MESSAGE_KIND_LABEL, EMAIL_STATUSES, EMAIL_STATUS_LABEL } from "@/lib/constants";
 import { sget, type SP } from "@/lib/view";
 
@@ -68,7 +68,8 @@ export default async function LeadPage({ params, searchParams }: { params: Promi
             <div className="mt-1 flex flex-wrap items-center gap-2 text-sm text-slate-500">
               <StageBadge stage={lead.stage} label={stageLab[lead.stage] ?? lead.stage} flag={flag[lead.stage]} />
               <span>Owner: <b className="text-slate-700">{lead.owner_name ?? "Unassigned"}</b></span>
-              <span>· Added {fmtDate(lead.created_at)}{lead.created_by_name ? ` by ${lead.created_by_name}` : ""}</span>
+              <span>· Lead date: <b className={lead.lead_date ? "text-slate-700" : "text-amber-700"}>{fmtEvent(lead.lead_date, lead.lead_date_precision)}</b>{lead.created_by_name ? ` · found by ${lead.created_by_name}` : ""}</span>
+              <span>· Entered in CRM {fmtDate(lead.created_at)}{lead.imported_by_name ? ` by ${lead.imported_by_name} (import)` : ""}</span>
             </div>
           </div>
           {can(me, "leads.stage") && (
@@ -114,6 +115,7 @@ export default async function LeadPage({ params, searchParams }: { params: Promi
               {can(me, "tasks.assign") && (
                 <Field label="Assigned employee"><select name="owner_id" defaultValue={lead.owner_id ?? ""} className="input"><option value="">Unassigned</option>{users.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}</select></Field>
               )}
+              <Field label="Lead date (when it was really found)"><input type="date" name="lead_date" defaultValue={toDateInput(lead.lead_date)} className="input" /><span className="text-xs text-slate-500">Empty = unknown. Not the day it was entered here.</span></Field>
               <Field label="Next action" className="md:col-span-2"><input name="next_action" defaultValue={lead.next_action ?? ""} className="input" /></Field>
               <Field label="Due date"><input type="date" name="next_due_at" defaultValue={lead.next_due_at ? toLocalInput(lead.next_due_at).slice(0, 10) : ""} className="input" /></Field>
               <Field label="Notes" className="md:col-span-3"><textarea name="notes" defaultValue={lead.notes ?? ""} className="input" /></Field>
@@ -227,7 +229,8 @@ export default async function LeadPage({ params, searchParams }: { params: Promi
                   ? <details className="mt-1 text-sm"><summary className="line-clamp-2 cursor-pointer whitespace-pre-wrap text-slate-700">{h.body}</summary><p className="mt-1 whitespace-pre-wrap text-slate-700">{h.body}</p></details>
                   : <p className="mt-1 whitespace-pre-wrap text-sm text-slate-700">{h.body}</p>)}
                 <div className="mt-1 flex flex-wrap gap-x-3 text-xs text-slate-500">
-                  <span>{h.actor_name} · {fmtDateTime(h.occurred_at)}</span>
+                  <span>{h.actor_name} · <span className={h.occurred_precision === "unknown" ? "text-amber-700" : ""}>{fmtEvent(h.occurred_at, h.occurred_precision)}</span></span>
+                  {h.imported_by_name && <span title={`Registered ${fmtDateTime(h.created_at)}`}>Imported by {h.imported_by_name} on {fmtDate(h.created_at)}</span>}
                   {h.contact_name && <span>Contact: {h.contact_name}</span>}
                   {h.channel && <span>Channel: {lab("channel")[h.channel] ?? h.channel}</span>}
                   {h.ref && <span>Ref: <code className="rounded bg-slate-100 px-1">{h.ref}</code></span>}

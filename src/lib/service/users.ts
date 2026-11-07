@@ -8,7 +8,7 @@ import { audit, parse, reqText } from "./common";
 import bcrypt from "bcryptjs";
 
 /** Rights a Chief can never hand to someone else. Only the Owner can. */
-export const CHIEF_LOCKED: Permission[] = ["approvals.decide", "tasks.assign", "tasks.view_all", "keys.manage"];
+export const CHIEF_LOCKED: Permission[] = ["approvals.decide", "tasks.assign", "tasks.view_all", "keys.manage", "history.import"];
 const safeCols = "id,username,name,role,preset,permissions,must_change_password,active,last_login_at,created_at";
 
 export async function listUsers(includeInactive = true): Promise<Row[]> {

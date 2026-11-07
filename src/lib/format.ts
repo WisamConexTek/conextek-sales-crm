@@ -15,3 +15,10 @@ export function toLocalInput(iso?: string | null): string {
 export const isOverdue = (iso?: string | null) => !!iso && new Date(iso).getTime() < Date.now();
 export const pct = (r: number | null) => (r == null ? "—" : `${(r * 100).toFixed(1)}%`);
 export const first = <T,>(v: T | T[] | undefined): T | undefined => (Array.isArray(v) ? v[0] : v);
+/** A date of something that happened: unknown stays "Unknown"; day-only dates show no hour. */
+export const fmtEvent = (iso?: string | null, precision?: string | null) =>
+  !iso || precision === "unknown" ? "Date unknown" : precision === "day" ? fmtDate(iso) : fmtDateTime(iso);
+/** Value for <input type="date"> in app timezone ("" when unknown). */
+export function toDateInput(iso?: string | null): string {
+  return iso ? toLocalInput(iso).slice(0, 10) : "";
+}

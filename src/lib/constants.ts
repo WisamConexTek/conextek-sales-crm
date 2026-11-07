@@ -88,6 +88,7 @@ export const PERMISSIONS = {
   "reports.view": "View reports and the dashboard for the whole team",
   "reports.export": "Export reports to CSV",
   "keys.manage": "Issue and revoke API keys for employees (never for the Owner or other Chiefs)",
+  "history.import": "Import historical records and correct original lead dates (Owner only unless granted)",
 } as const;
 export type Permission = keyof typeof PERMISSIONS;
 export const ALL_PERMISSIONS = Object.keys(PERMISSIONS) as Permission[];

@@ -2,8 +2,8 @@ import Papa from "papaparse";
 import { all, one } from "../db";
 import { HttpError, requirePerm, type Actor } from "../auth";
 import { createLead, findDuplicates, listLeads, type LeadFilters } from "./leads";
-import { domainOf } from "./common";
-import { getReport, rate, type Granularity } from "./reports";
+import { domainOf, parseEventDate, eventDateText } from "./common";
+import { getReport, getRangeReport, rate, type Granularity } from "./reports";
 
 export const MAX_IMPORT_ROWS = 500;
 
@@ -21,6 +21,8 @@ const ALIASES: Record<string, string[]> = {
   stage: ["stage", "status"],
   service: ["service", "service_of_interest"],
   notes: ["notes", "note", "comments"],
+  lead_date: ["lead_date", "original_date", "date_found", "date_added", "date"],
+  found_by: ["found_by", "original_employee"],
   next_action: ["next_action"],
   next_due_at: ["next_due", "next_due_at", "due_date", "due"],
   contact_name: ["contact_name", "contact", "person"],
@@ -103,6 +105,18 @@ export async function prepareImport(actor: Actor, text: string): Promise<{ rows:
       if (u) owner_id = u.id;
       else messages.push(`owner "${ownerVal}" not found — left unassigned`);
     }
+    // Original date of the lead. Blank stays UNKNOWN — it is never replaced by today's import date.
+    const ldRaw = get("lead_date");
+    let lead_date: string | null = null;
+    if (!ldRaw) messages.push("no lead_date — original date will be unknown (not counted in period reports)");
+    else if (parseEventDate(ldRaw) === "invalid") (messages.push(`lead_date "${ldRaw}" is not a valid date (use YYYY-MM-DD) — left unknown`));
+    else lead_date = ldRaw;
+    let found_by: number | null = null;
+    if (get("found_by")) {
+      const u = users.find((x) => x.username.toLowerCase() === get("found_by").toLowerCase() || x.name.toLowerCase() === get("found_by").toLowerCase());
+      if (u) found_by = u.id;
+      else messages.push(`found_by "${get("found_by")}" not found — credited to the importer`);
+    }
     const email = get("contact_email");
     const contact = get("contact_name") || email
       ? [{ name: get("contact_name") || email, role: get("contact_role"), email, phone: get("contact_phone"), linkedin: get("contact_linkedin") }]
@@ -111,7 +125,7 @@ export async function prepareImport(actor: Actor, text: string): Promise<{ rows:
 
     const data = {
       company, website: get("website"), industry, country: get("country"), market, segment, language, source, source_url: get("source_url"), owner_id,
-      stage: stage ?? undefined, service, notes, next_action: get("next_action"), next_due_at: get("next_due_at"), contacts: contact,
+      stage: stage ?? undefined, service, notes, next_action: get("next_action"), next_due_at: get("next_due_at"), contacts: contact, lead_date, found_by,
     };
 
     const dom = domainOf(get("website"));
@@ -137,7 +151,8 @@ export async function commitImport(actor: Actor, text: string, importDuplicates:
     if (r.status === "error" || !r.data) { failed++; errors.push(`Line ${r.line}: ${r.messages.join("; ")}`); continue; }
     if (r.status === "duplicate" && !importDuplicates) { skipped++; continue; }
     try {
-      await createLead(actor, { ...r.data, allow_duplicate: true });
+      const { found_by, ...fields } = r.data as Record<string, unknown>;
+      await createLead(actor, { ...fields, allow_duplicate: true }, false, { unknownDateByDefault: true, originalEmployeeId: (found_by as number | null) ?? undefined });
       created++;
     } catch (e) {
       failed++;
@@ -163,7 +178,7 @@ export async function leadsCsv(actor: Actor, filters: LeadFilters): Promise<stri
     out.push({
       company: l.company, website: l.website, industry: l.industry, country: l.country, market: l.market, segment: l.segment, language: l.language,
       source: l.source, source_url: l.source_url, owner: l.owner_name, stage: stage[l.stage] ?? l.stage, service: l.service,
-      last_activity: l.last_activity_at, next_action: l.next_action, next_due: l.next_due_at, notes: l.notes,
+      lead_date: l.lead_date ? eventDateText(l.lead_date, l.lead_date_precision) : "unknown", registered_in_crm: l.created_at, last_activity: l.last_activity_at, next_action: l.next_action, next_due: l.next_due_at, notes: l.notes,
       contact_name: c?.name, contact_role: c?.role, contact_email: c?.email, contact_phone: c?.phone, contact_linkedin: c?.linkedin,
       contact_email_status: c?.email_status,
     });
@@ -171,9 +186,11 @@ export async function leadsCsv(actor: Actor, filters: LeadFilters): Promise<stri
   return Papa.unparse(out.map((o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, safe(v)]))));
 }
 
-export async function reportCsv(actor: Actor, g: Granularity, at?: string, employee?: number | null): Promise<string> {
+export async function reportCsv(actor: Actor, g: Granularity, at?: string, employee?: number | null, range?: { all?: boolean; from?: string; to?: string }): Promise<string> {
   requirePerm(actor, "reports.export");
-  const r = await getReport(actor, { granularity: g, at, employee });
+  const r = range && (range.all || range.from)
+    ? await getRangeReport(actor, { ...range, employee })
+    : await getReport(actor, { granularity: g, at, employee });
   const pct = (a: number, b: number) => (rate(a, b) == null ? "" : `${(rate(a, b)! * 100).toFixed(1)}%`);
   const rows = r.buckets.map((b) => ({
     period: b.label, leads_added: b.m.leads_added, first_emails_sent: b.m.first_emails, first_email_bounces: b.m.first_email_bounces,

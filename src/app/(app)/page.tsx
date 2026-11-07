@@ -11,16 +11,16 @@ import { q, sget, snum, type SP, stageMeta } from "@/lib/view";
 export default async function Dashboard({ searchParams }: { searchParams: SP }) {
   const me = await requireUser();
   const sp = await searchParams;
-  const d = await getDashboard(me, { from: sget(sp, "from"), to: sget(sp, "to"), employee: snum(sp, "employee") });
+  const d = await getDashboard(me, { from: sget(sp, "from"), to: sget(sp, "to"), employee: snum(sp, "employee"), all: sget(sp, "all") === "1" });
   const users = await assignableUsers();
   const teamView = can(me, "reports.view") || isManager(me);
   const today = todayYmd();
-  const range = d.from === d.to ? (d.from === today ? "Today" : d.from) : `${d.from} → ${d.to}`;
+  const range = d.all ? "All data (since the beginning)" : d.from === d.to ? (d.from === today ? "Today" : d.from) : `${d.from} → ${d.to}`;
   const maxStage = Math.max(1, ...d.byStage.map((s) => s.n));
   const sm = await stageMeta();
   const empName = d.employee ? users.find((u) => u.id === d.employee)?.name : null;
   const preset = (label: string, from: string, to: string) => (
-    <Link href={`/${q({ from, to, employee: d.employee })}`} className={`btn btn-sm ${d.from === from && d.to === to ? "btn-primary" : ""}`}>{label}</Link>
+    <Link href={`/${q({ from, to, employee: d.employee })}`} className={`btn btn-sm ${!d.all && d.from === from && d.to === to ? "btn-primary" : ""}`}>{label}</Link>
   );
 
   return (
@@ -30,9 +30,17 @@ export default async function Dashboard({ searchParams }: { searchParams: SP }) 
         {preset("Yesterday", addDays(today, -1), addDays(today, -1))}
         {preset("7 days", addDays(today, -6), today)}
         {preset("30 days", addDays(today, -29), today)}
+        <Link href={`/${q({ all: 1, employee: d.employee })}`} className={`btn btn-sm ${d.all ? "btn-primary" : ""}`}>All data</Link>
       </PageHeader>
       <Flash ok={sget(sp, "ok")} err={sget(sp, "err")} />
 
+      {(d.unknownCounts.leads > 0 || d.unknownCounts.activities > 0) && (
+        <div className="mb-4 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+          {d.unknownCounts.leads} lead{d.unknownCounts.leads === 1 ? "" : "s"} and {d.unknownCounts.activities} activit{d.unknownCounts.activities === 1 ? "y" : "ies"} have no known original date, so they are <b>not</b> counted in dated periods
+          {d.all ? " (they are included in this all-data view)." : " — they only show under “All data”."}
+          {can(me, "history.import") && <> <Link href="/settings/history">Fix dates →</Link></>}
+        </div>
+      )}
       <form className="card mb-5 flex flex-wrap items-end gap-3 p-3">
         <div><label className="label">From</label><input type="date" name="from" defaultValue={d.from} className="input" /></div>
         <div><label className="label">To</label><input type="date" name="to" defaultValue={d.to} className="input" /></div>
