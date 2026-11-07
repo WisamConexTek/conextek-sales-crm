@@ -219,6 +219,16 @@ export async function setLeadTest(actor: Actor, leadId: number, isTest: boolean)
   await audit(actor, isTest ? "mark_lead_test" : "mark_lead_real", "lead", leadId, { company: lead.company });
 }
 
+/* ---------- historical-only (suppressed) entities ---------- */
+export async function setLeadHistorical(actor: Actor, leadId: number, on: boolean) {
+  if (!isManager(actor)) throw new HttpError(403, "Only the Owner or Chief can mark a lead historical-only.");
+  const lead = await one("SELECT * FROM leads WHERE id=?", [leadId]);
+  if (!lead) throw new HttpError(404, "Lead not found.");
+  if (!!lead.historical_only === on) return;
+  await run("UPDATE leads SET historical_only=?, updated_at=? WHERE id=?", [on ? 1 : 0, now(), leadId]);
+  await audit(actor, on ? "mark_lead_historical_only" : "unmark_lead_historical_only", "lead", leadId, { company: lead.company });
+}
+
 /* ---------- stage ---------- */
 export async function setStage(actor: Actor, leadId: number, stage: string, reason: string) {
   requirePerm(actor, "leads.stage");
@@ -268,6 +278,9 @@ export async function updateContact(actor: Actor, contactId: number, input: Reco
   for (const k of keys) {
     if (d[k] === c0[k]) continue;
     if (k === "name" && !d[k]) throw new HttpError(400, "name: required");
+    // Suppression is permanent unless an Owner/Chief explicitly corrects it (audited below).
+    if (k === "email_status" && (c0.email_status === "opted_out" || c0.email_status === "bounced") && d[k] !== "opted_out" && !(c0.email_status === "bounced" && d[k] === "opted_out") && !isManager(actor))
+      throw new HttpError(403, `This contact is marked ${c0.email_status}. Only the Owner or Chief can correct that.`);
     sets.push(`${k}=?`);
     args.push(d[k] as InValue);
     changes[k] = { from: c0[k], to: d[k] };
@@ -280,7 +293,7 @@ export async function updateContact(actor: Actor, contactId: number, input: Reco
 /* ---------- reads ---------- */
 export type LeadFilters = {
   q?: string; owner?: number; market?: string; segment?: string; stage?: string; channel?: string; testOnly?: boolean;
-  includeDemo?: boolean; page?: number; pageSize?: number; sort?: string;
+  includeDemo?: boolean; includeHistorical?: boolean; page?: number; pageSize?: number; sort?: string;
 };
 
 export async function listLeads(actor: Actor, f: LeadFilters) {
@@ -289,6 +302,8 @@ export async function listLeads(actor: Actor, f: LeadFilters) {
   const args: InValue[] = [...s.args];
   if (!f.includeDemo) where.push("l.is_demo=0");
   if (f.testOnly) where.push("l.is_demo=1");
+  // Historical-only (suppressed) entities are not outreach prospects: hidden unless asked for.
+  if (!f.includeHistorical) where.push("l.historical_only=0");
   if (f.q?.trim()) {
     const like = `%${f.q.trim().toLowerCase()}%`;
     where.push(`(lower(l.company) LIKE ? OR l.domain LIKE ? OR lower(l.country) LIKE ? OR EXISTS (SELECT 1 FROM contacts c WHERE c.lead_id=l.id AND (lower(c.name) LIKE ? OR lower(c.email) LIKE ?)))`);
@@ -324,8 +339,8 @@ export async function getLead(actor: Actor, id: number) {
   ))!;
   const contacts = await all("SELECT * FROM contacts WHERE lead_id=? ORDER BY is_primary DESC, id", [id]);
   const history = await all(
-    `SELECT a.*, u.name AS actor_name, c.name AS contact_name, ib.name AS imported_by_name
-     FROM activities a JOIN users u ON u.id=a.actor_id LEFT JOIN contacts c ON c.id=a.contact_id LEFT JOIN users ib ON ib.id=a.imported_by
+    `SELECT a.*, COALESCE(u.name,'Unknown original employee') AS actor_name, (a.actor_id IS NULL) AS actor_unknown, c.name AS contact_name, ib.name AS imported_by_name
+     FROM activities a LEFT JOIN users u ON u.id=a.actor_id LEFT JOIN contacts c ON c.id=a.contact_id LEFT JOIN users ib ON ib.id=a.imported_by
      WHERE a.lead_id=? ORDER BY a.occurred_at DESC, a.id DESC`,
     [id],
   );

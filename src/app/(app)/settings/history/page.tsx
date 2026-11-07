@@ -30,7 +30,7 @@ export default async function HistoryPage() {
       <Card title="Importing past outreach (leads, sends, replies, bounces)">
         <p className="text-sm text-slate-600">
           Done through the API so your agents or scripts can send the historical log in chunks: <code>POST /api/v1/import/history</code>. It checks first (dry run), skips duplicates, keeps do-not-contact/bounced states, and records the original employee separately from the person importing.
-          Full field list and examples are in the <Link href="/api-docs#history">API guide</Link>. The Owner can grant the “history.import” permission to a trusted API key.
+          Full field list and examples are in the <Link href="/api-docs#history">API guide</Link>. The Owner can give a Chief (or employee) time-limited migration access from that person’s settings page; it expires by itself and can be revoked. Other endpoints: <code>/import/lead-dates</code> and <code>/import/reconcile-activities</code> (attach import ids to activities already in the CRM).
         </p>
       </Card>
       <Card title="Recent imports and corrections">

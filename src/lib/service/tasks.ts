@@ -33,6 +33,7 @@ export async function createTask(actor: Actor, input: unknown, isDemo = false) {
   if (!isDemo && !(await one("SELECT id FROM users WHERE id=? AND active=1", [assignee]))) throw new HttpError(400, "assignee_id: unknown or disabled employee.");
   let leadRow: Row | null = null;
   if (d.lead_id) leadRow = await assertLeadAccess(actor, d.lead_id);
+  if (leadRow?.historical_only) throw new HttpError(400, "lead_id: that lead is historical-only (kept for past replies / suppression) and is not an outreach prospect, so no work can be assigned on it.");
   await assertListKey("task_type", d.task_type, "task_type");
   if (d.is_test && leadRow && !leadRow.is_demo) throw new HttpError(400, "is_test: a task on a real lead is real work. Mark the lead as test data instead.");
   const isTest = isDemo || !!d.is_test || !!leadRow?.is_demo;

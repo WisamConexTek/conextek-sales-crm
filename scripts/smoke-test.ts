@@ -315,6 +315,141 @@ async function main() {
   ok(unkMsg2.committed && um.occurred_precision === "unknown", "unknown-date history stays unknown");
   void dbAll;
 
+  console.log("Migration access, unknown employee, suppression, reconcile, report API");
+  // --- narrowly scoped, revocable, time-limited access for Chief ---
+  const permsBefore = [...(await actorById(chief.id)).perms].filter((p) => p !== "history.import").sort().join(",");
+  await throws(() => U.setMigrationAccess(chief, omar.id, 24), 403, "chief cannot grant migration access");
+  const until = await U.setMigrationAccess(owner, chief.id, 24);
+  const chiefM = await actorById(chief.id, "api");
+  ok(!!until && chiefM.perms.has("history.import"), "owner grants chief time-limited migration access");
+  ok([...chiefM.perms].filter((p) => p !== "history.import").sort().join(",") === permsBefore, "migration access adds no other permission");
+  const chiefDry = await H.importHistory(chiefM, { label: "chief dry", employee: null, leads: [{ external_id: "c-1", company: "Chief Test Co" }] });
+  ok(chiefDry.dry_run && chiefDry.counts.leads.created === 1, "chief can dry-run with own identity");
+  await throws(() => U.setMigrationAccess(chiefM, omar.id, 24), 403, "chief still cannot grant it to others");
+  await U.setPermissions(chiefM, omar.id, [...((await U.getUser(omar.id))!.perms as string[]), "history.import"]);
+  ok(!(await actorById(omar.id)).perms.has("history.import"), "chief cannot hand history.import to an employee");
+  await throws(() => U.createKey(chiefM, owner.id, "x"), 403, "migration access gives no access to owner keys");
+  await throws(() => U.createUser(chiefM, { username: "c2x", name: "c2", role: "chief" }), 403, "migration access gives no owner functions");
+  ok(!(await actorById(chief.id)).perms.has("message.record_sent") || permsBefore.includes("message.record_sent"), "migration access does not add send-recording rights");
+  await U.setMigrationAccess(owner, chief.id, null);
+  const chiefRev = await actorById(chief.id, "api");
+  await throws(() => H.importHistory(chiefRev, { label: "x", employee: null, leads: [{ company: "Z" }] }), 403, "revoked migration access stops working");
+  await U.setMigrationAccess(owner, chief.id, 1);
+  const { run: dbRun } = await import("../src/lib/db");
+  await dbRun("UPDATE users SET history_import_until=? WHERE id=?", [new Date(Date.now() - 1000).toISOString(), chief.id]);
+  const chiefExp = await actorById(chief.id, "api");
+  await throws(() => H.importHistory(chiefExp, { label: "x", employee: null, leads: [{ company: "Z" }] }), 403, "expired migration access stops working");
+  await U.setMigrationAccess(owner, chief.id, null);
+
+  // --- unknown original employee ---
+  const sBefore = (await R.getRangeReport(owner, { all: true })).byEmployee.find((e) => e.user.id === sara.id)?.m;
+  const ue = await H.importHistory(owner, { label: "unknown actor", commit: true, employee: null,
+    leads: [{ external_id: "u-1", company: "Nobody Knows Motors", website: "nobody.example", lead_date: "2025-07-01" }],
+    messages: [{ external_id: "u-1-m1", lead: { external_id: "u-1" }, channel: "email", kind: "first_email", sent_at: "2025-07-02", contact_email: "a@nobody.example", subject: "Hi" },
+               { external_id: "u-1-m2", lead: { external_id: "u-1" }, channel: "email", kind: "follow_up", sent_at: "2025-07-09", contact_email: "a@nobody.example", subject: "Following up" },
+               { external_id: "u-1-m3", lead: { external_id: "u-1" }, channel: "linkedin", kind: "other", sent_at: "2025-07-10", subject: "LinkedIn hello" }],
+    bounces: [{ external_id: "u-1-b2", message_external_id: "u-1-m2", bounced_at: "2025-07-10" }] });
+  ok(ue.committed, "unknown original employee accepted (top-level null)");
+  const uLead = (await one("SELECT * FROM leads WHERE external_id='u-1'"))!;
+  const uMsg = (await one("SELECT * FROM activities WHERE external_id='u-1-m1'"))!;
+  ok(uLead.created_by === null && uLead.imported_by === owner.id && uMsg.actor_id === null && uMsg.imported_by === owner.id, "unknown employee stored as NULL, never the importer; imported_by filled");
+  const repUnk = await R.getRangeReport(owner, { all: true });
+  const unkRow2 = repUnk.byEmployee.find((e) => e.user.id === 0);
+  ok(!!unkRow2 && unkRow2.m.first_emails === 1 && unkRow2.m.follow_ups === 1 && unkRow2.m.leads_added === 1, "unknown-actor records listed under 'Unknown original employee'");
+  ok(JSON.stringify(repUnk.byEmployee.find((e) => e.user.id === sara.id)?.m) === JSON.stringify(sBefore), "no named employee is credited for unknown-actor work");
+  ok(repUnk.totals.first_emails >= (unkRow2?.m.first_emails ?? 0) + 1, "unknown-actor records are in overall totals");
+  const perRec = await H.importHistory(owner, { label: "per record", commit: true, employee: "sara",
+    messages: [{ external_id: "u-1-m4", lead: { external_id: "u-1" }, channel: "email", kind: "other", sent_at: "2025-07-11", subject: "Other", employee: null }] });
+  ok(perRec.committed && (await one("SELECT actor_id FROM activities WHERE external_id='u-1-m4'"))!.actor_id === null, "per-record employee:null overrides the top-level employee");
+  const noEmp = await H.importHistory(owner, { label: "no emp", messages: [{ external_id: "u-1-m5", lead: { external_id: "u-1" }, channel: "email", kind: "other", sent_at: "2025-07-12", subject: "x" }] });
+  ok(noEmp.counts.messages.errors === 1 && String(noEmp.results.messages[0].message).includes("null"), "missing employee is an error that explains null");
+  const dncNoEmp = await H.importHistory(owner, { label: "dnc", employee: null, commit: true, do_not_contact: [{ lead: { external_id: "u-1" }, email: "b@nobody.example", at: "2025-07-15" }] });
+  ok(dncNoEmp.committed && (await one("SELECT email_status FROM contacts WHERE email='b@nobody.example'"))!.email_status === "opted_out", "do_not_contact follows the same employee rule (null allowed)");
+
+  // --- follow-up bounce linked to the follow-up, not the first email ---
+  const m2 = (await one("SELECT * FROM activities WHERE external_id='u-1-m2'"))!;
+  const b2 = (await one("SELECT * FROM activities WHERE external_id='u-1-b2'"))!;
+  ok(b2.parent_id === m2.id && b2.message_kind === "follow_up", "bounce is linked to the follow-up and takes its kind");
+  const d10 = (await R.getRangeReport(owner, { from: "2025-07-10", to: "2025-07-10" })).totals;
+  ok(d10.follow_up_bounces === 1 && d10.first_email_bounces === 0, "follow-up bounce is not counted against first emails");
+  const coh = (await R.getRangeReport(owner, { from: "2025-07-09", to: "2025-07-09" })).totals;
+  ok(coh.follow_ups === 1 && coh.follow_up_cohort_bounces === 1 && coh.follow_up_bounces === 0, "late bounce: event view in bounce period, cohort view in send period");
+  const wrongKind = await H.importHistory(owner, { label: "wk", employee: null, bounces: [{ external_id: "u-1-bx", message_external_id: "u-1-m2", kind: "first_email", bounced_at: "2025-07-11" }] });
+  ok(wrongKind.counts.bounces.errors === 1, "bounce naming the wrong kind is rejected");
+  const bounceOfReply = await H.importHistory(owner, { label: "br", employee: null, bounces: [{ external_id: "u-1-by", message_external_id: "h-1-r1", bounced_at: "2025-07-11" }] });
+  ok(bounceOfReply.counts.bounces.errors === 1, "bounce cannot attach to a reply");
+  const noRef = await H.importHistory(owner, { label: "nr", employee: null, bounces: [{ external_id: "u-1-bz", bounced_at: "2025-07-11" }] });
+  ok(noRef.counts.bounces.errors === 1, "bounce without an exact message reference is an error (never guessed)");
+  const lateUnknown = await H.importHistory(owner, { label: "lu", employee: null, commit: true,
+    messages: [{ external_id: "u-1-m6", lead: { external_id: "u-1" }, channel: "email", kind: "follow_up", subject: "undated follow-up" }],
+    bounces: [{ external_id: "u-1-b6", message_external_id: "u-1-m6", bounced_at: "2025-07-20" }] });
+  ok(lateUnknown.committed, "dated bounce on an unknown-date message passes chronology (nothing to compare)");
+  const crossBatch = await H.importHistory(owner, { label: "xb", employee: null, commit: true, replies: [{ external_id: "u-1-r1", in_reply_to: "u-1-m1", channel: "email", received_at: "2025-07-03", body: "ok" }] });
+  ok(crossBatch.committed && (await one("SELECT parent_id FROM activities WHERE external_id='u-1-r1'"))!.parent_id === uMsg.id, "reply references a message imported in another batch");
+  const early = await H.importHistory(owner, { label: "er", employee: null, replies: [{ external_id: "u-1-r2", in_reply_to: "u-1-m1", channel: "email", received_at: "2025-06-01", body: "too early" }] });
+  ok(early.counts.replies.errors === 1, "reply earlier than its message is rejected");
+
+  // --- suppressed, historical-only entities ---
+  const hist = await H.importHistory(owner, { label: "suppressed", employee: null, commit: true,
+    leads: [{ external_id: "s-1", company: "Opted Out Corp", website: "optedout.example", historical_only: true,
+              contacts: [{ email: "one@optedout.example", email_status: "opted_out" }, { email: "two@optedout.example", email_status: "bounced" }] }],
+    replies: [{ external_id: "s-1-r", lead: { external_id: "s-1" }, channel: "email", received_at: "2025-08-05", body: "Please remove us", contact_email: "one@optedout.example" }] });
+  ok(hist.committed, "historical-only suppressed entity imported with its reply");
+  const sLead = (await one("SELECT * FROM leads WHERE external_id='s-1'"))!;
+  ok(sLead.historical_only === 1, "entity flagged historical-only");
+  ok(!(await L.listLeads(owner, {})).rows.some((r) => r.id === sLead.id) && (await L.listLeads(owner, { includeHistorical: true })).rows.some((r) => r.id === sLead.id), "historical-only entity is hidden from default lead lists");
+  await throws(() => T.createTask(owner, { lead_id: sLead.id, assignee_id: sara.id, title: "chase them" }), 400, "no task can be assigned on a historical-only entity");
+  ok((await R.getRangeReport(owner, { from: "2025-08-05", to: "2025-08-05" })).totals.replies === 1 && (await R.getRangeReport(owner, { from: "2025-08-01", to: "2025-08-31" })).totals.leads_added === 0, "its reply counts on its date; it is not a lead added");
+  const reimport = await H.importHistory(owner, { label: "reimport", employee: null, commit: true,
+    leads: [{ external_id: "s-1b", company: "Opted Out Corp", contacts: [{ email: "one@optedout.example", email_status: "ok" }, { email: "two@optedout.example", email_status: "unknown" }] },
+            { external_id: "s-1c", company: "Opted Out Corp Again", website: "https://www.optedout.example/", contacts: [{ email: "one@optedout.example" }] }] });
+  ok(reimport.counts.leads.duplicate === 2, "duplicate matches of the suppressed entity are skipped");
+  const st = await dbAll("SELECT email,email_status FROM contacts WHERE lead_id=? ORDER BY email", [sLead.id]);
+  ok(st.length === 2 && st[0].email_status === "opted_out" && st[1].email_status === "bounced", "suppression survives duplicate matches (multiple addresses, per contact)");
+  const oc = (await one("SELECT id FROM contacts WHERE lead_id=? AND email='one@optedout.example'", [sLead.id]))!;
+  const { updateContact } = L;
+  const asOwnerOfLead = await actorById(sara.id, "api");
+  await throws(() => updateContact(asOwnerOfLead, oc.id as number, { email_status: "ok" }), 403, "an employee cannot clear a suppression");
+  await updateContact(owner, oc.id as number, { email_status: "ok" });
+  ok((await one("SELECT email_status FROM contacts WHERE id=?", [oc.id]))!.email_status === "ok", "Owner can make an explicit, audited correction");
+  await updateContact(owner, oc.id as number, { email_status: "opted_out" });
+  ok(!(await one("SELECT id FROM tasks WHERE lead_id=?", [sLead.id])), "historical import created no tasks or outreach");
+
+  // --- reconcile existing activities (regular API) with import ids, no duplicates ---
+  const rl = await L.createLead(owner, { company: "Steelmate Test", website: "steelmate.example", lead_date: "2025-09-01" });
+  const rec = await A.recordActivity(owner, rl, { type: "reply", channel: "email", body: "Interested, send details", occurred_at: addDays(today0, -3) + "T09:50", task_id: undefined });
+  const near = await H.importHistory(owner, { label: "near", employee: "sara", replies: [{ external_id: "steel-r1", lead: { id: rl }, channel: "email", received_at: addDays(today0, -3), body: "Interested, send details" }] });
+  ok(near.counts.replies.errors === 1 && String(near.results.replies[0].message).includes(`#${rec.id}`) && String(near.results.replies[0].message).includes("reconcile"), "a day-only import near an API-entered reply is flagged, not duplicated");
+  const actCount = Number((await one("SELECT COUNT(*) AS n FROM activities"))!.n);
+  const rcDry = await H.reconcileActivities(owner, { records: [{ activity_id: rec.id, external_id: "steel-r1", lead_id: rl, type: "reply" }] });
+  ok(rcDry.dry_run && rcDry.counts.will_change === 1 && !(await one("SELECT external_id FROM activities WHERE id=?", [rec.id]))!.external_id, "reconcile dry run changes nothing");
+  const badLead = await H.reconcileActivities(owner, { records: [{ activity_id: rec.id, external_id: "x", lead_id: 999999 }], commit: true });
+  ok(badLead.counts.errors === 1 && !badLead.committed, "reconcile checks the lead id and changes nothing on error");
+  const rc = await H.reconcileActivities(owner, { commit: true, label: "attach", records: [{ activity_id: rec.id, external_id: "steel-r1", lead_id: rl, type: "reply", employee: "omar" }] });
+  const rcRow = (await one("SELECT * FROM activities WHERE id=?", [rec.id]))!;
+  ok(rc.committed && rcRow.external_id === "steel-r1" && rcRow.actor_id === omar.id && rcRow.imported_by === owner.id, "reconcile attaches external_id, corrects original employee and keeps the recorder");
+  ok(rcRow.occurred_at === (await one("SELECT occurred_at FROM activities WHERE id=?", [rec.id]))!.occurred_at && Number((await one("SELECT COUNT(*) AS n FROM activities"))!.n) === actCount, "reconcile creates and deletes nothing");
+  const again2 = await H.importHistory(owner, { label: "near2", employee: "sara", commit: true, replies: [{ external_id: "steel-r1", lead: { id: rl }, channel: "email", received_at: addDays(today0, -3), body: "Interested, send details" }] });
+  ok(again2.counts.replies.exists === 1 && Number((await one("SELECT COUNT(*) AS n FROM activities WHERE lead_id=? AND type='reply'", [rl]))!.n) === 1, "after reconcile the same reply is recognised, no duplicate");
+  ok(!!(await one("SELECT id FROM audit_log WHERE action='reconcile_activity' AND entity_id=?", [String(rec.id)])), "reconcile is audited");
+  const distinct = await H.importHistory(owner, { label: "distinct", employee: "sara", commit: true, replies: [{ external_id: "steel-r2", lead: { id: rl }, channel: "email", received_at: addDays(today0, -3), body: "A second, different reply", not_activity_ids: [rec.id] }] });
+  ok(distinct.committed && distinct.counts.replies.created === 1, "not_activity_ids states explicitly that a record is a different event");
+  const fixEmp = await H.correctLeadDates(owner, { commit: true, records: [{ id: rl, employee: null }] });
+  const rlRow = (await L.getLead(owner, rl)).lead;
+  ok(fixEmp.committed && rlRow.created_by === null && rlRow.lead_date_precision === "day" && rlRow.imported_by === owner.id, "original employee can be corrected to unknown without touching the date; recorder kept");
+  const keepUnknown = await H.correctLeadDates(owner, { records: [{ id: unk, lead_date: "unknown" }, { id: old, lead_date: null }] });
+  ok(keepUnknown.counts.errors === 0 && (keepUnknown.results[0].status === "unchanged" || keepUnknown.results[0].status === "will_change"), "'unknown'/null are accepted as explicit unknown dates");
+
+  // --- report API ---
+  const api = await R.reportApi(owner, { all: true });
+  ok(api.view === "all" && api.timezone && api.rules.bounces.includes("cohort") && api.unknown_counts.leads >= 0 && !!api.unknown, "report API returns all-data view with rules and unknown counts");
+  const apiUnk = await R.reportApi(owner, { from: "2025-07-01", to: "2025-07-31", employee: "unknown" });
+  ok(apiUnk.totals.first_emails === 1 && apiUnk.totals.follow_ups === 1 && apiUnk.rates.follow_up_cohort_bounce_rate === 1, "report API filters by unknown employee and exposes cohort rates");
+  const apiSara = await R.reportApi(owner, { from: "2025-07-01", to: "2025-07-31", employee: "sara" });
+  ok(apiSara.totals.first_emails === 0, "named employee filter excludes unknown-actor work");
+  const apiPeriod = await R.reportApi(owner, { period: "month", at: "2025-07-15" });
+  ok(apiPeriod.view === "period" && apiPeriod.totals.reply_leads === 1, "report API period view; reply_leads counts distinct leads");
+
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 }

@@ -9,7 +9,7 @@ import bcrypt from "bcryptjs";
 
 /** Rights a Chief can never hand to someone else. Only the Owner can. */
 export const CHIEF_LOCKED: Permission[] = ["approvals.decide", "tasks.assign", "tasks.view_all", "keys.manage", "history.import"];
-const safeCols = "id,username,name,role,preset,permissions,must_change_password,active,last_login_at,created_at";
+const safeCols = "id,username,name,role,preset,permissions,must_change_password,active,last_login_at,created_at,history_import_until";
 
 export async function listUsers(includeInactive = true): Promise<Row[]> {
   const rows = await all(`SELECT ${safeCols} FROM users ${includeInactive ? "" : "WHERE active=1"} ORDER BY active DESC, role, name`);
@@ -167,4 +167,27 @@ export async function revokeKey(actor: Actor, keyId: number) {
   await assertKeyAccess(actor, await keyOwnerRole(keyId));
   await run("UPDATE api_keys SET active=0, revoked_at=? WHERE id=?", [now(), keyId]);
   await audit(actor, "revoke_api_key", "api_key", keyId);
+}
+
+/**
+ * Owner only. Give a Chief (or employee) time-limited access to the historical-import and lead-date-correction
+ * endpoints — and nothing else (no permission management, no Owner operations, no sending). hours=null revokes it now.
+ */
+export async function setMigrationAccess(actor: Actor, userId: number, hours: number | null) {
+  if (actor.role !== "owner") throw new HttpError(403, "Only the Owner can grant or revoke migration access.");
+  const u = await one("SELECT * FROM users WHERE id=?", [userId]);
+  if (!u) throw new HttpError(404, "User not found.");
+  if (u.role === "owner") throw new HttpError(400, "The Owner always has this access.");
+  let perms: string[] = [];
+  try { perms = JSON.parse(u.permissions); } catch {}
+  perms = perms.filter((p) => p !== "history.import");
+  let until: string | null = null;
+  if (hours != null) {
+    if (!Number.isFinite(hours) || hours < 1 || hours > 24 * 90) throw new HttpError(400, "hours: between 1 and 2160.");
+    perms.push("history.import");
+    until = new Date(Date.now() + hours * 3600_000).toISOString();
+  }
+  await run("UPDATE users SET permissions=?, history_import_until=?, updated_at=? WHERE id=?", [JSON.stringify(perms), until, now(), userId]);
+  await audit(actor, hours != null ? "grant_migration_access" : "revoke_migration_access", "user", userId, { until });
+  return until;
 }

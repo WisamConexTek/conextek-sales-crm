@@ -1,11 +1,12 @@
 import type { InValue } from "@libsql/client";
+import { HttpError } from "../auth";
 import { all, one, localMidnight, addDays, todayYmd, TZ, now, type Row } from "../db";
 import { can, isManager, type Actor } from "./../auth";
 import { leadScope } from "./leads";
 
 /** Employees without team-report rights only ever see their own numbers. */
 export function scopeEmployee(actor: Actor, requested?: number | null): number | undefined {
-  if (can(actor, "reports.view") || isManager(actor)) return requested || undefined;
+  if (can(actor, "reports.view") || isManager(actor)) return requested === 0 ? 0 : requested || undefined;
   return actor.id;
 }
 
@@ -20,11 +21,21 @@ export type Metrics = {
   won: number;
   lost: number;
   completed: number;
+  /** Messages SENT in the period that have a bounce (any date) — the send-date cohort view of bounces. */
+  first_email_cohort_bounces: number;
+  follow_up_cohort_bounces: number;
+  /** Distinct leads with at least one reply in the period (replies counts every inbound reply). */
+  reply_leads: number;
 };
 const zero = (): Metrics => ({
   leads_added: 0, first_emails: 0, first_email_bounces: 0, follow_ups: 0, follow_up_bounces: 0,
   replies: 0, meetings: 0, won: 0, lost: 0, completed: 0,
+  first_email_cohort_bounces: 0, follow_up_cohort_bounces: 0, reply_leads: 0,
 });
+/** SQL filter for an employee column. 0 = unknown original employee (NULL). */
+const ef = (col: string, e?: number) => (e === undefined ? "" : e === 0 ? ` AND ${col} IS NULL` : ` AND ${col}=?`);
+const ea_ = (e?: number): number[] => (e ? [e] : []);
+export const UNKNOWN_EMPLOYEE = "Unknown original employee";
 export const rate = (num: number, den: number) => (den > 0 ? num / den : null);
 
 type Raw = {
@@ -42,31 +53,32 @@ const ALL_TO = "9999-12-31T00:00:00.000Z";
  * Rows whose date is unknown are never placed in a period; they are only counted in the "all data" view.
  */
 async function fetchRaw(fromISO: string, toISO: string, employee?: number, withUnknown = false): Promise<Raw> {
-  const e = employee ? [employee] : [];
+  const e = ea_(employee);
   const acts = await all(
-    `SELECT a.type,a.message_kind,a.outcome,a.actor_id,a.occurred_at,sl.flag AS stage_flag, (a.occurred_precision='unknown') AS unk
+    `SELECT a.type,a.message_kind,a.outcome,a.actor_id,a.lead_id,a.occurred_at,sl.flag AS stage_flag, (a.occurred_precision='unknown') AS unk,
+            EXISTS(SELECT 1 FROM activities b WHERE b.parent_id=a.id AND b.outcome='bounced') AS has_bounce
      FROM activities a LEFT JOIN lists sl ON sl.kind='stage' AND sl.key=a.stage_to
      WHERE a.is_demo=0 AND a.type IN ('message','reply','status')
        AND ((a.occurred_precision<>'unknown' AND a.occurred_at>=? AND a.occurred_at<?)${withUnknown ? " OR a.occurred_precision='unknown'" : ""})
-     ${employee ? "AND a.actor_id=?" : ""}`,
+     ${ef("a.actor_id", employee)}`,
     [fromISO, toISO, ...e],
   );
   // A bounce is attributed to the employee who sent the message, and dated when the bounce happened.
   const bounces = await all(
-    `SELECT 'bounce' AS type,a.message_kind,a.outcome,p.actor_id AS actor_id,a.occurred_at,NULL AS stage_flag,(a.occurred_precision='unknown') AS unk
+    `SELECT 'bounce' AS type,a.message_kind,a.outcome,p.actor_id AS actor_id,a.lead_id,a.occurred_at,NULL AS stage_flag,(a.occurred_precision='unknown') AS unk, 0 AS has_bounce
      FROM activities a JOIN activities p ON p.id=a.parent_id
      WHERE a.is_demo=0 AND a.type='outcome' AND a.outcome='bounced'
        AND ((a.occurred_precision<>'unknown' AND a.occurred_at>=? AND a.occurred_at<?)${withUnknown ? " OR a.occurred_precision='unknown'" : ""})
-     ${employee ? "AND p.actor_id=?" : ""}`,
+     ${ef("p.actor_id", employee)}`,
     [fromISO, toISO, ...e],
   );
   const leads = await all(
     `SELECT created_by AS uid, lead_date AS at FROM leads
-     WHERE is_demo=0 AND ((lead_date>=? AND lead_date<?)${withUnknown ? " OR lead_date IS NULL" : ""}) ${employee ? "AND created_by=?" : ""}`,
+     WHERE is_demo=0 AND historical_only=0 AND ((lead_date>=? AND lead_date<?)${withUnknown ? " OR lead_date IS NULL" : ""}) ${ef("created_by", employee)}`,
     [fromISO, toISO, ...e],
   );
   const tasks = await all(
-    `SELECT assignee_id AS uid, completed_at AS at FROM tasks WHERE is_demo=0 AND status='completed' AND completed_at>=? AND completed_at<? ${employee ? "AND assignee_id=?" : ""}`,
+    `SELECT assignee_id AS uid, completed_at AS at FROM tasks WHERE is_demo=0 AND status='completed' AND completed_at>=? AND completed_at<? ${ef("assignee_id", employee)}`,
     [fromISO, toISO, ...e],
   );
   return { acts: [...acts, ...bounces], leads, tasks };
@@ -76,36 +88,38 @@ async function fetchRaw(fromISO: string, toISO: string, employee?: number, withU
 type Mode = "dated" | "all" | "unknown";
 function aggregate(raw: Raw, fromISO: string, toISO: string, uid?: number, mode: Mode = "dated"): Metrics {
   const m = zero();
+  const replyLeads = new Set<number>();
   const take = (unk: boolean, t: string | null) =>
     unk || t == null ? mode !== "dated" : mode !== "unknown" && t >= fromISO && t < toISO;
   for (const a of raw.acts) {
-    if (uid && a.actor_id !== uid) continue;
+    if (uid !== undefined && (a.actor_id ?? 0) !== uid) continue;
     if (!take(!!Number(a.unk), a.occurred_at)) continue;
     if (a.type === "message" && a.outcome === "sent") {
-      if (a.message_kind === "first_email") m.first_emails++;
-      else if (a.message_kind === "follow_up") m.follow_ups++;
+      if (a.message_kind === "first_email") (m.first_emails++, (m.first_email_cohort_bounces += Number(a.has_bounce) ? 1 : 0));
+      else if (a.message_kind === "follow_up") (m.follow_ups++, (m.follow_up_cohort_bounces += Number(a.has_bounce) ? 1 : 0));
     } else if (a.type === "bounce") {
       if (a.message_kind === "first_email") m.first_email_bounces++;
       else if (a.message_kind === "follow_up") m.follow_up_bounces++;
-    } else if (a.type === "reply") m.replies++;
+    } else if (a.type === "reply") (m.replies++, replyLeads.add(a.lead_id));
     else if (a.type === "status") {
       if (a.stage_flag === "meeting") m.meetings++;
       else if (a.stage_flag === "won") m.won++;
       else if (a.stage_flag === "lost") m.lost++;
     }
   }
-  for (const l of raw.leads) if ((!uid || l.uid === uid) && take(l.at == null, l.at)) m.leads_added++;
-  if (mode !== "unknown") for (const t of raw.tasks) if (inRange(t.at, fromISO, toISO) && (!uid || t.uid === uid)) m.completed++;
+  m.reply_leads = replyLeads.size;
+  for (const l of raw.leads) if ((uid === undefined || (l.uid ?? 0) === uid) && take(l.at == null, l.at)) m.leads_added++;
+  if (mode !== "unknown") for (const t of raw.tasks) if (inRange(t.at, fromISO, toISO) && (uid === undefined || t.uid === uid)) m.completed++;
   return m;
 }
 const inRange = (t: string, f: string, to: string) => t >= f && t < to;
 
 /** How many records have no known date (so they cannot sit in any period). */
 export async function unknownDateCounts(employee?: number) {
-  const l = await one(`SELECT COUNT(*) AS n FROM leads WHERE is_demo=0 AND lead_date IS NULL${employee ? " AND created_by=?" : ""}`, employee ? [employee] : []);
+  const l = await one(`SELECT COUNT(*) AS n FROM leads WHERE is_demo=0 AND historical_only=0 AND lead_date IS NULL${ef("created_by", employee)}`, ea_(employee));
   const a = await one(
-    `SELECT COUNT(*) AS n FROM activities a WHERE a.is_demo=0 AND a.occurred_precision='unknown' AND a.type IN ('message','reply','outcome','status')${employee ? " AND a.actor_id=?" : ""}`,
-    employee ? [employee] : [],
+    `SELECT COUNT(*) AS n FROM activities a WHERE a.is_demo=0 AND a.occurred_precision='unknown' AND a.type IN ('message','reply','outcome','status')${ef("a.actor_id", employee)}`,
+    ea_(employee),
   );
   return { leads: Number(l!.n), activities: Number(a!.n) };
 }
@@ -151,12 +165,12 @@ async function getRangeReport(actor: Actor, opts: { all?: boolean; from?: string
   let from: string, to: string;
   if (all_) {
     // Earliest dated record, to size the breakdown.
-    const e = employee ? [employee] : [];
+    const e = ea_(employee);
     const row = await one(
       `SELECT MIN(d) AS d FROM (
-         SELECT MIN(lead_date) AS d FROM leads WHERE is_demo=0 AND lead_date IS NOT NULL${employee ? " AND created_by=?" : ""}
-         UNION ALL SELECT MIN(occurred_at) FROM activities WHERE is_demo=0 AND occurred_precision<>'unknown'${employee ? " AND actor_id=?" : ""}
-         UNION ALL SELECT MIN(completed_at) FROM tasks WHERE is_demo=0 AND status='completed'${employee ? " AND assignee_id=?" : ""})`,
+         SELECT MIN(lead_date) AS d FROM leads WHERE is_demo=0 AND historical_only=0 AND lead_date IS NOT NULL${ef("created_by", employee)}
+         UNION ALL SELECT MIN(occurred_at) FROM activities WHERE is_demo=0 AND occurred_precision<>'unknown'${ef("actor_id", employee)}
+         UNION ALL SELECT MIN(completed_at) FROM tasks WHERE is_demo=0 AND status='completed'${ef("assignee_id", employee)})`,
       [...e, ...e, ...e],
     );
     from = row?.d ? todayYmd(undefined, new Date(row.d as string)) : today;
@@ -180,12 +194,17 @@ async function getRangeReport(actor: Actor, opts: { all?: boolean; from?: string
   });
   const totals = aggregate(raw, fromISO, toISO, undefined, all_ ? "all" : "dated");
   const unknown = all_ ? aggregate(raw, fromISO, toISO, undefined, "unknown") : null;
-  const users = await all(`SELECT id,name,role,active FROM users WHERE ${employee ? "id=?" : "1=1"} ORDER BY active DESC, name`, employee ? [employee] : []);
+  const users = employee === 0 ? [] : await all(`SELECT id,name,role,active FROM users WHERE ${employee ? "id=?" : "1=1"} ORDER BY active DESC, name`, ea_(employee));
   const overdue = await overdueByEmployee();
   const byEmployee = users
     .map((u) => ({ user: u, m: aggregate(raw, fromISO, toISO, u.id, all_ ? "all" : "dated"), overdue: overdue.get(u.id) ?? 0 }))
     .filter((r) => r.user.active || Object.values(r.m).some(Boolean) || r.overdue);
-  const totalOverdue = employee ? overdue.get(employee) ?? 0 : [...overdue.values()].reduce((a, b) => a + b, 0);
+  // Records whose original employee is unknown are in the totals but credited to nobody.
+  if (employee === undefined || employee === 0) {
+    const um = aggregate(raw, fromISO, toISO, 0, all_ ? "all" : "dated");
+    if (Object.values(um).some(Boolean)) byEmployee.push({ user: { id: 0, name: UNKNOWN_EMPLOYEE, role: "unknown", active: 1 }, m: um, overdue: 0 });
+  }
+  const totalOverdue = employee === 0 ? 0 : employee ? overdue.get(employee) ?? 0 : [...overdue.values()].reduce((a, b) => a + b, 0);
   return {
     mode: (all_ ? "all" : "range") as "all" | "range", from, to, breakdown: g, tz: TZ(), employee: employee ?? null,
     buckets, totals, unknown, byEmployee, totalOverdue, unknownCounts: await unknownDateCounts(employee),
@@ -212,13 +231,17 @@ export async function getReport(actor: Actor, opts: { granularity: Granularity; 
   });
   const cur = buckets[buckets.length - 1];
 
-  const users = await all(`SELECT id,name,role,active FROM users WHERE ${employee ? "id=?" : "1=1"} ORDER BY active DESC, name`, employee ? [employee] : []);
+  const users = employee === 0 ? [] : await all(`SELECT id,name,role,active FROM users WHERE ${employee ? "id=?" : "1=1"} ORDER BY active DESC, name`, ea_(employee));
   const overdue = await overdueByEmployee();
   const byEmployee = users
     .map((u) => ({ user: u, m: aggregate(raw, cur.from, cur.to, u.id), overdue: overdue.get(u.id) ?? 0 }))
     .filter((r) => r.user.active || Object.values(r.m).some(Boolean) || r.overdue);
+  if (employee === undefined || employee === 0) {
+    const um = aggregate(raw, cur.from, cur.to, 0);
+    if (Object.values(um).some(Boolean)) byEmployee.push({ user: { id: 0, name: UNKNOWN_EMPLOYEE, role: "unknown", active: 1 }, m: um, overdue: 0 });
+  }
   const totals = cur.m;
-  const totalOverdue = employee ? overdue.get(employee) ?? 0 : [...overdue.values()].reduce((a, b) => a + b, 0);
+  const totalOverdue = employee === 0 ? 0 : employee ? overdue.get(employee) ?? 0 : [...overdue.values()].reduce((a, b) => a + b, 0);
   return {
     granularity: g, at, tz: TZ(), employee: employee ?? null, buckets, current: cur,
     prevStart: prevStart(starts[0], g), nextStart: endYmd, byEmployee, totals, totalOverdue, unknownCounts: await unknownDateCounts(employee),
@@ -236,7 +259,7 @@ async function overdueByEmployee(): Promise<Map<number, number>> {
 
 /* ---------- dashboard ---------- */
 export async function getDashboard(actor: Actor, opts: { from?: string; to?: string; employee?: number | null; all?: boolean }) {
-  const employee = scopeEmployee(actor, opts.employee);
+  const employee = scopeEmployee(actor, opts.employee) || undefined; // unknown-employee filter exists only in /reports
   const today = todayYmd();
   const allTime = !!opts.all;
   const from = isYmd(opts.from) ? opts.from : today;
@@ -258,8 +281,8 @@ export async function getDashboard(actor: Actor, opts: { from?: string; to?: str
   const c: Record<string, number> = Object.fromEntries(counts.map((r) => [r.type, Number(r.n)]));
 
   const replies = await all(
-    `SELECT a.id,a.lead_id,a.occurred_at,a.title,a.body,l.company,u.name AS actor_name
-     FROM activities a JOIN leads l ON l.id=a.lead_id JOIN users u ON u.id=a.actor_id
+    `SELECT a.id,a.lead_id,a.occurred_at,a.title,a.body,l.company,COALESCE(u.name,'Unknown original employee') AS actor_name
+     FROM activities a JOIN leads l ON l.id=a.lead_id LEFT JOIN users u ON u.id=a.actor_id
      WHERE a.is_demo=0 AND a.type='reply' AND a.occurred_at>=? AND a.occurred_at<?${known}${ea} ORDER BY a.occurred_at DESC LIMIT 8`,
     [fromISO, toISO, ...ea1],
   );
@@ -267,7 +290,7 @@ export async function getDashboard(actor: Actor, opts: { from?: string; to?: str
   const sc = leadScope(actor);
   const stageRows = await all(
     `SELECT s.key,s.label,s.flag,s.active,
-       (SELECT COUNT(*) FROM leads l WHERE l.stage=s.key AND l.is_demo=0 AND ${sc.sql}${employee ? " AND l.owner_id=?" : ""}) AS n
+       (SELECT COUNT(*) FROM leads l WHERE l.stage=s.key AND l.is_demo=0 AND l.historical_only=0 AND ${sc.sql}${employee ? " AND l.owner_id=?" : ""}) AS n
      FROM lists s WHERE s.kind='stage' ORDER BY s.position,s.id`,
     [...sc.args, ...(employee ? [employee] : [])],
   );
@@ -299,8 +322,8 @@ export async function getDashboard(actor: Actor, opts: { from?: string; to?: str
   );
 
   const feed = await all(
-    `SELECT a.id,a.lead_id,a.type,a.message_kind,a.outcome,a.title,a.occurred_at,a.stage_to,l.company,u.name AS actor_name
-     FROM activities a JOIN leads l ON l.id=a.lead_id JOIN users u ON u.id=a.actor_id
+    `SELECT a.id,a.lead_id,a.type,a.message_kind,a.outcome,a.title,a.occurred_at,a.stage_to,l.company,COALESCE(u.name,'Unknown original employee') AS actor_name
+     FROM activities a JOIN leads l ON l.id=a.lead_id LEFT JOIN users u ON u.id=a.actor_id
      WHERE a.is_demo=0 AND a.occurred_at>=? AND a.occurred_at<?${known}${ea} ORDER BY a.occurred_at DESC LIMIT 12`,
     [fromISO, toISO, ...ea1],
   );
@@ -311,4 +334,40 @@ export async function getDashboard(actor: Actor, opts: { from?: string; to?: str
     firstBounceRate: rate(m.first_email_bounces, m.first_emails),
     followBounceRate: rate(m.follow_up_bounces, m.follow_ups),
   };
+}
+
+/* ---------- read API ---------- */
+export const REPORT_RULES = {
+  timezone: "Dates and day boundaries use APP_TIMEZONE (see `timezone`). A day runs from 00:00 to 24:00 local time; `to` is inclusive. A date-only event is stored as local midnight of that day.",
+  views: "all=1 (since the beginning, plus a separate unknown-date row) · from=YYYY-MM-DD&to=YYYY-MM-DD (custom) · period=day|week|month&at=YYYY-MM-DD (the current bucket plus history).",
+  event_dates: "Counted on the date it HAPPENED: leads on lead_date, sends/replies/stage changes on occurred_at, bounces on the bounce's own date, tasks on completed_at. Never on created_at (entry) or import time.",
+  unknown_dates: "Records with an unknown date are in `unknown_counts` and, under all=1, in `totals` and the `unknown` row. They are never placed in a dated period or custom range.",
+  employees: "Credited to the ORIGINAL employee (actor / created_by), never to whoever imported the record. Records whose original employee is unknown are in `totals` and listed as 'Unknown original employee' (id 0); filter with employee=unknown. Bounces are credited to the employee of the message that bounced.",
+  sends: "first_emails = message records with kind first_email; follow_ups = kind follow_up; kind other is not counted in either. Counted by kind, whatever the channel.",
+  replies: "replies = number of inbound reply records (not conversations). reply_leads = distinct leads with at least one reply in the period.",
+  bounces: "first_email_bounces / follow_up_bounces are bounce EVENTS dated when the bounce happened (a bounce takes the kind of its message). Event-basis rate = bounces in the period ÷ sends in the period, so a late bounce lands in the later period and the rate can mix cohorts. *_cohort_bounces = messages SENT in the period that have a bounce (any date): the send-cohort view; cohort rate = cohort_bounces ÷ sends.",
+  excluded: "Test data (is_test) and historical-only (suppressed) entities as 'leads added' are excluded; replies/bounces recorded on historical-only entities still count on their dates.",
+};
+
+export async function reportApi(actor: Actor, p: { all?: boolean; from?: string; to?: string; period?: Granularity; at?: string; employee?: string | null }) {
+  let emp: number | null = null;
+  if (p.employee) {
+    if (/^unknown$/i.test(p.employee)) emp = 0;
+    else if (/^\d+$/.test(p.employee)) emp = Number(p.employee);
+    else emp = ((await one("SELECT id FROM users WHERE lower(username)=lower(?)", [p.employee])) as { id: number } | null)?.id ?? -1;
+    if (emp === -1) throw new HttpError(400, `employee: no user "${p.employee}". Use an id, a username, or "unknown".`);
+  }
+  const rates = (m: Metrics) => ({
+    first_email_bounce_rate: rate(m.first_email_bounces, m.first_emails),
+    follow_up_bounce_rate: rate(m.follow_up_bounces, m.follow_ups),
+    first_email_cohort_bounce_rate: rate(m.first_email_cohort_bounces, m.first_emails),
+    follow_up_cohort_bounce_rate: rate(m.follow_up_cohort_bounces, m.follow_ups),
+  });
+  if (p.all || p.from) {
+    const r = await getRangeReport(actor, { all: p.all, from: p.from, to: p.to, employee: emp });
+    return { view: r.mode, from: p.all ? null : r.from, to: r.to, timezone: r.tz, breakdown: r.breakdown, employee: r.employee, totals: r.totals, rates: rates(r.totals), unknown: r.unknown, unknown_counts: r.unknownCounts, by_employee: r.byEmployee.map((e) => ({ employee_id: e.user.id, name: e.user.name, ...e.m })), buckets: r.buckets.map((b) => ({ label: b.label, from: b.from, to: b.to, ...b.m })), rules: REPORT_RULES };
+  }
+  const g = p.period && ["day", "week", "month"].includes(p.period) ? p.period : "day";
+  const r = await getReport(actor, { granularity: g, at: p.at, employee: emp });
+  return { view: "period", period: g, at: r.at, timezone: r.tz, employee: r.employee, totals: r.totals, rates: rates(r.totals), unknown_counts: r.unknownCounts, by_employee: r.byEmployee.map((e) => ({ employee_id: e.user.id, name: e.user.name, ...e.m })), buckets: r.buckets.map((b) => ({ label: b.label, from: b.from, to: b.to, ...b.m })), rules: REPORT_RULES };
 }

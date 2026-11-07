@@ -42,6 +42,8 @@ function toActor(u: Row, via: Actor["via"]): Actor {
   try {
     perms = (JSON.parse(u.permissions) as string[]).filter((p): p is Permission => (ALL_PERMISSIONS as string[]).includes(p));
   } catch {}
+  // Time-limited migration access: after the Owner's chosen moment the permission silently stops applying.
+  if (u.history_import_until && String(u.history_import_until) <= now()) perms = perms.filter((p) => p !== "history.import");
   return {
     id: u.id, username: u.username, name: u.name, role: u.role,
     perms: new Set(perms), via, mustChangePassword: !!u.must_change_password,

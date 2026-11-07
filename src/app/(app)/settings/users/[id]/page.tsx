@@ -3,7 +3,7 @@ import { notFound, redirect } from "next/navigation";
 import { requireUser, isManager } from "@/lib/auth";
 import { getUser, listKeys, canManageKeysFor, CHIEF_LOCKED } from "@/lib/service/users";
 import {
-  updateUserAction, setPermsAction, applyPresetAction, resetPasswordAction, createKeyAction, keyToggleAction, keyRevokeAction,
+  updateUserAction, setPermsAction, applyPresetAction, resetPasswordAction, createKeyAction, keyToggleAction, keyRevokeAction, setMigrationAccessAction,
 } from "@/app/actions";
 import { SecretAction } from "@/components/SecretAction";
 import { Badge, Card, Field, Flash, PageHeader } from "@/components/ui";
@@ -42,6 +42,22 @@ export default async function UserPage({ params, searchParams }: { params: Promi
             <Field label="Role"><select name="role" defaultValue={u.role} className="input" disabled={isOwnerAcct}>{isOwnerAcct ? <option value="owner">Owner</option> : <><option value="employee">Employee</option><option value="chief">Chief</option></>}</select></Field>
             <Field label="Status"><select name="active" defaultValue={u.active ? "1" : "0"} className="input" disabled={isOwnerAcct}><option value="1">Active</option><option value="0">Disabled (cannot sign in; API keys stop working)</option></select></Field>
             <div className="flex items-end"><button className="btn btn-primary">Save</button></div>
+          </form>
+        </Card>
+      )}
+
+      {owner && !isOwnerAcct && (
+        <Card title="Migration access (historical import)" right={u.history_import_until && u.history_import_until > new Date().toISOString() ? <Badge tone="green">Active until {fmtDateTime(u.history_import_until)}</Badge> : <Badge tone="gray">Not granted</Badge>}>
+          <p className="mb-3 text-sm text-slate-600">
+            Lets this person (with their own login or API key) use only the historical-import, lead-date-correction and activity-reconcile endpoints — dry run first. It does <b>not</b> give permission management, Owner functions or any way to send messages.
+            Access switches itself off at the end of the period; you can revoke it earlier.
+          </p>
+          <form action={setMigrationAccessAction} className="flex flex-wrap items-center gap-2">
+            <input type="hidden" name="_back" value={back} /><input type="hidden" name="id" value={u.id} />
+            <button name="hours" value="24" className="btn">Grant for 24 hours</button>
+            <button name="hours" value="168" className="btn">Grant for 7 days</button>
+            <button name="hours" value="720" className="btn">Grant for 30 days</button>
+            <button name="hours" value="revoke" className="btn text-red-700">Revoke now</button>
           </form>
         </Card>
       )}

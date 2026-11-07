@@ -64,11 +64,11 @@ export default async function LeadPage({ params, searchParams }: { params: Promi
       <Card>
         <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
           <div>
-            <h1 className="text-xl font-semibold text-slate-900">{lead.company} {lead.is_demo ? <DemoBadge /> : null}</h1>
+            <h1 className="text-xl font-semibold text-slate-900">{lead.company} {lead.is_demo ? <DemoBadge /> : null}{lead.historical_only ? <span className="ml-2 rounded bg-slate-200 px-2 py-0.5 align-middle text-xs font-medium text-slate-700" title="Kept only for past replies, bounces and opt-outs. Not an outreach prospect.">HISTORICAL ONLY</span> : null}</h1>
             <div className="mt-1 flex flex-wrap items-center gap-2 text-sm text-slate-500">
               <StageBadge stage={lead.stage} label={stageLab[lead.stage] ?? lead.stage} flag={flag[lead.stage]} />
               <span>Owner: <b className="text-slate-700">{lead.owner_name ?? "Unassigned"}</b></span>
-              <span>· Lead date: <b className={lead.lead_date ? "text-slate-700" : "text-amber-700"}>{fmtEvent(lead.lead_date, lead.lead_date_precision)}</b>{lead.created_by_name ? ` · found by ${lead.created_by_name}` : ""}</span>
+              <span>· Lead date: <b className={lead.lead_date ? "text-slate-700" : "text-amber-700"}>{fmtEvent(lead.lead_date, lead.lead_date_precision)}</b>{lead.created_by_name ? ` · found by ${lead.created_by_name}` : " · found by unknown employee"}</span>
               <span>· Entered in CRM {fmtDate(lead.created_at)}{lead.imported_by_name ? ` by ${lead.imported_by_name} (import)` : ""}</span>
             </div>
           </div>
@@ -229,7 +229,7 @@ export default async function LeadPage({ params, searchParams }: { params: Promi
                   ? <details className="mt-1 text-sm"><summary className="line-clamp-2 cursor-pointer whitespace-pre-wrap text-slate-700">{h.body}</summary><p className="mt-1 whitespace-pre-wrap text-slate-700">{h.body}</p></details>
                   : <p className="mt-1 whitespace-pre-wrap text-sm text-slate-700">{h.body}</p>)}
                 <div className="mt-1 flex flex-wrap gap-x-3 text-xs text-slate-500">
-                  <span>{h.actor_name} · <span className={h.occurred_precision === "unknown" ? "text-amber-700" : ""}>{fmtEvent(h.occurred_at, h.occurred_precision)}</span></span>
+                  <span className={h.actor_unknown ? "italic text-amber-700" : ""}>{h.actor_name} · <span className={h.occurred_precision === "unknown" ? "text-amber-700" : ""}>{fmtEvent(h.occurred_at, h.occurred_precision)}</span></span>
                   {h.imported_by_name && <span title={`Registered ${fmtDateTime(h.created_at)}`}>Imported by {h.imported_by_name} on {fmtDate(h.created_at)}</span>}
                   {h.contact_name && <span>Contact: {h.contact_name}</span>}
                   {h.channel && <span>Channel: {lab("channel")[h.channel] ?? h.channel}</span>}

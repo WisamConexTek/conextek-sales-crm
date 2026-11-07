@@ -24,7 +24,7 @@ export default async function Approvals({ searchParams }: { searchParams: SP }) 
   const nPending = all_.filter((a) => a.status === "pending").length;
   const leadIds = [...new Set(rows.map((r) => r.lead_id).filter(Boolean))] as number[];
   const ctx: Record<number, Row[]> = {};
-  for (const id of leadIds) ctx[id] = await all("SELECT a.type,a.title,a.body,a.occurred_at,a.message_kind,u.name AS actor_name FROM activities a JOIN users u ON u.id=a.actor_id WHERE a.lead_id=? AND a.type<>'approval' ORDER BY a.occurred_at DESC,a.id DESC LIMIT 4", [id]);
+  for (const id of leadIds) ctx[id] = await all("SELECT a.type,a.title,a.body,a.occurred_at,a.message_kind,COALESCE(u.name,'Unknown original employee') AS actor_name FROM activities a LEFT JOIN users u ON u.id=a.actor_id WHERE a.lead_id=? AND a.type<>'approval' ORDER BY a.occurred_at DESC,a.id DESC LIMIT 4", [id]);
   const decisionLabel: Record<string, string> = { approved: "Approved", rejected: "Rejected", changes_requested: "Changes requested" };
   const groups = oneId ? [{ title: `Approval #${oneId}`, rows }] : tab === "pending" ? (["chief", "wisam"] as const).map((r) => ({ title: `Waiting on ${who(r)}`, rows: rows.filter((a) => a.requires === r) })) : [{ title: "Decided", rows }];
 

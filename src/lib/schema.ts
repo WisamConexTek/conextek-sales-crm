@@ -234,4 +234,48 @@ CREATE TABLE import_batches (
   created_at TEXT NOT NULL
 );
 `,
+  `
+-- Migration 4: unknown original actor, historical-only (suppressed) entities, time-limited migration access.
+-- activities.actor_id becomes nullable: NULL = the original employee is unknown (never replaced by the importer).
+CREATE TABLE activities_new (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+  contact_id INTEGER REFERENCES contacts(id),
+  task_id INTEGER REFERENCES tasks(id),
+  approval_id INTEGER,
+  parent_id INTEGER REFERENCES activities(id),
+  type TEXT NOT NULL,
+  message_kind TEXT CHECK (message_kind IN ('first_email','follow_up','other')),
+  channel TEXT,
+  outcome TEXT CHECK (outcome IN ('sent','reply_received','bounced','no_response_yet','opted_out')),
+  title TEXT,
+  body TEXT,
+  ref TEXT,
+  url TEXT,
+  stage_from TEXT,
+  stage_to TEXT,
+  actor_id INTEGER REFERENCES users(id),
+  occurred_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  is_demo INTEGER NOT NULL DEFAULT 0,
+  occurred_precision TEXT NOT NULL DEFAULT 'time',
+  external_id TEXT,
+  imported_by INTEGER REFERENCES users(id),
+  import_batch_id INTEGER
+);
+INSERT INTO activities_new (id,lead_id,contact_id,task_id,approval_id,parent_id,type,message_kind,channel,outcome,title,body,ref,url,stage_from,stage_to,actor_id,occurred_at,created_at,is_demo,occurred_precision,external_id,imported_by,import_batch_id)
+  SELECT id,lead_id,contact_id,task_id,approval_id,parent_id,type,message_kind,channel,outcome,title,body,ref,url,stage_from,stage_to,actor_id,occurred_at,created_at,is_demo,occurred_precision,external_id,imported_by,import_batch_id FROM activities;
+DROP TABLE activities;
+ALTER TABLE activities_new RENAME TO activities;
+CREATE INDEX idx_act_lead ON activities(lead_id, occurred_at);
+CREATE INDEX idx_act_type ON activities(type, occurred_at);
+CREATE INDEX idx_act_parent ON activities(parent_id);
+CREATE UNIQUE INDEX idx_act_external ON activities(external_id) WHERE external_id IS NOT NULL;
+
+-- historical_only: a company/contact kept only so its past replies, bounces and opt-outs are on record.
+-- Never an outreach prospect: hidden from default lead lists and stage counts, no tasks, not a "lead added".
+ALTER TABLE leads ADD COLUMN historical_only INTEGER NOT NULL DEFAULT 0;
+-- Owner-granted, time-limited migration access (history.import stops working after this moment).
+ALTER TABLE users ADD COLUMN history_import_until TEXT;
+`,
 ];

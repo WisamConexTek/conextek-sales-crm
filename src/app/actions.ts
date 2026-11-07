@@ -178,6 +178,14 @@ export async function createKeyAction(_p: SecretState, fd: FD): Promise<SecretSt
   const a = await requireUser();
   return secret(async () => ({ secret: await Users.createKey(a, n(fd, "user_id"), s(fd, "label")), message: "API key created." }));
 }
+export async function setMigrationAccessAction(fd: FD) {
+  const a = await requireUser();
+  const h = s(fd, "hours");
+  await guard(fd, async () => {
+    const until = await Users.setMigrationAccess(a, n(fd, "id"), h === "revoke" ? null : Number(h));
+    return until ? "Migration access granted until " + new Date(until).toLocaleString("en-GB") + "." : "Migration access revoked.";
+  });
+}
 export async function updateUserAction(fd: FD) {
   const a = await requireUser();
   await guard(fd, async () => {

@@ -1,5 +1,5 @@
 import type { InValue, Transaction } from "@libsql/client";
-import { all, one, run, now, ready, todayYmd } from "../db";
+import { all, one, run, now, ready, todayYmd, localMidnight, addDays } from "../db";
 import { HttpError, requirePerm, type Actor } from "../auth";
 import { audit, domainOf, parseEventDate, eventDateText, type EventDate } from "./common";
 
@@ -72,16 +72,23 @@ export async function importHistory(actor: Actor, body: Rec) {
     if (!hit) throw new Error(`${field}: "${s}" is not an active ${kind}. Accepted: ${lists.get(kind)!.keys.join(", ")}.`);
     return hit;
   };
-  const batchEmployee = body.employee;
-  const employeeOf = (r: Rec, fallback?: number | null): number => {
-    const raw = r.employee ?? batchEmployee;
-    if (raw == null || raw === "") {
-      if (fallback) return fallback;
-      throw new Error("employee: who did the original work (username) is required, per record or once at the top level.");
-    }
+  /**
+   * Original employee = who did the work. null means UNKNOWN and is stored as NULL — it is never replaced by the importer,
+   * the lead owner or anyone else. Per record `employee` wins; otherwise the top-level `employee`; otherwise the fallback
+   * (bounces/replies inherit the message they belong to, whatever that is); otherwise an error.
+   */
+  const has = (o: Rec, k: string) => Object.prototype.hasOwnProperty.call(o, k);
+  const empFrom = (raw: unknown): number | null => {
+    if (raw === null || raw === "" || (typeof raw === "string" && /^unknown$/i.test(raw.trim()))) return null;
     const id = findUser(raw);
-    if (!id) throw new Error(`employee: no user "${String(raw)}". Use the username shown in Settings → People.`);
+    if (!id) throw new Error(`employee: no user "${String(raw)}". Use a username from Settings → People, or null if the original employee is unknown.`);
     return id;
+  };
+  const employeeOf = (r: Rec, fallback?: { v: number | null }): number | null => {
+    if (has(r, "employee")) return empFrom(r.employee);
+    if (has(body, "employee")) return empFrom(body.employee);
+    if (fallback) return fallback.v;
+    throw new Error('employee: required — a username, or null if the original employee is unknown (per record or at the top level).');
   };
   const dateOf = (v: unknown, field: string, mustKnow: boolean): EventDate => {
     const e = parseEventDate(v);
@@ -132,14 +139,20 @@ export async function importHistory(actor: Actor, body: Rec) {
   let batchId: number | null = null;
   const ensureBatch = async () => (batchId ??= await x("INSERT INTO import_batches (kind,label,imported_by,created_at) VALUES ('history',?,?,?)", [label, actor.id, at]));
 
-  const actByExt = new Map<string, { id: number; lead_id: number; contact_id: number | null; message_kind: string | null; actor_id: number; occurred_at: string; precision: string }>();
+  type Act = { id: number; type: string; lead_id: number; contact_id: number | null; message_kind: string | null; actor_id: number | null; occurred_at: string; precision: string };
+  const toAct = (r: Rec): Act => ({ id: Number(r.id), type: String(r.type), lead_id: Number(r.lead_id), contact_id: r.contact_id == null ? null : Number(r.contact_id), message_kind: r.message_kind as string | null, actor_id: r.actor_id == null ? null : Number(r.actor_id), occurred_at: String(r.occurred_at), precision: String(r.precision) });
+  const actByExt = new Map<string, Act>();
   const loadAct = async (ext: string) => {
     if (actByExt.has(ext)) return actByExt.get(ext)!;
-    const [r] = await q("SELECT id,lead_id,contact_id,message_kind,actor_id,occurred_at,occurred_precision AS precision FROM activities WHERE external_id=?", [ext]);
+    const [r] = await q("SELECT id,type,lead_id,contact_id,message_kind,actor_id,occurred_at,occurred_precision AS precision FROM activities WHERE external_id=?", [ext]);
     if (!r) return null;
-    const v = { id: Number(r.id), lead_id: Number(r.lead_id), contact_id: r.contact_id == null ? null : Number(r.contact_id), message_kind: r.message_kind as string | null, actor_id: Number(r.actor_id), occurred_at: String(r.occurred_at), precision: String(r.precision) };
+    const v = toAct(r);
     actByExt.set(ext, v);
     return v;
+  };
+  const loadActById = async (id: number) => {
+    const [r] = await q("SELECT id,type,lead_id,contact_id,message_kind,actor_id,occurred_at,occurred_precision AS precision FROM activities WHERE id=?", [id]);
+    return r ? toAct(r) : null;
   };
 
   /** Find a lead's contact by email (optionally creating one). Never lowers a deliverability state. */
@@ -235,11 +248,11 @@ export async function importHistory(actor: Actor, body: Rec) {
         const bid = await ensureBatch();
         const id = await x(
           `INSERT INTO leads (company,website,domain,industry,country,market,segment,language,source,source_url,owner_id,stage,service,notes,is_demo,created_by,created_at,updated_at,
-                              lead_date,lead_date_precision,external_id,imported_by,import_batch_id)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+                              lead_date,lead_date_precision,external_id,imported_by,import_batch_id,historical_only)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
           [company, website, dom, fields.industry, str(r.country, 80), fields.market, fields.segment, fields.language, fields.source, str(r.source_url, 500),
             null, stage, fields.service, str(r.notes, 8000), makeTest || r.is_test === true ? 1 : 0, employee, at, at,
-            ld.at, ld.precision === "unknown" ? null : ld.precision, ext, actor.id, bid],
+            ld.at, ld.precision === "unknown" ? null : ld.precision, ext, actor.id, bid, r.historical_only === true ? 1 : 0],
         );
         for (const [k, cc] of cs.entries()) {
           await x(
@@ -259,7 +272,7 @@ export async function importHistory(actor: Actor, body: Rec) {
     /* ---------------- shared activity insert ---------------- */
     const insertActivity = async (a: {
       lead: L; type: string; kind?: string | null; outcome?: string | null; channel?: string | null; title?: string | null; body?: string | null; ref?: string | null; url?: string | null;
-      contactId?: number | null; parentId?: number | null; employee: number; when: EventDate; ext: string | null;
+      contactId?: number | null; parentId?: number | null; employee: number | null; when: EventDate; ext: string | null;
     }) => {
       const bid = await ensureBatch();
       const occurred = a.when.at ?? at;
@@ -272,17 +285,63 @@ export async function importHistory(actor: Actor, body: Rec) {
       if (a.when.at) await x("UPDATE leads SET last_activity_at = CASE WHEN last_activity_at IS NULL OR last_activity_at < ? THEN ? ELSE last_activity_at END WHERE id=?", [occurred, occurred, a.lead.id]);
       return id;
     };
-    const sameAsExisting = async (ext: string | null, key: { lead: number; type: string; channel: string | null; kind: string | null; at: string; employee: number; contact: number | null; title: string | null }) => {
+    /**
+     * Duplicate detection for activities, in this order (never guessing):
+     *  1. same external_id                       -> "exists"
+     *  2. identical natural key (same lead, type, channel, kind, contact, subject and the exact same stored time/day;
+     *     the actor is deliberately NOT part of it, so an unknown/different original employee cannot create a duplicate) -> "exists"
+     *  3. a record entered earlier WITHOUT an external_id (e.g. through the regular API) on the same local day that could be
+     *     the same event (date-only vs exact time, missing channel/subject) -> ERROR naming the candidate ids. Resolve it with
+     *     POST /import/reconcile-activities (attach the external_id to that activity), or list the ids in
+     *     "not_activity_ids" on the record to state explicitly that they are different events.
+     */
+    const parseIds = (v: unknown, field: string): number[] => {
+      if (v == null) return [];
+      if (!Array.isArray(v) || v.some((n) => !Number.isInteger(Number(n)))) throw new Error(`${field}: must be an array of activity ids.`);
+      return v.map(Number);
+    };
+    const sameAsExisting = async (
+      ext: string | null,
+      key: { lead: number; type: string; channel: string | null; kind: string | null; when: EventDate; contact: number | null; title: string | null },
+      notIds: number[] = [],
+    ): Promise<number | null> => {
       if (ext) {
         const e = await loadAct(ext);
         if (e) return e.id;
       }
+      if (!key.when.at) return null; // unknown date: only external_id can identify it (enforced earlier)
       const [r] = await q(
         `SELECT id FROM activities WHERE lead_id=? AND type=? AND COALESCE(channel,'')=COALESCE(?,'') AND COALESCE(message_kind,'')=COALESCE(?,'')
-           AND occurred_at=? AND occurred_precision<>'unknown' AND actor_id=? AND COALESCE(contact_id,0)=COALESCE(?,0) AND COALESCE(title,'')=COALESCE(?,'') LIMIT 1`,
-        [key.lead, key.type, key.channel, key.kind, key.at, key.employee, key.contact, key.title],
+           AND occurred_at=? AND occurred_precision=? AND COALESCE(contact_id,0)=COALESCE(?,0) AND COALESCE(title,'')=COALESCE(?,'') LIMIT 1`,
+        [key.lead, key.type, key.channel, key.kind, key.when.at, key.when.precision, key.contact, key.title],
       );
-      return r ? Number(r.id) : null;
+      if (r) return Number(r.id);
+      const day = todayYmd(undefined, new Date(key.when.at));
+      const near = (await q(
+        `SELECT id,type,occurred_at,occurred_precision,channel,message_kind,title,contact_id FROM activities
+          WHERE lead_id=? AND type=? AND external_id IS NULL AND occurred_precision<>'unknown' AND occurred_at>=? AND occurred_at<?`,
+        [key.lead, key.type, localMidnight(day).toISOString(), localMidnight(addDays(day, 1)).toISOString()],
+      )).filter(
+        (c) =>
+          !notIds.includes(Number(c.id)) &&
+          (key.kind == null || c.message_kind == null || c.message_kind === key.kind) &&
+          (key.channel == null || c.channel == null || c.channel === key.channel) &&
+          (key.contact == null || c.contact_id == null || Number(c.contact_id) === key.contact) &&
+          (key.title == null || c.title == null || c.title === key.title),
+      );
+      if (near.length)
+        throw new Error(
+          `Possible match with existing ${key.type} ${near.map((c) => `#${c.id} (${c.occurred_precision === "day" ? String(c.occurred_at).slice(0, 10) : c.occurred_at})`).join(", ")} recorded without an external_id. ` +
+            `If it is the same event, attach this external_id to it with POST /api/v1/import/reconcile-activities; if it is a different event, add its id to "not_activity_ids" on this record. Nothing was guessed.`,
+        );
+      return null;
+    };
+    const resolveMessage = async (extId: unknown, idVal: unknown, field: string): Promise<Act | null> => {
+      const e = str(extId, 120);
+      const a = e ? await loadAct(e) : idVal != null ? await loadActById(Number(idVal)) : null;
+      if (!a) return null;
+      if (a.type !== "message") throw new Error(`${field}: that record is a ${a.type}, not a sent message.`);
+      return a;
     };
 
     /* ---------------- sent messages ---------------- */
@@ -293,18 +352,18 @@ export async function importHistory(actor: Actor, body: Rec) {
         const channel = listKey("channel", r.channel, "channel");
         if (!channel) throw new Error(`channel: required (${lists.get("channel")!.keys.join(", ")}).`);
         const kind = str(r.kind) ?? str(r.message_kind);
-        if (!kind || !MESSAGE_KINDS.includes(kind)) throw new Error(`kind: ${MESSAGE_KINDS.join(", ")} (a first email, a follow-up, or anything else).`);
+        if (!kind || !MESSAGE_KINDS.includes(kind)) throw new Error(`kind: ${MESSAGE_KINDS.join(", ")} (first message = first_email, later = follow_up, anything else, e.g. a LinkedIn opener you do not want in email metrics, = other).`);
         const when = dateOf(r.sent_at, "sent_at", false);
         if (!when.at && !ext) throw new Error("external_id: required when sent_at is unknown (it is the only way to avoid duplicates).");
         const subject = str(r.subject, 200), text = str(r.body, 20000), ref = str(r.ref, 300), url = str(r.url, 600);
         if (!subject && !text && !ref && !url) throw new Error("Include the subject/body or a reference/link.");
         const employee = employeeOf(r);
         const contact = await contactFor(lead.id, r.contact_email, { name: str(r.contact_name, 120) });
-        const dupId = await sameAsExisting(ext, { lead: lead.id, type: "message", channel, kind, at: when.at ?? "", employee, contact: contact?.id ?? null, title: subject });
+        const dupId = await sameAsExisting(ext, { lead: lead.id, type: "message", channel, kind, when, contact: contact?.id ?? null, title: subject }, parseIds(r.not_activity_ids, "not_activity_ids"));
         if (dupId) { out.messages.push({ index: i, external_id: ext, status: "exists", id: dupId, lead_id: lead.id, message: "Already recorded." }); continue; }
         if (contact && contact.status !== "unknown" && contact.status !== "ok") warnings.push(`messages[${i}]: contact is marked ${contact.status}. Recorded as history only.`);
         const id = await insertActivity({ lead, type: "message", kind, outcome: "sent", channel, title: subject, body: text, ref, url, contactId: contact?.id, employee, when, ext });
-        if (ext) actByExt.set(ext, { id, lead_id: lead.id, contact_id: contact?.id ?? null, message_kind: kind, actor_id: employee, occurred_at: when.at ?? at, precision: when.precision });
+        if (ext) actByExt.set(ext, { id, type: "message", lead_id: lead.id, contact_id: contact?.id ?? null, message_kind: kind, actor_id: employee, occurred_at: when.at ?? at, precision: when.precision });
         out.messages.push({ index: i, external_id: ext, status: "created", id, lead_id: lead.id });
       } catch (e) {
         fail("messages", i, ext, e);
@@ -316,21 +375,23 @@ export async function importHistory(actor: Actor, body: Rec) {
       const ext = str(r.external_id, 120);
       try {
         const replyTo = str(r.in_reply_to, 120);
-        const parent = replyTo ? await loadAct(replyTo) : null;
-        if (replyTo && !parent) throw new Error(`in_reply_to: no sent message with external_id "${replyTo}".`);
+        const parent = await resolveMessage(r.in_reply_to, r.in_reply_to_id, "in_reply_to");
+        if ((replyTo || r.in_reply_to_id != null) && !parent) throw new Error(`in_reply_to: no sent message ${replyTo ? `with external_id "${replyTo}"` : `with id ${r.in_reply_to_id}`} (it may be in a batch that has not been committed yet).`);
         const lead = r.lead != null ? resolveLead(r.lead) : parent ? byId.get(parent.lead_id)! : resolveLead(undefined);
         if (parent && parent.lead_id !== lead.id) throw new Error("in_reply_to: that message belongs to a different lead.");
         const channel = listKey("channel", r.channel, "channel") ?? null;
         if (!channel) throw new Error(`channel: required (${lists.get("channel")!.keys.join(", ")}).`);
         const when = dateOf(r.received_at, "received_at", false);
         if (!when.at && !ext) throw new Error("external_id: required when received_at is unknown.");
+        if (when.at && parent && parent.precision !== "unknown" && when.at < parent.occurred_at && eventDayBefore(when, parent)) throw new Error("received_at: a reply cannot be earlier than the message it answers.");
         const subject = str(r.subject, 200), text = str(r.body, 20000), ref = str(r.ref, 300), url = str(r.url, 600);
         if (!text && !ref && !url) throw new Error("Paste the reply text or give a reference/link.");
-        const employee = employeeOf(r, parent?.actor_id);
+        const employee = employeeOf(r, parent ? { v: parent.actor_id } : undefined);
         const contact = (await contactFor(lead.id, r.contact_email, { name: str(r.contact_name, 120) })) ?? (parent?.contact_id ? { id: parent.contact_id, status: "" } : null);
-        const dupId = await sameAsExisting(ext, { lead: lead.id, type: "reply", channel, kind: null, at: when.at ?? "", employee, contact: contact?.id ?? null, title: subject });
+        const dupId = await sameAsExisting(ext, { lead: lead.id, type: "reply", channel, kind: null, when, contact: contact?.id ?? null, title: subject }, parseIds(r.not_activity_ids, "not_activity_ids"));
         if (dupId) { out.replies.push({ index: i, external_id: ext, status: "exists", id: dupId, lead_id: lead.id, message: "Already recorded." }); continue; }
         const id = await insertActivity({ lead, type: "reply", outcome: "reply_received", channel, title: subject, body: text, ref, url, contactId: contact?.id, parentId: parent?.id, employee, when, ext });
+        if (ext) actByExt.set(ext, { id, type: "reply", lead_id: lead.id, contact_id: contact?.id ?? null, message_kind: null, actor_id: employee, occurred_at: when.at ?? at, precision: when.precision });
         if (contact) {
           const [cr] = await q("SELECT email_status FROM contacts WHERE id=?", [contact.id]);
           if (cr?.email_status === "unknown") await x("UPDATE contacts SET email_status='ok', updated_at=? WHERE id=?", [at, contact.id]);
@@ -345,18 +406,16 @@ export async function importHistory(actor: Actor, body: Rec) {
     for (const [i, r] of sections.bounces.entries()) {
       const ext = str(r.external_id, 120);
       try {
-        const mExt = str(r.message_external_id, 120);
-        let parent = mExt ? await loadAct(mExt) : null;
-        if (!parent && r.message_id != null) {
-          const [p] = await q("SELECT id,lead_id,contact_id,message_kind,actor_id,occurred_at,occurred_precision AS precision FROM activities WHERE id=? AND type='message'", [Number(r.message_id)]);
-          if (p) parent = { id: Number(p.id), lead_id: Number(p.lead_id), contact_id: p.contact_id == null ? null : Number(p.contact_id), message_kind: p.message_kind as string | null, actor_id: Number(p.actor_id), occurred_at: String(p.occurred_at), precision: String(p.precision) };
-        }
-        if (!parent) throw new Error('message_external_id: the sent message this bounce belongs to is required (import the message first, or give its CRM id as "message_id").');
+        const parent = await resolveMessage(r.message_external_id, r.message_id, "message_external_id");
+        if (!parent) throw new Error('message_external_id: the exact sent message this bounce belongs to is required (import that message first, or give its CRM activity id as "message_id"). Bounces are never matched by guessing.');
+        const wantKind = str(r.kind);
+        if (wantKind && wantKind !== parent.message_kind) throw new Error(`kind: you said "${wantKind}" but that message is a "${parent.message_kind}". A bounce takes the kind of the message it belongs to.`);
         const lead = byId.get(parent.lead_id)!;
         const when = dateOf(r.bounced_at, "bounced_at", false);
         if (!when.at && !ext) throw new Error("external_id: required when bounced_at is unknown.");
+        // Chronology is only checked when BOTH dates are known; an unknown send date never blocks a dated bounce.
         if (when.at && parent.precision !== "unknown" && when.at < parent.occurred_at && eventDayBefore(when, parent)) throw new Error("bounced_at: a bounce cannot be earlier than the message it belongs to.");
-        const employee = employeeOf(r, parent.actor_id);
+        const employee = employeeOf(r, { v: parent.actor_id });
         const already = ext ? await loadAct(ext) : null;
         const [dupB] = already ? [{ id: already.id }] : await q("SELECT id FROM activities WHERE parent_id=? AND outcome='bounced' LIMIT 1", [parent.id]);
         if (dupB) { out.bounces.push({ index: i, external_id: ext, status: "exists", id: Number(dupB.id), lead_id: lead.id, message: "A bounce is already recorded for that message." }); continue; }
@@ -365,7 +424,7 @@ export async function importHistory(actor: Actor, body: Rec) {
           const [cr] = await q("SELECT email_status FROM contacts WHERE id=?", [parent.contact_id]);
           if (cr && (await escalate(parent.contact_id, String(cr.email_status), "bounced"))) contactsEscalated++;
         }
-        if (ext) actByExt.set(ext, { id, lead_id: lead.id, contact_id: parent.contact_id, message_kind: parent.message_kind, actor_id: employee, occurred_at: when.at ?? at, precision: when.precision });
+        if (ext) actByExt.set(ext, { id, type: "outcome", lead_id: lead.id, contact_id: parent.contact_id, message_kind: parent.message_kind, actor_id: employee, occurred_at: when.at ?? at, precision: when.precision });
         out.bounces.push({ index: i, external_id: ext, status: "created", id, lead_id: lead.id });
       } catch (e) {
         fail("bounces", i, ext, e);
@@ -390,10 +449,10 @@ export async function importHistory(actor: Actor, body: Rec) {
         // Leave a visible note in the lead history (only once per contact+status unless an external_id says otherwise).
         const title = status === "opted_out" ? "Do not contact (imported)" : "Bounced address (imported)";
         const note = str(r.note, 2000) ?? `${email} marked ${status === "opted_out" ? "do-not-contact" : "bounced"} from historical records.`;
-        const dupId = await sameAsExisting(ext, { lead: lead.id, type: "note", channel: null, kind: null, at: when.at ?? "", employee, contact: contact.id, title });
+        const dupId = await sameAsExisting(ext, { lead: lead.id, type: "note", channel: null, kind: null, when, contact: contact.id, title });
         if (dupId) { out.do_not_contact.push({ index: i, external_id: ext, status: "exists", id: dupId, lead_id: lead.id, message: changed ? "Contact status updated; note already existed." : "Already recorded." }); continue; }
         const id = await insertActivity({ lead, type: "note", title, body: note, contactId: contact.id, employee, when, ext });
-        if (ext) actByExt.set(ext, { id, lead_id: lead.id, contact_id: contact.id, message_kind: null, actor_id: employee, occurred_at: when.at ?? at, precision: when.precision });
+        if (ext) actByExt.set(ext, { id, type: "note", lead_id: lead.id, contact_id: contact.id, message_kind: null, actor_id: employee, occurred_at: when.at ?? at, precision: when.precision });
         out.do_not_contact.push({ index: i, external_id: ext, status: "created", id, lead_id: lead.id });
       } catch (e) {
         fail("do_not_contact", i, ext, e);
@@ -459,10 +518,10 @@ export async function correctLeadDates(actor: Actor, body: Rec) {
   const commit = body.commit === true;
   const label = str(body.label, 200) ?? "Lead date correction";
 
-  const leads = await all("SELECT id,company,domain,external_id,lead_date,lead_date_precision,created_by FROM leads");
+  const leads = await all("SELECT id,company,domain,external_id,lead_date,lead_date_precision,created_by,imported_by FROM leads");
   const users = await all("SELECT id,username,name FROM users");
   const out: DateFixRow[] = [];
-  const plan: { row: DateFixRow; id: number; ev: EventDate; employee: number | null; before: Rec }[] = [];
+  const plan: { row: DateFixRow; id: number; ev: EventDate | null; setEmployee: boolean; employee: number | null; before: Rec }[] = [];
   const show = (l: Rec) => (l.lead_date ? eventDateText(l.lead_date as string, l.lead_date_precision as string) : "unknown");
 
   for (const [index, r] of (recs as Rec[]).entries()) {
@@ -476,24 +535,34 @@ export async function correctLeadDates(actor: Actor, body: Rec) {
       if (!hits.length) { out.push({ index, status: "not_found", message: "No matching lead. Nothing is created by a correction." }); continue; }
       if (hits.length > 1) { out.push({ index, status: "ambiguous", message: `Matches ${hits.length} leads (${hits.map((h) => "#" + h.id).join(", ")}) — use id or external_id.` }); continue; }
       const l = hits[0];
-      if (r.lead_date == null || String(r.lead_date).trim() === "") throw new Error('lead_date: required (YYYY-MM-DD, YYYY-MM-DDTHH:mm, or "unknown" to clear it).');
-      const ev = parseEventDate(r.lead_date);
-      if (ev === "invalid") throw new Error('lead_date: use YYYY-MM-DD, YYYY-MM-DDTHH:mm, or "unknown".');
-      if (ev.at && new Date(ev.at).getTime() > Date.now() + 5 * 60000) throw new Error("lead_date: cannot be in the future.");
+      // lead_date: a date, "unknown"/null (keep or make it unknown — nothing is inferred), or absent when only the employee is corrected.
+      const hasDate = Object.prototype.hasOwnProperty.call(r, "lead_date");
+      const hasEmp = Object.prototype.hasOwnProperty.call(r, "employee");
+      if (!hasDate && !hasEmp) throw new Error('Nothing to correct: give lead_date (YYYY-MM-DD, YYYY-MM-DDTHH:mm, "unknown" or null) and/or employee.');
+      if (hasDate && typeof r.lead_date === "string" && r.lead_date.trim() === "") throw new Error('lead_date: empty — use "unknown" (or null) to state that the date is not known.');
+      let ev: EventDate | null = null;
+      if (hasDate) {
+        const p = r.lead_date === null ? ({ at: null, precision: "unknown" } as EventDate) : parseEventDate(r.lead_date);
+        if (p === "invalid") throw new Error('lead_date: use YYYY-MM-DD, YYYY-MM-DDTHH:mm, "unknown" or null.');
+        if (p.at && new Date(p.at).getTime() > Date.now() + 5 * 60000) throw new Error("lead_date: cannot be in the future.");
+        ev = p;
+      }
+      // employee: a username, or null/"unknown" = the original employee is unknown. Only changed when the key is present.
       let employee: number | null = null;
-      if (str(r.employee)) {
-        const s = str(r.employee)!.toLowerCase();
-        employee = (users.find((u) => u.username.toLowerCase() === s) ?? users.find((u) => u.name.toLowerCase() === s))?.id ?? null;
+      if (hasEmp && r.employee !== null && str(r.employee) && !/^unknown$/i.test(str(r.employee)!)) {
+        const s2 = str(r.employee)!.toLowerCase();
+        employee = (users.find((u) => u.username.toLowerCase() === s2) ?? users.find((u) => u.name.toLowerCase() === s2))?.id ?? null;
         if (!employee) throw new Error(`employee: no user "${str(r.employee)}".`);
       }
-      const same = ev.at === l.lead_date && (ev.precision === "unknown" ? null : ev.precision) === l.lead_date_precision;
-      const sameEmp = employee == null || employee === l.created_by;
+      const same = !ev || (ev.at === l.lead_date && (ev.precision === "unknown" ? null : ev.precision) === l.lead_date_precision);
+      const sameEmp = !hasEmp || employee === (l.created_by ?? null);
       const row: DateFixRow = {
-        index, lead_id: l.id as number, company: l.company as string, from: show(l), to: ev.at ? eventDateText(ev.at, ev.precision) : "unknown",
+        index, lead_id: l.id as number, company: l.company as string, from: show(l), to: ev ? (ev.at ? eventDateText(ev.at, ev.precision) : "unknown") : show(l),
         status: same && sameEmp ? "unchanged" : "will_change",
       };
+      if (hasEmp && !sameEmp) row.message = `original employee: ${l.created_by ? users.find((u) => u.id === l.created_by)?.username : "unknown"} → ${employee ? users.find((u) => u.id === employee)?.username : "unknown"}`;
       out.push(row);
-      if (row.status === "will_change") plan.push({ row, id: l.id as number, ev, employee: sameEmp ? null : employee, before: l });
+      if (row.status === "will_change") plan.push({ row, id: l.id as number, ev: same ? null : ev, setEmployee: hasEmp && !sameEmp, employee, before: l });
     } catch (e) {
       out.push({ index, status: "error", message: e instanceof Error ? e.message : String(e) });
     }
@@ -505,14 +574,20 @@ export async function correctLeadDates(actor: Actor, body: Rec) {
     const t = now();
     batchId = (await run("INSERT INTO import_batches (kind,label,imported_by,summary,created_at) VALUES ('date_fix',?,?,?,?)", [label, actor.id, JSON.stringify({ changed: plan.length }), t])).id;
     for (const p of plan) {
-      const sets = ["lead_date=?", "lead_date_precision=?", "updated_at=?"];
-      const args: InValue[] = [p.ev.at, p.ev.precision === "unknown" ? null : p.ev.precision, t];
-      if (p.employee) (sets.push("created_by=?"), args.push(p.employee));
+      const sets = ["updated_at=?"];
+      const args: InValue[] = [t];
+      if (p.ev) (sets.push("lead_date=?", "lead_date_precision=?"), args.push(p.ev.at, p.ev.precision === "unknown" ? null : p.ev.precision));
+      if (p.setEmployee) {
+        sets.push("created_by=?");
+        args.push(p.employee);
+        // Keep who recorded it: the previous original employee becomes the recorder if no importer is stored yet.
+        if (p.before.imported_by == null && p.before.created_by != null) (sets.push("imported_by=?"), args.push(p.before.created_by as number));
+      }
       await run(`UPDATE leads SET ${sets.join(",")} WHERE id=?`, [...args, p.id]);
       await audit(actor, "correct_lead_date", "lead", p.id, {
         batch_id: batchId, label,
-        lead_date: { from: p.row.from, to: p.row.to },
-        ...(p.employee ? { original_employee: { from: p.before.created_by, to: p.employee } } : {}),
+        ...(p.ev ? { lead_date: { from: p.row.from, to: p.row.to } } : {}),
+        ...(p.setEmployee ? { original_employee: { from: p.before.created_by ?? "unknown", to: p.employee ?? "unknown" } } : {}),
         note: "The date the lead was entered into the CRM (created_at) is unchanged.",
       });
       p.row.status = "changed";
@@ -536,4 +611,98 @@ export async function recentBatches(limit = 10) {
 export async function dateStatus() {
   const l = await one("SELECT COUNT(*) AS total, SUM(lead_date IS NULL) AS unknown FROM leads WHERE is_demo=0");
   return { total: Number(l!.total), unknown: Number(l!.unknown ?? 0) };
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+/*  Reconcile activities that already exist (entered through the regular API) with import ids      */
+/* ---------------------------------------------------------------------------------------------- */
+export type ReconcileRow = {
+  index: number;
+  status: "will_change" | "changed" | "unchanged" | "error";
+  activity_id?: number;
+  message?: string;
+};
+
+/**
+ * Attach a stable external_id to an existing activity (so a later import of the same event is recognised as "exists"),
+ * and optionally correct its ORIGINAL employee when there is evidence. Nothing is created or deleted; the date, type,
+ * text and lead of the activity are never touched. The person who recorded it is preserved in imported_by.
+ *
+ * record: { activity_id*, external_id, employee (username | null = unknown; omit to leave as is), lead_id?, type? (safety checks) }
+ */
+export async function reconcileActivities(actor: Actor, body: Rec) {
+  requirePerm(actor, "history.import");
+  const recs = body.records;
+  if (!Array.isArray(recs) || !recs.length || recs.some((r) => !isObj(r))) throw new HttpError(400, 'records: a non-empty array, e.g. {"activity_id":451,"external_id":"steelmate-reply-1","lead_id":9,"type":"reply"}.');
+  if (recs.length > 200) throw new HttpError(400, "Send at most 200 records per request.");
+  const commit = body.commit === true;
+  const label = str(body.label, 200) ?? "Reconcile activities";
+  const users = await all("SELECT id,username,name FROM users");
+  const out: ReconcileRow[] = [];
+  const plan: { row: ReconcileRow; id: number; ext: string | null; setEmp: boolean; emp: number | null; before: Rec }[] = [];
+  const seenExt = new Set<string>();
+  for (const [index, r] of (recs as Rec[]).entries()) {
+    try {
+      const id = Number(r.activity_id);
+      if (!Number.isInteger(id) || id < 1) throw new Error("activity_id: required (the CRM activity id).");
+      const a = await one("SELECT * FROM activities WHERE id=?", [id]);
+      if (!a) throw new Error(`activity_id: no activity #${id}.`);
+      if (r.lead_id != null && Number(r.lead_id) !== a.lead_id) throw new Error(`lead_id: activity #${id} belongs to lead ${a.lead_id}, not ${r.lead_id}. Nothing was changed.`);
+      if (str(r.type) && str(r.type) !== a.type) throw new Error(`type: activity #${id} is a "${a.type}", not "${str(r.type)}". Nothing was changed.`);
+      const ext = str(r.external_id, 120);
+      if (ext) {
+        if (seenExt.has(ext)) throw new Error(`external_id "${ext}" is used twice in this request.`);
+        seenExt.add(ext);
+        if (a.external_id && a.external_id !== ext) throw new Error(`activity #${id} already has external_id "${a.external_id}".`);
+        const other = await one("SELECT id FROM activities WHERE external_id=? AND id<>?", [ext, id]);
+        if (other) throw new Error(`external_id "${ext}" already belongs to activity #${other.id}.`);
+      }
+      const hasEmp = Object.prototype.hasOwnProperty.call(r, "employee");
+      let emp: number | null = null;
+      if (hasEmp && r.employee !== null && str(r.employee) && !/^unknown$/i.test(str(r.employee)!)) {
+        const s2 = str(r.employee)!.toLowerCase();
+        emp = (users.find((u) => u.username.toLowerCase() === s2) ?? users.find((u) => u.name.toLowerCase() === s2))?.id ?? null;
+        if (!emp) throw new Error(`employee: no user "${str(r.employee)}".`);
+      }
+      if (!ext && !hasEmp) throw new Error("Nothing to do: give external_id and/or employee.");
+      const setEmp = hasEmp && emp !== (a.actor_id ?? null);
+      const setExt = !!ext && a.external_id !== ext;
+      const row: ReconcileRow = { index, activity_id: id, status: setEmp || setExt ? "will_change" : "unchanged" };
+      out.push(row);
+      if (row.status === "will_change") plan.push({ row, id, ext: setExt ? ext : null, setEmp, emp, before: a });
+    } catch (e) {
+      out.push({ index, status: "error", message: e instanceof Error ? e.message : String(e) });
+    }
+  }
+  const errors = out.filter((r) => r.status === "error").length;
+  let batchId: number | null = null;
+  if (commit && errors === 0 && plan.length) {
+    const t = now();
+    batchId = (await run("INSERT INTO import_batches (kind,label,imported_by,summary,created_at) VALUES ('reconcile',?,?,?,?)", [label, actor.id, JSON.stringify({ changed: plan.length }), t])).id;
+    for (const p of plan) {
+      const sets: string[] = [];
+      const args: InValue[] = [];
+      if (p.ext) (sets.push("external_id=?"), args.push(p.ext));
+      if (p.setEmp) {
+        sets.push("actor_id=?");
+        args.push(p.emp);
+        // The person who recorded it stays on record as the recorder.
+        if (p.before.imported_by == null && p.before.actor_id != null) (sets.push("imported_by=?"), args.push(p.before.actor_id as number));
+      }
+      await run(`UPDATE activities SET ${sets.join(",")} WHERE id=?`, [...args, p.id]);
+      await audit(actor, "reconcile_activity", "activity", p.id, {
+        batch_id: batchId, label,
+        ...(p.ext ? { external_id: p.ext } : {}),
+        ...(p.setEmp ? { original_employee: { from: p.before.actor_id ?? "unknown", to: p.emp ?? "unknown" }, recorded_by_kept: p.before.imported_by ?? p.before.actor_id ?? null } : {}),
+      });
+      p.row.status = "changed";
+    }
+  }
+  const c = (s: ReconcileRow["status"]) => out.filter((r) => r.status === s).length;
+  return {
+    committed: !!batchId, dry_run: !commit, batch_id: batchId,
+    note: !commit ? 'Dry run — nothing was changed. Send the same body with "commit": true to apply.' : errors ? "Nothing was changed because some records have errors." : batchId ? "Reconciled." : "Nothing needed changing.",
+    counts: { changed: c("changed"), will_change: c("will_change"), unchanged: c("unchanged"), errors },
+    results: out,
+  };
 }
