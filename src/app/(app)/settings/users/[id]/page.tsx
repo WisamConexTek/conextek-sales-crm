@@ -77,9 +77,10 @@ export default async function UserPage({ params, searchParams }: { params: Promi
 
       {canReset && (
         <Card title="Password">
-          <SecretAction action={resetPasswordAction} submit="Reset password" secretLabel="Give it to them securely — they must choose a new one at next sign-in.">
+          <SecretAction action={resetPasswordAction} submit="Reset password" secretLabel="Give it to them securely. They can change it under Account.">
             <input type="hidden" name="id" value={u.id} />
-            <p className="mb-2 text-sm text-slate-600">Sets a one-time temporary password and forces a change at next sign-in. Existing sessions are signed out.</p>
+            <p className="mb-2 text-sm text-slate-600">Set a new password for this person. Existing sessions are signed out.</p>
+            <Field label="New password (min 10 chars, blank = generate)"><input name="password" type="text" autoComplete="off" minLength={10} className="input max-w-sm" /></Field>
           </SecretAction>
         </Card>
       )}

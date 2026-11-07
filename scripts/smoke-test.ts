@@ -25,11 +25,19 @@ async function main() {
 
   const owner = await actorById(1);
   ok(owner.role === "owner", "owner bootstrapped from env");
-  await throws(() => U.createUser({ ...owner, role: "chief" }, { username: "x", name: "x", role: "employee" }), 403, "only owner can add users");
+  await throws(() => U.createUser({ ...owner, role: "employee", perms: new Set() } as typeof owner, { username: "x", name: "x", role: "employee" }), 403, "employees cannot add users");
   const c = await U.createUser(owner, { username: "chief", name: "Chief", role: "chief" });
   const e1 = await U.createUser(owner, { username: "sara", name: "Sara", role: "employee", preset: "researcher" });
   const e2 = await U.createUser(owner, { username: "omar", name: "Omar", role: "employee", preset: "outreach" });
   const chief = await actorById(c.id, "api"), sara = await actorById(e1.id, "api"), omar = await actorById(e2.id, "api");
+  const nu = await U.createUser(chief, { username: "newbie", name: "Newbie", role: "employee", preset: "outreach", password: "chosen-by-chief-1" });
+  ok(nu.password === "chosen-by-chief-1", "chief creates an employee with a chosen password");
+  ok(!(await actorById(nu.id)).mustChangePassword, "new account is not forced to change password");
+  await throws(() => U.createUser(chief, { username: "chief2", name: "C2", role: "chief" }), 403, "chief cannot create another chief");
+  await throws(() => U.createUser(chief, { username: "xtest1", name: "x", role: "employee", preset: "chief" }), 403, "chief cannot use the chief preset");
+  await throws(() => U.createUser(chief, { username: "xtest2", name: "x", role: "employee", password: "short" }), 400, "short password rejected");
+  await throws(() => U.createUser(chief, { username: "newbie", name: "dup", role: "employee" }), 409, "duplicate username rejected");
+  ok(!(await actorById(nu.id)).perms.has("approvals.decide"), "chief-created employee has no approval rights");
 
   console.log("Leads & duplicates");
   const lid = await L.createLead(sara, { company: "Acme Ltd", website: "https://www.acme.com/about", country: "UAE", contacts: [{ name: "Jo", email: "jo@acme.com" }] });
@@ -128,8 +136,10 @@ async function main() {
   await U.revokeKey(owner, keys[0].id as number);
   await throws(() => getApiActor(new Request("http://x", { headers: { authorization: `Bearer ${k}` } })), 401, "revoked key rejected");
   const pw = await U.resetPassword(owner, e2.id);
-  ok(pw.length >= 12, "admin password reset issues temp password");
-  ok((await actorById(e2.id)).mustChangePassword, "temp password forces change");
+  ok(pw.length >= 12, "reset without a password generates one");
+  ok(!(await actorById(e2.id)).mustChangePassword, "no forced password change");
+  await U.resetPassword(owner, e2.id, "my-own-chosen-pass");
+  await throws(() => U.resetPassword(owner, e2.id, "short"), 400, "short password rejected");
 
   console.log("Demo data exclusion");
   const dl = await L.createLead(owner, { company: "DEMO Co", owner_id: omar.id }, true);

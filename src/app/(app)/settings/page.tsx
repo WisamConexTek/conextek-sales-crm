@@ -22,7 +22,7 @@ export default async function Settings({ searchParams }: { searchParams: SP }) {
 
   return (
     <div className="space-y-5">
-      <PageHeader title="Settings & Permissions" sub={owner ? "Full owner access" : "Chief: you can adjust employee permissions and reset their passwords"} />
+      <PageHeader title="Settings & Permissions" sub={owner ? "Full owner access" : "Chief: you can add employees, adjust their permissions and reset their passwords"} />
       <Flash ok={sget(sp, "ok")} err={sget(sp, "err")} />
       <div className="flex gap-1 border-b border-slate-200">
         {tabs.map(([k, l]) => <Link key={k} href={`/settings?tab=${k}`} className={`-mb-px border-b-2 px-4 py-2 text-sm no-underline hover:no-underline ${tab === k ? "border-brand-600 font-semibold text-brand-700" : "border-transparent text-slate-600"}`}>{l}</Link>)}
@@ -54,7 +54,7 @@ async function Team({ owner }: { owner: boolean }) {
                     <td className="td">{u.role === "owner" ? "All" : u.perms.length}</td>
                     <td className="td">{k}</td>
                     <td className="td text-slate-600">{u.last_login_at ? fmtDateTime(u.last_login_at) : "Never"}</td>
-                    <td className="td">{u.active ? <Badge tone="green">Active</Badge> : <Badge tone="gray">Disabled</Badge>}{u.must_change_password ? <> <Badge tone="amber">Temp password</Badge></> : null}</td>
+                    <td className="td">{u.active ? <Badge tone="green">Active</Badge> : <Badge tone="gray">Disabled</Badge>}</td>
                   </tr>
                 );
               })}
@@ -62,15 +62,16 @@ async function Team({ owner }: { owner: boolean }) {
           </table>
         </div>
       </Card>
-      {owner && (
-        <Card title="Add a team member">
-          <SecretAction action={createUserAction} submit="Create account" className="grid max-w-3xl gap-3 md:grid-cols-4" secretLabel="Share it securely — they must change it at first login.">
+      {(
+        <Card title={owner ? "Add a team member" : "Add an employee"}>
+          <SecretAction action={createUserAction} submit="Create account" className="grid max-w-4xl gap-3 md:grid-cols-5" secretLabel="Share it securely. They can change it any time under Account.">
             <Field label="Name"><input name="name" className="input" required /></Field>
             <Field label="Username"><input name="username" className="input" required pattern="[a-zA-Z0-9._\-]+" minLength={3} /></Field>
-            <Field label="Role"><select name="role" className="input"><option value="employee">Employee</option><option value="chief">Chief</option></select></Field>
-            <Field label="Permission preset"><select name="preset" className="input" defaultValue="researcher">{Object.entries(PRESETS).filter(([k]) => k !== "owner").map(([k, p]) => <option key={k} value={k}>{p.label}</option>)}</select></Field>
+            <Field label="Role"><select name="role" className="input"><option value="employee">Employee</option>{owner && <option value="chief">Chief</option>}</select></Field>
+            <Field label="Password (min 10 chars, blank = generate)"><input name="password" type="text" autoComplete="off" minLength={10} className="input" /></Field>
+            <Field label="Permission preset"><select name="preset" className="input" defaultValue="researcher">{Object.entries(PRESETS).filter(([k, p]) => k !== "owner" && (owner || p.role === "employee")).map(([k, p]) => <option key={k} value={k}>{p.label}</option>)}</select></Field>
           </SecretAction>
-          <p className="mt-3 text-xs text-slate-500">After creating the account, open it to issue the employee's API key and fine-tune permissions. New people can be added any time — nothing else needs to change.</p>
+          <p className="mt-3 text-xs text-slate-500">After creating the account, open it to fine-tune permissions{owner ? " and issue the employee's API key" : ". The owner issues API keys"}. New people can be added any time — nothing else needs to change.</p>
         </Card>
       )}
     </>

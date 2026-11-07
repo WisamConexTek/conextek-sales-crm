@@ -7,6 +7,7 @@ import { ALL_PERMISSIONS, PRESETS, type Permission } from "../constants";
 import { audit, parse, reqText } from "./common";
 import bcrypt from "bcryptjs";
 
+const CHIEF_LOCKED: Permission[] = ["approvals.decide", "tasks.assign", "tasks.view_all"];
 const safeCols = "id,username,name,role,preset,permissions,must_change_password,active,last_login_at,created_at";
 
 export async function listUsers(includeInactive = true): Promise<Row[]> {
@@ -27,23 +28,29 @@ const createSchema = z.object({
   name: reqText(80),
   role: z.enum(["chief", "employee"]),
   preset: z.string().optional(),
+  password: z.string().optional(),
 });
 
 export async function createUser(actor: Actor, input: unknown) {
-  if (actor.role !== "owner") throw new HttpError(403, "Only the owner can add team members.");
+  if (actor.role !== "owner" && actor.role !== "chief") throw new HttpError(403, "Only the owner or Chief can add team members.");
   const d = parse(createSchema, input);
+  // Chief may add employees only (never another Chief), with presets that stay within Chief's own rights.
+  if (actor.role === "chief" && d.role !== "employee") throw new HttpError(403, "Chief can add employees only. The owner adds other Chiefs.");
   if (await one("SELECT id FROM users WHERE username=?", [d.username])) throw new HttpError(409, "That username already exists.");
   const presetKey = d.preset && PRESETS[d.preset] ? d.preset : d.role === "chief" ? "chief" : "researcher";
+  if (actor.role === "chief" && PRESETS[presetKey].role !== "employee") throw new HttpError(403, "Chief can only use employee presets.");
   const preset = PRESETS[presetKey];
-  const temp = generateTempPassword();
+  const perms = actor.role === "owner" ? preset.perms : preset.perms.filter((p) => can(actor, p) && !CHIEF_LOCKED.includes(p));
+  const pw = d.password?.trim() ? d.password : generateTempPassword();
+  validatePassword(pw);
   const t = now();
   const r = await run(
     `INSERT INTO users (username,name,role,preset,permissions,password_hash,must_change_password,created_at,updated_at)
-     VALUES (?,?,?,?,?,?,1,?,?)`,
-    [d.username, d.name, d.role, presetKey, JSON.stringify(preset.perms), await hashPassword(temp), t, t],
+     VALUES (?,?,?,?,?,?,0,?,?)`,
+    [d.username, d.name, d.role, presetKey, JSON.stringify(perms), await hashPassword(pw), t, t],
   );
-  await audit(actor, "create_user", "user", r.id, { username: d.username, role: d.role, preset: presetKey });
-  return { id: r.id, tempPassword: temp };
+  await audit(actor, "create_user", "user", r.id, { username: d.username, role: d.role, preset: presetKey, created_by_role: actor.role });
+  return { id: r.id, password: pw };
 }
 
 export async function updateUserProfile(actor: Actor, id: number, input: { name?: string; role?: string; active?: boolean }) {
@@ -87,17 +94,18 @@ export async function setPermissions(actor: Actor, id: number, perms: string[], 
   });
 }
 
-export async function resetPassword(actor: Actor, id: number) {
+export async function resetPassword(actor: Actor, id: number, newPassword?: string) {
   const u = await getUser(id);
   if (!u) throw new HttpError(404, "User not found.");
   const allowed = actor.role === "owner" ? u.role !== "owner" || id === actor.id : actor.role === "chief" && u.role === "employee";
   if (!allowed) throw new HttpError(403, "You cannot reset this person's password.");
-  const temp = generateTempPassword();
-  await run("UPDATE users SET password_hash=?, must_change_password=1, failed_logins=0, locked_until=NULL, updated_at=? WHERE id=?", [
-    await hashPassword(temp), now(), id,
+  const pw = newPassword?.trim() ? newPassword : generateTempPassword();
+  validatePassword(pw);
+  await run("UPDATE users SET password_hash=?, must_change_password=0, failed_logins=0, locked_until=NULL, updated_at=? WHERE id=?", [
+    await hashPassword(pw), now(), id,
   ]);
   await audit(actor, "reset_password", "user", id, { target: u.username });
-  return temp;
+  return pw;
 }
 
 export async function changeOwnPassword(actor: Actor, current: string, next: string) {

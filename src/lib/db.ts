@@ -61,7 +61,7 @@ async function bootstrap(c: Client) {
               VALUES (?,?,?,?,?,?,?,?,?)`,
         args: [
           username, process.env.OWNER_NAME || username, "owner", "owner",
-          JSON.stringify(PRESETS.owner.perms), await bcrypt.hash(password, 11), 1, t, t,
+          JSON.stringify(PRESETS.owner.perms), await bcrypt.hash(password, 11), 0, t, t,
         ],
       });
       await c.execute({

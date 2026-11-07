@@ -157,12 +157,12 @@ export async function createUserAction(_p: SecretState, fd: FD): Promise<SecretS
   const a = await requireUser();
   return secret(async () => {
     const r = await Users.createUser(a, obj(fd));
-    return { secret: r.tempPassword, message: `Account "${s(fd, "username")}" created. Temporary password:` };
+    return { secret: r.password, message: `Account "${s(fd, "username")}" created. Password:` };
   });
 }
 export async function resetPasswordAction(_p: SecretState, fd: FD): Promise<SecretState> {
   const a = await requireUser();
-  return secret(async () => ({ secret: await Users.resetPassword(a, n(fd, "id")), message: "Temporary password set (they must change it at next login)." }));
+  return secret(async () => ({ secret: await Users.resetPassword(a, n(fd, "id"), s(fd, "password")), message: "Password set. Existing sessions were signed out." }));
 }
 export async function createKeyAction(_p: SecretState, fd: FD): Promise<SecretState> {
   const a = await requireUser();
