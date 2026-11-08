@@ -2,6 +2,7 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { requireUser, can, isManager } from "@/lib/auth";
 import { getLead } from "@/lib/service/leads";
+import { leadCampaigns } from "@/lib/service/campaigns";
 import { getLists } from "@/lib/service/lists";
 import { assignableUsers } from "@/lib/service/users";
 import {
@@ -27,7 +28,7 @@ export default async function LeadPage({ params, searchParams }: { params: Promi
   let data;
   try { data = await getLead(me, leadId); } catch { notFound(); }
   const { lead, contacts, history, tasks } = data;
-  const [lists, users] = await Promise.all([getLists(true), assignableUsers()]);
+  const [lists, users, camps] = await Promise.all([getLists(true), assignableUsers(), leadCampaigns(leadId)]);
   const lab = (kind: string) => Object.fromEntries(lists[kind].map((i) => [i.key, i.label]));
   const stageLab = lab("stage");
   const flag = Object.fromEntries(lists.stage.map((i) => [i.key, i.flag]));
@@ -69,6 +70,7 @@ export default async function LeadPage({ params, searchParams }: { params: Promi
               <StageBadge stage={lead.stage} label={stageLab[lead.stage] ?? lead.stage} flag={flag[lead.stage]} />
               <span>Owner: <b className="text-slate-700">{lead.owner_name ?? "Unassigned"}</b></span>
               <span>· Lead date: <b className={lead.lead_date ? "text-slate-700" : "text-amber-700"}>{fmtEvent(lead.lead_date, lead.lead_date_precision)}</b>{lead.created_by_name ? ` · found by ${lead.created_by_name}` : " · found by unknown employee"}</span>
+              <span>· Campaign: {camps.filter((c) => c.status === "active").length ? camps.filter((c) => c.status === "active").map((c) => <b key={c.id} className="text-slate-700">{c.campaign}</b>) : <b className="text-amber-700">not assigned</b>}{camps.some((c) => c.status === "transferred") ? ` (earlier: ${camps.filter((c) => c.status === "transferred").map((c) => c.campaign).join(", ")})` : ""}</span>
               <span>· Entered in CRM {fmtDate(lead.created_at)}{lead.imported_by_name ? ` by ${lead.imported_by_name} (import)` : ""}</span>
             </div>
           </div>

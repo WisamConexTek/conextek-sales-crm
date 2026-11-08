@@ -5,6 +5,8 @@ import { HttpError, can, requirePerm, isManager, type Actor } from "../auth";
 import { OPEN_TASK_STATUSES, TASK_STATUSES, type TaskStatus } from "../constants";
 import { audit, parse, optText, optInt, optDate, optBool, reqText, assertListKey } from "./common";
 import { assertLeadAccess } from "./leads";
+import { assertChannel, PREP_STATUSES } from "./campaigns";
+import { parseWhen } from "./common";
 
 /* ================= tasks ================= */
 
@@ -22,8 +24,26 @@ const createSchema = z.object({
   task_type: optText(60),
   due_at: optDate,
   approval: z.enum(["default", "chief", "wisam", "none"]).optional(),
+  scheduled_at: z.unknown().optional(),
+  channel: optText(30).optional(),
+  action_type: optText(60).optional(),
+  prep_status: z.preprocess((v) => (v === "" ? null : v), z.enum(PREP_STATUSES).nullable()).optional(),
+  blockers: optText(1000).optional(),
+  campaign_id: optInt.optional(),
   is_test: optBool.optional(),
 });
+
+/** scheduled_at accepts the same timestamp formats as event dates (explicit Z/offset preferred); the raw input is kept. */
+function schedule(v: unknown): { at: string | null; input: string | null } {
+  if (v == null || v === "") return { at: null, input: null };
+  if (typeof v !== "string") throw new HttpError(400, "scheduled_at: send an ISO timestamp such as 2026-11-09T10:00:00+02:00 (or Z), or null.");
+  const at = parseWhen(v);
+  if (!at || at === "invalid") throw new HttpError(400, `scheduled_at: "${v}" is not a valid date/time. Use YYYY-MM-DDTHH:mm[:ss] with Z or an offset.`);
+  return { at, input: v.trim() };
+}
+async function assertCampaign(id: number | null | undefined) {
+  if (id && !(await one("SELECT id FROM campaigns WHERE id=?", [id]))) throw new HttpError(400, "campaign_id: unknown campaign.");
+}
 
 export async function createTask(actor: Actor, input: unknown, isDemo = false) {
   const d = parse(createSchema, input);
@@ -38,6 +58,9 @@ export async function createTask(actor: Actor, input: unknown, isDemo = false) {
   if (d.is_test && leadRow && !leadRow.is_demo) throw new HttpError(400, "is_test: a task on a real lead is real work. Mark the lead as test data instead.");
   const isTest = isDemo || !!d.is_test || !!leadRow?.is_demo;
 
+  await assertChannel(d.channel);
+  await assertCampaign(d.campaign_id);
+  const sch = schedule(d.scheduled_at);
   const base = await defaultApprover(d.task_type);
   const choice = d.approval ?? "default";
   let approvalFrom: "chief" | "wisam" | null;
@@ -50,9 +73,9 @@ export async function createTask(actor: Actor, input: unknown, isDemo = false) {
 
   const t = now();
   const r = await run(
-    `INSERT INTO tasks (lead_id,assignee_id,created_by,title,instructions,task_type,approval_from,due_at,is_demo,created_at,updated_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-    [d.lead_id, assignee, actor.id, d.title, d.instructions, d.task_type, approvalFrom, d.due_at, isTest ? 1 : 0, t, t],
+    `INSERT INTO tasks (lead_id,assignee_id,created_by,title,instructions,task_type,approval_from,due_at,is_demo,created_at,updated_at,scheduled_at,scheduled_input,channel,action_type,prep_status,blockers,campaign_id)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [d.lead_id, assignee, actor.id, d.title, d.instructions, d.task_type, approvalFrom, d.due_at, isTest ? 1 : 0, t, t, sch.at, sch.input, d.channel ?? null, d.action_type ?? null, d.prep_status ?? null, d.blockers ?? null, d.campaign_id ?? null],
   );
   if (d.lead_id)
     await run(
@@ -140,6 +163,12 @@ const updateSchema = z.object({
   instructions: optText(8000).optional(),
   due_at: optDate.optional(),
   assignee_id: optInt.optional(),
+  scheduled_at: z.unknown().optional(),
+  channel: optText(30).optional(),
+  action_type: optText(60).optional(),
+  prep_status: z.preprocess((v) => (v === "" ? null : v), z.enum(PREP_STATUSES).nullable()).optional(),
+  blockers: optText(1000).optional(),
+  campaign_id: optInt.optional(),
 });
 
 export async function updateTask(actor: Actor, id: number, input: Record<string, unknown>) {
@@ -180,6 +209,19 @@ export async function updateTask(actor: Actor, id: number, input: Record<string,
       set("assignee_id", d.assignee_id);
     }
   }
+  // Structured planning fields: the assignee may keep their own preparation status and blockers current;
+  // scheduling, channel, campaign and action type are manager/creator edits like the due date.
+  const prep = d.prep_status !== undefined || d.blockers !== undefined;
+  const plan = d.scheduled_at !== undefined || d.channel !== undefined || d.action_type !== undefined || d.campaign_id !== undefined;
+  if (plan && !canManage && !(isCreator && isAssignee)) throw new HttpError(403, "Only a manager can change the schedule, channel, campaign or action type.");
+  if (prep) {
+    if (d.prep_status !== undefined) set("prep_status", d.prep_status);
+    if (d.blockers !== undefined) set("blockers", d.blockers);
+  }
+  if (d.channel !== undefined) { await assertChannel(d.channel); set("channel", d.channel); }
+  if (d.action_type !== undefined) set("action_type", d.action_type);
+  if (d.campaign_id !== undefined) { await assertCampaign(d.campaign_id); set("campaign_id", d.campaign_id); }
+  if (d.scheduled_at !== undefined) { const sch = schedule(d.scheduled_at); set("scheduled_at", sch.at); set("scheduled_input", sch.input); }
   if (!sets.length) return;
   const stmts = [{ sql: `UPDATE tasks SET ${sets.join(",")}, updated_at=? WHERE id=?`, args: [...args, now(), id] as InValue[] }];
   if (d.status === "cancelled")

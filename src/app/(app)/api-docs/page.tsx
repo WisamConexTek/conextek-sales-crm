@@ -158,6 +158,28 @@ export default async function ApiDocs() {
       </Card>
 
 
+      <div id="campaigns" />
+      <Card title="Projects, campaigns, channels and task planning">
+        <P>
+          A <b>project</b> (ConexTek) contains <b>campaigns</b> (US Car Dealers, Gulf Car Dealers, Canton Fair…). <b>Channels</b> are email, linkedin and x. A lead stays <b>one canonical record</b>; campaign membership is a history on top of it. Joining or moving a campaign never changes the lead’s stage, tasks, sends or contact restrictions, and never restarts outreach. All times are ISO 8601 with <code>Z</code> or an offset; the CRM displays Asia/Hebron.
+        </P>
+        <Code>{`GET   /api/v1/projects                      GET /api/v1/channels
+GET   /api/v1/campaigns                     → unique_leads = distinct real leads with ACTIVE membership
+POST  /api/v1/campaigns                     campaigns.manage: {"name","project_id?","owner_id?","target_markets":["UAE","KSA"],"objective","status":"draft|active|paused|closed"}
+GET   /api/v1/campaigns/{id}                PATCH /api/v1/campaigns/{id}  (same fields)
+GET   /api/v1/campaigns/unassigned          campaigns.manage: real leads with no campaign (the migration review queue, never auto-filled)
+GET   /api/v1/leads/{id}/campaigns          membership history (status active|transferred|removed, is_original, transferred_from)
+POST  /api/v1/leads/{id}/campaigns          campaigns.manage: {"campaign_id":2,"note":"…","transfer_from_campaign_id":1?}
+DELETE /api/v1/leads/{id}/campaigns?campaign_id=2
+POST  /api/v1/leads                         accepts "campaign_id": the new lead is linked to it as its original source`}</Code>
+        <ul className="mb-2 list-disc space-y-1 pl-5 text-sm text-slate-700">
+          <li><b>Idempotent:</b> enrolling a lead already active in that campaign returns <code>changed:false</code>.</li>
+          <li><b>409</b> if the lead is already active in another campaign and no <code>transfer_from_campaign_id</code> is given. A transfer keeps the old row as <code>transferred</code> (history and original-source attribution stay) and is audited.</li>
+          <li><b>409</b> for a lead with an opted-out contact, or a historical-only lead: no campaign can bypass do-not-contact.</li>
+          <li><b>Tasks</b> (<code>POST /tasks</code>, <code>PATCH /tasks/{"{id}"}</code>) accept <code>scheduled_at</code> (real timestamp; the original text is kept in <code>scheduled_input</code>), <code>channel</code>, <code>action_type</code>, <code>campaign_id</code>, <code>prep_status</code> (<code>validation_needed | draft_needed | internal_review | user_approval_needed | ready_for_execution</code>) and <code>blockers</code>. Dates in words (“next Tuesday”) are rejected. The assignee may update <code>prep_status</code> and <code>blockers</code>; schedule, channel, campaign and action type are manager (or creator) edits. <code>prep_status</code> is separate from the sales stage and is <b>not</b> an approval to contact.</li>
+        </ul>
+      </Card>
+
       <div id="history" />
       <Card title="Importing historical records (past leads, sends, replies, bounces)">
         <P>

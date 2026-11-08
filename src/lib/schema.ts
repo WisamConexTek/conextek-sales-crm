@@ -278,4 +278,89 @@ ALTER TABLE leads ADD COLUMN historical_only INTEGER NOT NULL DEFAULT 0;
 -- Owner-granted, time-limited migration access (history.import stops working after this moment).
 ALTER TABLE users ADD COLUMN history_import_until TEXT;
 `,
+  `
+-- Migration 5 (additive only): projects, campaigns, channels, campaign membership, task scheduling and
+-- preparation status, read-only legacy archive. Nothing existing is changed, moved, reset or deleted.
+CREATE TABLE projects (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  key TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','paused','closed')),
+  created_at TEXT NOT NULL
+);
+CREATE TABLE channels (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  key TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL,
+  active INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE campaigns (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL REFERENCES projects(id),
+  key TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL,
+  owner_id INTEGER REFERENCES users(id),
+  target_markets TEXT,
+  objective TEXT,
+  status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','active','paused','closed')),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+-- One canonical lead; membership is history. A lead can have several rows over time, but only one 'active' at once
+-- unless a manager enrols it in a second campaign explicitly. is_original marks original-source attribution.
+CREATE TABLE lead_campaigns (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  lead_id INTEGER NOT NULL REFERENCES leads(id),
+  campaign_id INTEGER NOT NULL REFERENCES campaigns(id),
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','transferred','removed')),
+  is_original INTEGER NOT NULL DEFAULT 0,
+  transferred_from INTEGER REFERENCES campaigns(id),
+  added_by INTEGER REFERENCES users(id),
+  note TEXT,
+  joined_at TEXT NOT NULL,
+  ended_at TEXT,
+  UNIQUE (lead_id, campaign_id)
+);
+CREATE INDEX idx_lc_campaign ON lead_campaigns(campaign_id, status);
+-- Structured task fields. All nullable: NULL = unknown, never guessed for existing tasks.
+ALTER TABLE tasks ADD COLUMN scheduled_at TEXT;
+ALTER TABLE tasks ADD COLUMN scheduled_input TEXT;
+ALTER TABLE tasks ADD COLUMN channel TEXT;
+ALTER TABLE tasks ADD COLUMN action_type TEXT;
+ALTER TABLE tasks ADD COLUMN prep_status TEXT CHECK (prep_status IS NULL OR prep_status IN ('validation_needed','draft_needed','internal_review','user_approval_needed','ready_for_execution'));
+ALTER TABLE tasks ADD COLUMN blockers TEXT;
+ALTER TABLE tasks ADD COLUMN campaign_id INTEGER REFERENCES campaigns(id);
+CREATE INDEX idx_tasks_sched ON tasks(scheduled_at);
+-- Read-only copy of free-text sources, with provenance. Rows cannot be changed or removed.
+CREATE TABLE legacy_archive (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  entity TEXT NOT NULL,
+  entity_id INTEGER NOT NULL,
+  field TEXT NOT NULL,
+  content TEXT NOT NULL,
+  source_updated_at TEXT,
+  archived_at TEXT NOT NULL,
+  UNIQUE (entity, entity_id, field)
+);
+CREATE TRIGGER legacy_archive_no_update BEFORE UPDATE ON legacy_archive BEGIN SELECT RAISE(ABORT,'legacy_archive is read-only'); END;
+CREATE TRIGGER legacy_archive_no_delete BEFORE DELETE ON legacy_archive BEGIN SELECT RAISE(ABORT,'legacy_archive is read-only'); END;
+INSERT INTO legacy_archive (entity,entity_id,field,content,source_updated_at,archived_at)
+  SELECT 'lead',id,'notes',notes,updated_at,strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM leads WHERE notes IS NOT NULL AND TRIM(notes)<>'';
+INSERT INTO legacy_archive (entity,entity_id,field,content,source_updated_at,archived_at)
+  SELECT 'lead',id,'next_action',next_action,updated_at,strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM leads WHERE next_action IS NOT NULL AND TRIM(next_action)<>'';
+INSERT INTO legacy_archive (entity,entity_id,field,content,source_updated_at,archived_at)
+  SELECT 'task',id,'title',title,updated_at,strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM tasks;
+INSERT INTO legacy_archive (entity,entity_id,field,content,source_updated_at,archived_at)
+  SELECT 'task',id,'instructions',instructions,updated_at,strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM tasks WHERE instructions IS NOT NULL AND TRIM(instructions)<>'';
+INSERT INTO legacy_archive (entity,entity_id,field,content,source_updated_at,archived_at)
+  SELECT 'approval',id,'content',content,decided_at,strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM approvals WHERE content IS NOT NULL AND TRIM(content)<>'';
+-- Seed reference data (projects/campaigns/channels). No lead is placed in any campaign here: that needs evidence.
+INSERT INTO projects (key,name,created_at) VALUES ('conextek','ConexTek',strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+INSERT INTO channels (key,name) VALUES ('email','Email'),('linkedin','LinkedIn'),('x','X');
+INSERT INTO campaigns (project_id,key,name,status,created_at,updated_at)
+  SELECT p.id,c.k,c.n,'draft',strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM projects p,
+  (SELECT 'us_car_dealers' AS k,'US Car Dealers' AS n UNION ALL SELECT 'gulf_car_dealers','Gulf Car Dealers' UNION ALL SELECT 'canton_fair','Canton Fair') c WHERE p.key='conextek';
+UPDATE users SET permissions = json_insert(permissions,'$[#]','campaigns.manage')
+  WHERE role='chief' AND permissions NOT LIKE '%campaigns.manage%';
+`,
 ];

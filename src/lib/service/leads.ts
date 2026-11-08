@@ -72,6 +72,7 @@ const createSchema = z.object({
   stage: z.string().optional(),
   contacts: z.array(contactSchema).optional(),
   allow_duplicate: optBool.optional(),
+  campaign_id: optInt.optional(),
   is_test: optBool.optional(),
   lead_date: z.unknown().optional(),
 });
@@ -121,6 +122,13 @@ export async function createLead(actor: Actor, input: unknown, isDemo = false, o
   if (!ownerId && !isManager(actor)) ownerId = actor.id;
   if (!isDemo) await assertAssignable(ownerId);
 
+  let campaignId: number | null = null;
+  if (d.campaign_id) {
+    const camp = await one("SELECT id,status,name FROM campaigns WHERE id=?", [d.campaign_id]);
+    if (!camp) throw new HttpError(400, "campaign_id: unknown campaign.");
+    if (camp.status === "closed") throw new HttpError(400, `campaign_id: "${camp.name}" is closed.`);
+    campaignId = camp.id as number;
+  }
   const isTest = isDemo || !!d.is_test; // test records are labelled and never counted in reports
   if (!isDemo && !isTest && !d.allow_duplicate) {
     const dups = await findDuplicates({ company: d.company, website: d.website, emails: d.contacts?.map((c) => c.email ?? "") });
@@ -149,7 +157,9 @@ export async function createLead(actor: Actor, input: unknown, isDemo = false, o
       [r.id, c.name, c.role, c.email, c.phone, c.linkedin, c.other_social, c.notes, i === 0 ? 1 : 0, t, t],
     );
   }
-  await audit(actor, "create_lead", "lead", r.id, { company: d.company, owner_id: ownerId, ...(isTest ? { test: true } : {}), ...(ld.at ? { lead_date: ld.at, precision: ld.precision } : { lead_date: "unknown" }) });
+  if (campaignId)
+    await run("INSERT INTO lead_campaigns (lead_id,campaign_id,status,is_original,added_by,joined_at) VALUES (?,?,'active',1,?,?)", [r.id, campaignId, actor.id, t]);
+  await audit(actor, "create_lead", "lead", r.id, { company: d.company, ...(campaignId ? { campaign_id: campaignId } : {}), owner_id: ownerId, ...(isTest ? { test: true } : {}), ...(ld.at ? { lead_date: ld.at, precision: ld.precision } : { lead_date: "unknown" }) });
   return r.id;
 }
 

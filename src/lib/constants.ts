@@ -88,6 +88,7 @@ export const PERMISSIONS = {
   "reports.view": "View reports and the dashboard for the whole team",
   "reports.export": "Export reports to CSV",
   "keys.manage": "Issue and revoke API keys for employees (never for the Owner or other Chiefs)",
+  "campaigns.manage": "Create and edit campaigns, enrol and transfer leads between campaigns",
   "history.import": "Import historical records and correct original lead dates (Owner only unless granted)",
 } as const;
 export type Permission = keyof typeof PERMISSIONS;
@@ -101,7 +102,7 @@ export const PRESETS: Record<string, { label: string; role: Role; perms: Permiss
     perms: [
       "leads.view_all", "leads.create", "leads.edit", "leads.stage", "leads.import", "leads.export",
       "activity.record", "tasks.create_own", "tasks.assign", "tasks.view_all",
-      "approvals.submit", "approvals.decide", "reports.view", "reports.export", "keys.manage",
+      "approvals.submit", "approvals.decide", "reports.view", "reports.export", "keys.manage", "campaigns.manage",
     ],
   },
   researcher: {
