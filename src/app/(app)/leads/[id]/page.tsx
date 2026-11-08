@@ -2,7 +2,9 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { requireUser, can, isManager } from "@/lib/auth";
 import { getLead } from "@/lib/service/leads";
-import { leadCampaigns } from "@/lib/service/campaigns";
+import { leadCampaigns, listCampaigns } from "@/lib/service/campaigns";
+import { leadOperations } from "@/lib/service/schedule";
+import { enrolLeadAction } from "@/app/actions";
 import { getLists } from "@/lib/service/lists";
 import { assignableUsers } from "@/lib/service/users";
 import {
@@ -28,7 +30,8 @@ export default async function LeadPage({ params, searchParams }: { params: Promi
   let data;
   try { data = await getLead(me, leadId); } catch { notFound(); }
   const { lead, contacts, history, tasks } = data;
-  const [lists, users, camps] = await Promise.all([getLists(true), assignableUsers(), leadCampaigns(leadId)]);
+  const [lists, users, camps, ops, allCamps] = await Promise.all([getLists(true), assignableUsers(), leadCampaigns(leadId), leadOperations(me, leadId), listCampaigns()]);
+  const activeCamp = camps.filter((c) => c.status === "active");
   const lab = (kind: string) => Object.fromEntries(lists[kind].map((i) => [i.key, i.label]));
   const stageLab = lab("stage");
   const flag = Object.fromEntries(lists.stage.map((i) => [i.key, i.flag]));
@@ -133,6 +136,34 @@ export default async function LeadPage({ params, searchParams }: { params: Promi
           </form>
         )}
       </Card>
+
+      <Card title="Where this lead stands">
+        <dl className="grid gap-x-6 gap-y-3 text-sm md:grid-cols-4">
+          <div><dt className="text-xs font-medium uppercase tracking-wide text-slate-500">Campaign</dt><dd>{activeCamp.length ? activeCamp.map((c) => `${c.project} · ${c.campaign}`).join(", ") : <span className="text-amber-700">not assigned</span>}</dd></div>
+          <div><dt className="text-xs font-medium uppercase tracking-wide text-slate-500">Last communication</dt><dd>{ops.last_communication ? <>{ops.last_communication.type === "reply" ? "Reply" : MESSAGE_KIND_LABEL[ops.last_communication.message_kind as string] ?? "Message"} · {fmtEvent(ops.last_communication.occurred_at as string, ops.last_communication.occurred_precision as string)}</> : "None recorded"}</dd></div>
+          <div><dt className="text-xs font-medium uppercase tracking-wide text-slate-500">Next action</dt><dd>{ops.next_task ? <><Link href={`/tasks/${ops.next_task.id}`}>{ops.next_task.title as string}</Link><div className="text-xs text-slate-500">{ops.next_task.employee as string} · {ops.next_task.at ? fmtDateTime(ops.next_task.at as string) : "no date"}{ops.next_task.channel ? ` · ${ops.next_task.channel}` : ""}</div></> : lead.next_action ? <span className="text-slate-600">{lead.next_action} <span className="text-xs text-slate-400">(legacy note)</span></span> : <span className="text-amber-700">nothing planned</span>}</dd></div>
+          <div><dt className="text-xs font-medium uppercase tracking-wide text-slate-500">Preparation · approval</dt><dd>{ops.next_task?.prep_status ? String(ops.next_task.prep_status).replace(/_/g, " ") : "not set"}<div className="text-xs text-slate-500">{ops.active_send_authorizations ? `${ops.active_send_authorizations} active send authorization` : "no send authorization"}</div></dd></div>
+        </dl>
+        {(ops.restrictions.length > 0 || ops.crm_pending_sends > 0 || ops.next_task?.blockers) && (
+          <div className="mt-3 space-y-1 text-sm">
+            {ops.restrictions.map((r) => <div key={String(r.name)} className="rounded border border-red-200 bg-red-50 px-2 py-1 text-red-800">{String(r.name)}: {r.email_status === "opted_out" ? "OPTED OUT — do not contact" : "address bounced"}</div>)}
+            {ops.crm_pending_sends > 0 && <div className="rounded border border-amber-300 bg-amber-50 px-2 py-1 text-amber-900">SENT_CONFIRMED_CRM_PENDING: a message was sent but its CRM record is missing. Do not resend; reconcile it.</div>}
+            {ops.next_task?.blockers ? <div className="rounded border border-amber-200 bg-amber-50 px-2 py-1 text-amber-900">Blocker: {String(ops.next_task.blockers)}</div> : null}
+          </div>
+        )}
+        {camps.length > 0 && <p className="mt-3 text-xs text-slate-500">Campaign history: {camps.map((c) => `${c.campaign} (${c.status}${c.is_original ? ", original source" : ""}, since ${fmtDate(c.joined_at as string)})`).join(" → ")}</p>}
+        {can(me, "campaigns.manage") && !lead.historical_only && (
+          <form action={enrolLeadAction} className="mt-3 flex flex-wrap items-end gap-2 border-t border-slate-100 pt-3">
+            <input type="hidden" name="lead_id" value={leadId} /><input type="hidden" name="_back" value={back} />
+            <div><label className="label">{activeCamp.length ? "Move to campaign" : "Add to campaign"}</label>
+              <select name="campaign_id" className="input">{allCamps.filter((c) => c.status !== "closed" && !activeCamp.some((a) => a.campaign_id === c.id)).map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}</select></div>
+            {activeCamp.length === 1 && <input type="hidden" name="transfer_from_campaign_id" value={activeCamp[0].campaign_id as number} />}
+            <div><label className="label">Note</label><input name="note" className="input w-56" placeholder="why" /></div>
+            <button className="btn btn-sm">{activeCamp.length ? "Transfer (history kept)" : "Add"}</button>
+          </form>
+        )}
+      </Card>
+
 
       {/* ---- Contacts ---- */}
       <Card title={`Contacts (${contacts.length})`}>

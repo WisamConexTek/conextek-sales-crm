@@ -8,6 +8,7 @@ import * as Users from "@/lib/service/users";
 import * as Lists from "@/lib/service/lists";
 import * as Leads from "@/lib/service/leads";
 import * as Tasks from "@/lib/service/tasks";
+import * as Campaigns from "@/lib/service/campaigns";
 import { recordActivity } from "@/lib/service/activities";
 import { prepareImport, commitImport } from "@/lib/service/csv";
 import { correctLeadDates, type DateFixRow } from "@/lib/service/history";
@@ -295,4 +296,21 @@ export async function removeDemoAction(fd: FD) {
   if (s(fd, "confirm").trim().toUpperCase() !== "DELETE") redirect(join(safeBack(fd), "err=" + encodeURIComponent("Type DELETE to confirm — removing test data is permanent.")));
   const a = await requireUser();
   await guard(fd, async () => { await removeDemo(a); return "Demo data removed."; }, "/settings");
+}
+
+export async function createCampaignAction(fd: FD) {
+  const a = await requireUser();
+  await guard(fd, async () => { await Campaigns.createCampaign(a, obj(fd)); return "Campaign created."; }, "/campaigns");
+}
+export async function setCampaignStatusAction(fd: FD) {
+  const a = await requireUser();
+  await guard(fd, async () => { await Campaigns.updateCampaign(a, n(fd, "id"), { status: s(fd, "status") }); return "Campaign updated."; }, "/campaigns");
+}
+export async function enrolLeadAction(fd: FD) {
+  const a = await requireUser();
+  await guard(fd, async () => {
+    const from = s(fd, "transfer_from_campaign_id");
+    const r = await Campaigns.enrolLead(a, n(fd, "lead_id"), { campaign_id: n(fd, "campaign_id"), ...(from ? { transfer_from_campaign_id: Number(from) } : {}), note: s(fd, "note") });
+    return r.changed ? (from ? "Lead transferred. History kept." : "Lead added to the campaign.") : "Already in that campaign.";
+  }, "/campaigns");
 }

@@ -21,9 +21,11 @@ export default async function AppLayout({ children }: { children: React.ReactNod
     { href: "/", label: "Dashboard" },
     { href: "/leads", label: "Leads" },
     { href: "/my-work", label: "My Work", badge: mine },
+    { href: "/schedule", label: "Today & Tomorrow" },
     { href: "/approvals", label: "Approvals", badge: toDecide },
     { href: "/reports", label: can(me, "reports.view") || isManager(me) ? "Reports" : "My numbers" },
   ];
+  if (can(me, "campaigns.manage") || can(me, "reports.view") || isManager(me)) items.push({ href: "/campaigns", label: "Campaigns" });
   if (isManager(me)) items.push({ href: "/settings", label: "Settings & Permissions" });
   if (can(me, "history.import")) items.push({ href: "/settings/history", label: "Historical data" });
   items.push({ href: "/api-docs", label: "API guide" });

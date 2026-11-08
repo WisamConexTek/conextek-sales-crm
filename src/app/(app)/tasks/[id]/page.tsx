@@ -1,11 +1,13 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { requireUser } from "@/lib/auth";
+import { requireUser, can, isManager } from "@/lib/auth";
+import { listChannels, listCampaigns, PREP_STATUSES } from "@/lib/service/campaigns";
+import { updateTaskAction } from "@/app/actions";
 import { getTaskDetail, type TaskDetail } from "@/lib/service/tasks";
 import { getLists } from "@/lib/service/lists";
 import { Badge, Card, DemoBadge, LeadLink, StatusBadge } from "@/components/ui";
 import { Ref } from "@/components/Ref";
-import { fmtDateTime } from "@/lib/format";
+import { fmtDateTime, toLocalInput } from "@/lib/format";
 
 const EVENT: Record<string, { label: string; tone: "gray" | "blue" | "green" | "amber" | "red" | "purple" }> = {
   task_created: { label: "Task created", tone: "gray" },
@@ -26,6 +28,9 @@ export default async function TaskPage({ params }: { params: Promise<{ id: strin
   let t: TaskDetail;
   try { t = await getTaskDetail(me, taskId); } catch { notFound(); }
   const lists = await getLists(true);
+  const [channels, camps] = await Promise.all([listChannels(), listCampaigns()]);
+  const manage = can(me, "tasks.assign") || isManager(me);
+  const open = !["completed", "cancelled"].includes(t.status);
   const typeLab = Object.fromEntries(lists.task_type.map((i) => [i.key, i.label]));
   const progress = t.notes.filter((n) => n.kind === "progress");
 
@@ -53,6 +58,31 @@ export default async function TaskPage({ params }: { params: Promise<{ id: strin
         {t.instructions && <div className="mt-4 rounded-md bg-slate-50 p-3 text-sm whitespace-pre-wrap"><div className="mb-1 text-xs font-medium uppercase tracking-wide text-slate-500">Instructions</div>{t.instructions}</div>}
         {t.change_request && t.status === "changes_requested" && <div className="mt-3 rounded-md border border-red-200 bg-red-50 p-3 text-sm whitespace-pre-wrap"><div className="mb-1 text-xs font-medium uppercase tracking-wide text-red-700">Changes requested</div>{t.change_request}</div>}
         {t.completion_note && <div className="mt-3 rounded-md border border-emerald-200 bg-emerald-50 p-3 text-sm whitespace-pre-wrap"><div className="mb-1 text-xs font-medium uppercase tracking-wide text-emerald-800">Completion note</div>{t.completion_note}</div>}
+      </Card>
+
+      <Card title="Planning">
+        <dl className="grid gap-x-6 gap-y-3 text-sm md:grid-cols-4">
+          <div><dt className="text-xs font-medium uppercase tracking-wide text-slate-500">Scheduled (Asia/Hebron)</dt><dd>{t.scheduled_at ? fmtDateTime(t.scheduled_at) : "—"}{t.scheduled_input ? <div className="text-xs text-slate-400">entered as {t.scheduled_input}</div> : null}</dd></div>
+          <div><dt className="text-xs font-medium uppercase tracking-wide text-slate-500">Campaign</dt><dd>{camps.find((c) => c.id === t.campaign_id)?.name ?? "—"}</dd></div>
+          <div><dt className="text-xs font-medium uppercase tracking-wide text-slate-500">Channel · action</dt><dd>{t.channel ?? "—"}{t.action_type ? ` · ${t.action_type}` : ""}</dd></div>
+          <div><dt className="text-xs font-medium uppercase tracking-wide text-slate-500">Preparation</dt><dd>{t.prep_status ? String(t.prep_status).replace(/_/g, " ") : "not set"}{t.blockers ? <div className="text-xs text-amber-700">Blocker: {t.blockers}</div> : null}</dd></div>
+        </dl>
+        {open && (
+          <form action={updateTaskAction} className="mt-3 flex flex-wrap items-end gap-2 border-t border-slate-100 pt-3">
+            <input type="hidden" name="id" value={t.id} /><input type="hidden" name="_back" value={`/tasks/${t.id}`} />
+            {manage && <>
+              <div><label className="label">Scheduled time</label><input type="datetime-local" name="scheduled_at" defaultValue={toLocalInput(t.scheduled_at)} className="input" /></div>
+              <div><label className="label">Due</label><input type="datetime-local" name="due_at" defaultValue={toLocalInput(t.due_at)} className="input" /></div>
+              <div><label className="label">Campaign</label><select name="campaign_id" defaultValue={t.campaign_id ?? ""} className="input"><option value="">—</option>{camps.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}</select></div>
+              <div><label className="label">Channel</label><select name="channel" defaultValue={t.channel ?? ""} className="input"><option value="">—</option>{channels.map((c) => <option key={c.key} value={c.key}>{c.name}</option>)}</select></div>
+              <div><label className="label">Action</label><input name="action_type" defaultValue={t.action_type ?? ""} className="input w-40" placeholder="send_first_email" /></div>
+            </>}
+            <div><label className="label">Preparation</label><select name="prep_status" defaultValue={t.prep_status ?? ""} className="input"><option value="">not set</option>{PREP_STATUSES.map((p) => <option key={p} value={p}>{p.replace(/_/g, " ")}</option>)}</select></div>
+            <div><label className="label">Blockers</label><input name="blockers" defaultValue={t.blockers ?? ""} className="input w-64" /></div>
+            <button className="btn btn-sm btn-primary">Save planning</button>
+          </form>
+        )}
+        <p className="mt-2 text-xs text-slate-400">Times are entered and shown in Asia/Hebron. “Ready for authorized execution” is a preparation state, not permission to contact.</p>
       </Card>
 
       <Card title={`Progress notes (${progress.length})`}>

@@ -171,6 +171,11 @@ GET   /api/v1/campaigns/unassigned          campaigns.manage: real leads with no
 GET   /api/v1/leads/{id}/campaigns          membership history (status active|transferred|removed, is_original, transferred_from)
 POST  /api/v1/leads/{id}/campaigns          campaigns.manage: {"campaign_id":2,"note":"…","transfer_from_campaign_id":1?}
 DELETE /api/v1/leads/{id}/campaigns?campaign_id=2
+GET   /api/v1/schedule?view=today|tomorrow | date=YYYY-MM-DD | from=&to=   filters: employee, project, campaign, channel, state=overdue|blocked|ready|planned|completed
+        → {timezone:"Asia/Hebron", counts, rows[]}; each row: employee, project, campaign, lead, contact, channel, action_type, at (instant), at_source (scheduled_at|due_at), prep_status, blockers, state, is_overdue
+        Days run midnight-to-midnight in Asia/Hebron (including the 24 Oct clock change). Employees see only their own work.
+GET   /api/v1/campaigns/report[?campaign_id=]   managers: unique leads, preparation backlog, approved scheduled, first emails, follow-ups, replies, positive replies, meetings, won/lost,
+        rates as {numerator, denominator, value}, plus "rules" explaining attribution and denominators
 POST  /api/v1/leads                         accepts "campaign_id": the new lead is linked to it as its original source`}</Code>
         <ul className="mb-2 list-disc space-y-1 pl-5 text-sm text-slate-700">
           <li><b>Idempotent:</b> enrolling a lead already active in that campaign returns <code>changed:false</code>.</li>

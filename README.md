@@ -60,3 +60,6 @@ Passwords are bcrypt-hashed; API keys are stored hashed (shown once); sessions a
 
 ## Campaign foundations (migration 5, additive)
 Projects, campaigns, channels, lead↔campaign membership history, structured task planning fields (`scheduled_at`, `channel`, `action_type`, `prep_status`, `blockers`, `campaign_id`) and a read-only `legacy_archive` of notes/instructions. Nothing existing is changed; no lead is placed in a campaign without evidence (see `GET /api/v1/campaigns/unassigned`). Before touching production: `npx tsx scripts/baseline.ts --out data/baselines/before.json`, back up, test the restore with `scripts/restore-test.ts`, deploy, then `scripts/baseline.ts --compare data/baselines/before.json` must print RECONCILED. Details in `/api-docs#campaigns`.
+
+### Phase 3 views
+`/schedule` (Today & Tomorrow, filters, overdue/blocked/ready/planned/completed), `/campaigns` (report cards, status, review queue), lead page "Where this lead stands" panel with campaign transfer, task "Planning" card. Arabic/mixed text aligns per paragraph (`unicode-bidi: plaintext`). Report definitions: `GET /api/v1/campaigns/report` → `rules`.

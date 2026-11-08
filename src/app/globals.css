@@ -33,3 +33,7 @@ textarea.input { @apply min-h-20; }
 .card { @apply rounded-lg border border-slate-200 bg-white shadow-sm; }
 .th { @apply px-3 py-2 text-left text-xs font-semibold uppercase tracking-wide text-slate-500; }
 .td { @apply px-3 py-2 align-top; }
+
+/* Arabic / mixed Arabic-English text: each text block picks its own direction and aligns accordingly. */
+input:not([type=checkbox]):not([type=radio]):not([type=date]):not([type=datetime-local]), textarea, .card p, .card td, .card li, .card dd, h1, h2, h3, .whitespace-pre-wrap { unicode-bidi: plaintext; text-align: start; }
+html[dir=rtl] body { direction: rtl; }
