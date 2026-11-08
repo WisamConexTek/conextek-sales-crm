@@ -298,10 +298,10 @@ export async function getDashboard(actor: Actor, opts: { from?: string; to?: str
 
   const overdueArgs: InValue[] = [now(), ...(employee ? [employee] : [])];
   const overdueTasks = await all(
-    `SELECT t.id,t.title,t.due_at,t.status,t.lead_id,l.company,u.name AS assignee_name FROM tasks t
+    `SELECT t.id,t.title,t.due_at,t.status,t.lead_id,t.task_type,l.company,u.name AS assignee_name FROM tasks t
      JOIN users u ON u.id=t.assignee_id LEFT JOIN leads l ON l.id=t.lead_id
      WHERE t.is_demo=0 AND t.due_at < ? AND t.status IN ('todo','in_progress','changes_requested','approved')${employee ? " AND t.assignee_id=?" : ""}
-     ORDER BY t.due_at ASC LIMIT 10`,
+     ORDER BY t.due_at ASC LIMIT 8`,
     overdueArgs,
   );
   const overdueCount = Number(
@@ -315,7 +315,7 @@ export async function getDashboard(actor: Actor, opts: { from?: string; to?: str
   const pending = { chief: 0, wisam: 0 };
   for (const p of pend) pending[p.requires as "chief" | "wisam"] = Number(p.n);
   const pendingList = await all(
-    `SELECT a.id,a.title,a.requires,a.created_at,l.company,u.name AS submitted_by_name FROM approvals a
+    `SELECT a.id,a.title,a.kind,a.lead_id,a.requires,a.created_at,l.company,u.name AS submitted_by_name FROM approvals a
      JOIN users u ON u.id=a.submitted_by LEFT JOIN leads l ON l.id=a.lead_id
      WHERE a.is_demo=0 AND a.status='pending'${employee ? " AND a.submitted_by=?" : ""} ORDER BY a.created_at ASC LIMIT 8`,
     employee ? [employee] : [],
@@ -328,7 +328,66 @@ export async function getDashboard(actor: Actor, opts: { from?: string; to?: str
     [fromISO, toISO, ...ea1],
   );
 
+  // ---- "needs attention" data: everything below is live (as of now), not tied to the selected period ----
+  const OPEN = "('todo','in_progress','changes_requested','approved')";
+  const empT = employee ? " AND t.assignee_id=?" : "";
+  const empA: InValue[] = employee ? [employee] : [];
+  const nowISO = now();
+  const d0 = localMidnight(todayYmd()).toISOString();
+  const d1 = localMidnight(addDays(todayYmd(), 1)).toISOString();
+  const d2 = localMidnight(addDays(todayYmd(), 2)).toISOString();
+  const week = new Date(Date.now() - 7 * 86400000).toISOString();
+  const one_ = async (sql: string, a: InValue[]) => Number((await one(sql, a))!.n);
+  const dueToday = await one_(`SELECT COUNT(*) AS n FROM tasks t WHERE t.is_demo=0 AND t.due_at>=? AND t.due_at<? AND t.status IN ${OPEN}${empT}`, [d0, d1, ...empA]);
+  const dueTomorrow = await one_(`SELECT COUNT(*) AS n FROM tasks t WHERE t.is_demo=0 AND t.due_at>=? AND t.due_at<? AND t.status IN ${OPEN}${empT}`, [d1, d2, ...empA]);
+  const overdueOld = await one_(`SELECT COUNT(*) AS n FROM tasks t WHERE t.is_demo=0 AND t.due_at<? AND t.status IN ${OPEN}${empT}`, [week, ...empA]);
+  const noDueDate = await one_(`SELECT COUNT(*) AS n FROM tasks t WHERE t.is_demo=0 AND t.due_at IS NULL AND t.status IN ${OPEN}${empT}`, [...empA]);
+  const overdueByPerson = await all(
+    `SELECT u.id,u.name,COUNT(*) AS n,MIN(t.due_at) AS oldest FROM tasks t JOIN users u ON u.id=t.assignee_id
+     WHERE t.is_demo=0 AND t.due_at<? AND t.status IN ${OPEN}${empT} GROUP BY u.id,u.name ORDER BY n DESC LIMIT 6`, [nowISO, ...empA]);
+  const approvalAges = await all(`SELECT a.requires, MIN(a.created_at) AS oldest FROM approvals a WHERE a.is_demo=0 AND a.status='pending'${employee ? " AND a.submitted_by=?" : ""} GROUP BY a.requires`, empA);
+  const oldestApproval: Record<string, string> = Object.fromEntries(approvalAges.map((r) => [r.requires, r.oldest]));
+  const waitingOnApprovalTasks = await one_(`SELECT COUNT(*) AS n FROM tasks t WHERE t.is_demo=0 AND t.status='waiting_approval'${empT}`, [...empA]);
+
+  // Replies nobody has answered yet (latest reply is newer than our latest outbound message), still-open leads, last 30 days.
+  const scL = leadScope(actor);
+  const since30 = new Date(Date.now() - 30 * 86400000).toISOString();
+  const unanswered = await all(
+    `SELECT l.id,l.company,l.stage,r.at AS reply_at FROM leads l
+     JOIN (SELECT lead_id, MAX(occurred_at) AS at FROM activities WHERE type='reply' AND is_demo=0 AND occurred_precision<>'unknown' GROUP BY lead_id) r ON r.lead_id=l.id
+     WHERE l.is_demo=0 AND l.historical_only=0 AND r.at>=? AND ${scL.sql}${employee ? " AND l.owner_id=?" : ""}
+       AND NOT EXISTS (SELECT 1 FROM activities m WHERE m.lead_id=l.id AND m.type='message' AND m.occurred_at>r.at)
+       AND NOT EXISTS (SELECT 1 FROM lists s WHERE s.kind='stage' AND s.key=l.stage AND s.flag IN ('won','lost','closed','meeting'))
+       AND NOT EXISTS (SELECT 1 FROM contacts c WHERE c.lead_id=l.id AND c.email_status='opted_out')
+     ORDER BY r.at ASC LIMIT 8`, [since30, ...scL.args, ...(employee ? [employee] : [])]);
+
+  // Open leads with nothing planned: no open task and no activity for 7+ days.
+  const stale = await all(
+    `SELECT l.id,l.company,l.stage,COALESCE(l.last_activity_at,l.created_at) AS last_at,u.name AS owner_name FROM leads l LEFT JOIN users u ON u.id=l.owner_id
+     WHERE l.is_demo=0 AND l.historical_only=0 AND ${scL.sql}${employee ? " AND l.owner_id=?" : ""}
+       AND COALESCE(l.last_activity_at,l.created_at)<?
+       AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.lead_id=l.id AND t.status IN ${OPEN.replace(")", ",'waiting_approval')")})
+       AND NOT EXISTS (SELECT 1 FROM lists s WHERE s.kind='stage' AND s.key=l.stage AND s.flag IN ('won','lost','closed'))
+       AND NOT EXISTS (SELECT 1 FROM contacts c WHERE c.lead_id=l.id AND c.email_status IN ('opted_out','bounced') AND NOT EXISTS (SELECT 1 FROM contacts c2 WHERE c2.lead_id=l.id AND c2.email_status NOT IN ('opted_out','bounced')))
+     ORDER BY last_at ASC LIMIT 8`, [...scL.args, ...(employee ? [employee] : []), week]);
+  const staleCount = await one_(
+    `SELECT COUNT(*) AS n FROM leads l WHERE l.is_demo=0 AND l.historical_only=0 AND ${scL.sql}${employee ? " AND l.owner_id=?" : ""}
+       AND COALESCE(l.last_activity_at,l.created_at)<?
+       AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.lead_id=l.id AND t.status IN ${OPEN.replace(")", ",'waiting_approval')")})
+       AND NOT EXISTS (SELECT 1 FROM lists s WHERE s.kind='stage' AND s.key=l.stage AND s.flag IN ('won','lost','closed'))`, [...scL.args, ...(employee ? [employee] : []), week]);
+
+  // Team workload (managers see everyone; employees see themselves).
+  const workload = await all(
+    `SELECT u.id,u.name,
+       SUM(CASE WHEN t.status IN ${OPEN} THEN 1 ELSE 0 END) AS open_n,
+       SUM(CASE WHEN t.status IN ${OPEN} AND t.due_at<? THEN 1 ELSE 0 END) AS overdue_n,
+       SUM(CASE WHEN t.status IN ${OPEN} AND t.due_at>=? AND t.due_at<? THEN 1 ELSE 0 END) AS today_n,
+       SUM(CASE WHEN t.status='waiting_approval' THEN 1 ELSE 0 END) AS waiting_n
+     FROM tasks t JOIN users u ON u.id=t.assignee_id WHERE t.is_demo=0 AND t.status NOT IN ('completed','cancelled')${empT}
+     GROUP BY u.id,u.name ORDER BY overdue_n DESC, open_n DESC`, [nowISO, d0, d1, ...empA]);
+
   return {
+    attention: { dueToday, dueTomorrow, overdueOld, noDueDate, overdueByPerson, oldestApproval, waitingOnApprovalTasks, unanswered, stale, staleCount, workload: workload.map((w) => ({ id: w.id, name: w.name, open: Number(w.open_n), overdue: Number(w.overdue_n), today: Number(w.today_n), waiting: Number(w.waiting_n) })) },
     from, to, today, all: allTime, unknownCounts: await unknownDateCounts(employee), employee: employee ?? null, m, counts: c, replies, byStage, overdueTasks, overdueCount,
     pending, pendingList, feed,
     firstBounceRate: rate(m.first_email_bounces, m.first_emails),

@@ -160,6 +160,11 @@ async function main() {
   const real2 = (await R.getReport(owner, { granularity: "day" })).totals;
   ok(JSON.stringify(real1) === JSON.stringify(real2), "test lead, task and work are not counted in report totals");
   ok((await R.getDashboard(owner, {})).pending.chief === 0, "test approvals are not counted on the dashboard");
+  { const at = (await R.getDashboard(owner, { all: true })).attention;
+    ok(Array.isArray(at.unanswered) && Array.isArray(at.stale) && Array.isArray(at.workload) && typeof at.dueToday === "number" && typeof at.staleCount === "number", "dashboard 'needs attention' data loads (replies unanswered, quiet leads, workload)");
+    const sara = await one("SELECT id FROM users WHERE username='sara'");
+    const own = (await R.getDashboard(owner, { employee: sara!.id })).attention;
+    ok(own.workload.every((w) => w.id === sara!.id), "dashboard workload honours the employee filter"); }
   await throws(() => T.createTask(chief, { title: "x", lead_id: lid, assignee_id: omar.id, is_test: true }), 400, "cannot create a test task on a real lead");
   await throws(() => L.setLeadTest(omar, lid, true), 403, "employee cannot flag test data");
   await L.setLeadTest(chief, lid, true);

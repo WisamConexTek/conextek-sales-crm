@@ -8,6 +8,8 @@ import { fmtShort, pct } from "@/lib/format";
 import { MESSAGE_KIND_LABEL, ACTIVITY_TYPE_LABEL } from "@/lib/constants";
 import { q, sget, snum, type SP, stageMeta } from "@/lib/view";
 
+const ago = (iso: string | null | undefined) => { if (!iso) return "—"; const h = (Date.now() - new Date(iso).getTime()) / 3600000; return h < 1 ? "under 1h" : h < 48 ? `${Math.floor(h)}h` : `${Math.floor(h / 24)}d`; };
+
 export default async function Dashboard({ searchParams }: { searchParams: SP }) {
   const me = await requireUser();
   const sp = await searchParams;
@@ -63,10 +65,43 @@ export default async function Dashboard({ searchParams }: { searchParams: SP }) 
         <Stat label="New replies" value={d.m.replies} href="/reports" tone={d.m.replies ? "green" : undefined} sub={`${d.m.meetings} meetings · ${d.m.won} won · ${d.m.lost} lost`} />
         <Stat label="First-email bounce rate" value={pct(d.firstBounceRate)} tone={d.firstBounceRate != null && d.firstBounceRate > 0.05 ? "red" : undefined}
           sub={`${d.m.first_email_bounces} of ${d.m.first_emails} first emails · follow-ups: ${pct(d.followBounceRate)} (${d.m.follow_up_bounces}/${d.m.follow_ups})`} />
-        <Stat label="Overdue tasks" value={d.overdueCount} tone={d.overdueCount ? "red" : undefined} href="/my-work" sub="as of now" />
+        <Stat label="Overdue tasks" value={d.overdueCount} tone={d.overdueCount ? "red" : undefined} href="/my-work"
+          sub={d.overdueCount ? `${d.attention.overdueOld} overdue 7+ days · oldest ${ago(d.overdueTasks[0]?.due_at)} · ${d.attention.dueToday} due today` : `${d.attention.dueToday} due today · ${d.attention.dueTomorrow} tomorrow`} />
         <Stat label="Approvals waiting" value={d.pending.chief + d.pending.wisam} href="/approvals" tone={d.pending.chief + d.pending.wisam ? "amber" : undefined}
-          sub={`${d.pending.chief} on Chief · ${d.pending.wisam} on Wisam`} />
+          sub={`${d.pending.chief} on Chief · ${d.pending.wisam} on Wisam${d.pending.chief + d.pending.wisam ? ` · oldest waiting ${ago([d.attention.oldestApproval.chief, d.attention.oldestApproval.wisam].filter(Boolean).sort()[0])}` : ""}`} />
       </div>
+
+      <Card title="Needs attention now" className="mb-5" right={<span className="text-xs text-slate-500">live · not limited to the date range</span>}>
+        <div className="grid gap-5 md:grid-cols-3">
+          <div>
+            <div className="mb-1 text-xs font-medium uppercase tracking-wide text-slate-500">Replies not answered yet ({d.attention.unanswered.length})</div>
+            {d.attention.unanswered.length === 0 ? <Empty>Every reply from the last 30 days has a response.</Empty> : (
+              <ul className="divide-y divide-slate-100">{d.attention.unanswered.map((l) => (
+                <li key={l.id} className="flex justify-between gap-2 py-1.5 text-sm"><LeadLink id={l.id} company={l.company} /><span className="shrink-0 text-xs text-red-600">waiting {ago(l.reply_at)}</span></li>
+              ))}</ul>
+            )}
+          </div>
+          <div>
+            <div className="mb-1 text-xs font-medium uppercase tracking-wide text-slate-500">Open leads with nothing planned ({d.attention.staleCount})</div>
+            {d.attention.stale.length === 0 ? <Empty>Every open lead has work planned or recent activity.</Empty> : (
+              <ul className="divide-y divide-slate-100">{d.attention.stale.map((l) => (
+                <li key={l.id} className="flex justify-between gap-2 py-1.5 text-sm"><LeadLink id={l.id} company={l.company} /><span className="shrink-0 text-xs text-slate-500">{l.owner_name ?? "no owner"} · quiet {ago(l.last_at)}</span></li>
+              ))}</ul>
+            )}
+            <p className="mt-1 text-xs text-slate-400">No open task and no activity for 7+ days; won, lost and closed leads excluded.</p>
+          </div>
+          <div>
+            <div className="mb-1 text-xs font-medium uppercase tracking-wide text-slate-500">Workload by person</div>
+            {d.attention.workload.length === 0 ? <Empty>No open tasks.</Empty> : (
+              <table className="w-full text-sm"><thead><tr className="text-left text-xs text-slate-500"><th className="font-normal">Who</th><th className="font-normal">Open</th><th className="font-normal">Overdue</th><th className="font-normal">Today</th><th className="font-normal">In approval</th></tr></thead>
+                <tbody>{d.attention.workload.map((w) => (
+                  <tr key={w.id}><td className="py-0.5">{w.name}</td><td>{w.open}</td><td className={w.overdue ? "font-medium text-red-600" : ""}>{w.overdue}</td><td>{w.today}</td><td>{w.waiting}</td></tr>
+                ))}</tbody></table>
+            )}
+            {d.attention.noDueDate > 0 && <p className="mt-1 text-xs text-amber-700">{d.attention.noDueDate} open task{d.attention.noDueDate === 1 ? " has" : "s have"} no due date, so they can never become overdue.</p>}
+          </div>
+        </div>
+      </Card>
 
       <div className="grid gap-5 lg:grid-cols-3">
         <Card title="Leads by stage" right={<Link href="/leads" className="text-xs">All leads →</Link>} className="lg:col-span-1">
@@ -90,8 +125,8 @@ export default async function Dashboard({ searchParams }: { searchParams: SP }) 
               {d.pendingList.map((a) => (
                 <li key={a.id} className="flex items-start justify-between gap-2 py-2">
                   <div className="min-w-0">
-                    <Link href="/approvals" className="block truncate font-medium">{a.title}</Link>
-                    <div className="text-xs text-slate-500">{a.company ?? "No lead"} · {a.submitted_by_name} · {fmtShort(a.created_at)}</div>
+                    <Link href={`/approvals?id=${a.id}`} className="block truncate font-medium">{a.title}</Link>
+                    <div className="text-xs text-slate-500">{a.company ?? "No lead"} · {a.kind} · from {a.submitted_by_name} · <span className={Date.now() - new Date(a.created_at).getTime() > 2 * 86400000 ? "text-red-600" : ""}>waiting {ago(a.created_at)}</span></div>
                   </div>
                   <Badge tone={a.requires === "wisam" ? "purple" : "amber"}>{a.requires === "wisam" ? "Wisam" : "Chief"}</Badge>
                 </li>
@@ -102,14 +137,17 @@ export default async function Dashboard({ searchParams }: { searchParams: SP }) 
 
         <Card title={`Overdue tasks (${d.overdueCount})`} right={<Link href="/my-work" className="text-xs">My Work →</Link>}>
           {d.overdueTasks.length === 0 ? <Empty>No overdue tasks.</Empty> : (
+            <>
+            {d.attention.overdueByPerson.length > 1 && <p className="mb-1 text-xs text-slate-500">{d.attention.overdueByPerson.map((p) => `${p.name}: ${p.n}`).join(" · ")}</p>}
             <ul className="divide-y divide-slate-100">
               {d.overdueTasks.map((t) => (
                 <li key={t.id} className="py-2">
-                  <div className="flex justify-between gap-2"><span className="font-medium">{t.title}</span><StatusBadge status={t.status} /></div>
-                  <div className="text-xs text-slate-500">{t.company ? <LeadLink id={t.lead_id} company={t.company} /> : "No lead"} · {t.assignee_name} · <span className="text-red-600">due {fmtShort(t.due_at)}</span></div>
+                  <div className="flex justify-between gap-2"><Link href={`/tasks/${t.id}`} className="font-medium">{t.title}</Link><StatusBadge status={t.status} /></div>
+                  <div className="text-xs text-slate-500">{t.company ? <LeadLink id={t.lead_id} company={t.company} /> : "No lead"} · {t.assignee_name} · <span className="text-red-600">{ago(t.due_at)} overdue (due {fmtShort(t.due_at)})</span></div>
                 </li>
               ))}
             </ul>
+            </>
           )}
         </Card>
 
