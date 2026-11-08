@@ -180,6 +180,43 @@ POST  /api/v1/leads                         accepts "campaign_id": the new lead 
         </ul>
       </Card>
 
+      <div id="sends" />
+      <Card title="Duplicate checks, versioned approvals and confirmed sends">
+        <P>
+          <b>The CRM never sends.</b> The browser email workflow sends; the CRM holds the exact text, the authorization, the evidence and the record. Chief&apos;s <b>editorial</b> approval and the Owner&apos;s <b>send</b> authorization are different records.
+        </P>
+        <Code>{`# 1. Duplicate / identity check (works for every employee, even without access to the matching lead)
+POST /api/v1/duplicates/check   {"company","website","emails":[],"phones":[],"profiles":[]}
+  → decision: duplicate (same email, or same domain AND name) | review (same domain only, same name only, phone, profile URL: never merged automatically) | clear
+  → matches[]: signals, campaigns, do_not_contact; lead_id/company/stage only if you may open that lead
+POST /api/v1/duplicates/reviews {"existing_lead_id":12,"proposed":{...}}      send an ambiguous match to Chief (once)
+GET  /api/v1/duplicates/reviews (Chief/Owner)    PATCH /api/v1/duplicates/reviews/{id} {"decision":"same|different","note"}
+
+# 2. Exact content: immutable versions per lead + recipient + channel + campaign
+POST /api/v1/messages/versions  {"lead_id","contact_id?","channel":"email","campaign_id","task_id?","subject","body"}
+  → {id, version}  Same text = same version. Any change = a NEW version, and every active authorization of older versions is voided.
+GET  /api/v1/messages/versions/{id}
+
+# 3. Authorizations (bound to ONE version, recipient, channel, campaign and action)
+POST /api/v1/authorizations     {"message_version_id","kind":"editorial|send","permitted_action":"first_email|follow_up|other","note"}
+  editorial: Chief/Owner (approvals.decide). send: Owner only.      DELETE /api/v1/authorizations/{id} revokes.
+
+# 4. Before sending: validate (authorization, suppression, campaign, history, recording capability)
+GET  /api/v1/sends/eligibility?message_version_id=7   → {eligible, reasons[], warnings[]}
+
+# 5. After the browser sent it: confirm (needs message.record_sent). event_id makes it idempotent.
+POST /api/v1/sends   {"event_id":"evt-2026-11-08-0001","message_version_id":7,"sent_at":"2026-11-08T10:00:00+02:00","evidence":"mailbox message-id <…>"}
+  → status RECORDED (activity saved, read back and verified, stage moved Ready→Contacted only; stronger stages untouched)
+  → or status SENT_CONFIRMED_CRM_PENDING + stop_further_sends:true if recording failed. NEVER resend to fix this:
+POST /api/v1/sends/{event_id}/reconcile     records the missing activity exactly once; safe to repeat
+GET  /api/v1/sends?status=SENT_CONFIRMED_CRM_PENDING`}</Code>
+        <ul className="mb-2 list-disc space-y-1 pl-5 text-sm text-slate-700">
+          <li><b>Blocked (409) with reasons:</b> no active Owner authorization for this exact version, a newer version exists, opted-out or bounced contact, historical-only lead, campaign not active, lead not an active member of that campaign (or active in several), a first email already sent on that channel in any campaign or date, a conflicting active authorization, or an unreconciled pending send for the lead.</li>
+          <li><b>Race-safe:</b> an authorization is consumed by one atomic claim; with several simultaneous workers exactly one send is recorded.</li>
+          <li>None of this needs <code>history.import</code>; it works with ordinary permissions.</li>
+        </ul>
+      </Card>
+
       <div id="history" />
       <Card title="Importing historical records (past leads, sends, replies, bounces)">
         <P>

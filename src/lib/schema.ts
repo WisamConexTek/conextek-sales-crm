@@ -363,4 +363,75 @@ INSERT INTO campaigns (project_id,key,name,status,created_at,updated_at)
 UPDATE users SET permissions = json_insert(permissions,'$[#]','campaigns.manage')
   WHERE role='chief' AND permissions NOT LIKE '%campaigns.manage%';
 `,
+  `
+-- Migration 6 (additive): immutable message versions, scoped authorizations, send events, duplicate reviews.
+CREATE TABLE message_versions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  lead_id INTEGER NOT NULL REFERENCES leads(id),
+  contact_id INTEGER REFERENCES contacts(id),
+  channel TEXT NOT NULL REFERENCES channels(key),
+  campaign_id INTEGER NOT NULL REFERENCES campaigns(id),
+  task_id INTEGER REFERENCES tasks(id),
+  version INTEGER NOT NULL,
+  subject TEXT,
+  body TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  created_by INTEGER NOT NULL REFERENCES users(id),
+  created_at TEXT NOT NULL
+);
+CREATE INDEX idx_mv_thread ON message_versions(lead_id, contact_id, channel, campaign_id, version);
+CREATE TRIGGER message_versions_no_update BEFORE UPDATE ON message_versions BEGIN SELECT RAISE(ABORT,'message versions are immutable: create a new version'); END;
+CREATE TRIGGER message_versions_no_delete BEFORE DELETE ON message_versions BEGIN SELECT RAISE(ABORT,'message versions are immutable'); END;
+-- An authorization names the exact version, recipient, channel, campaign and permitted action.
+-- editorial = Chief/editor review. send = the Owner's permission to send. They are different records.
+CREATE TABLE send_authorizations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  message_version_id INTEGER NOT NULL REFERENCES message_versions(id),
+  lead_id INTEGER NOT NULL,
+  contact_id INTEGER,
+  channel TEXT NOT NULL,
+  campaign_id INTEGER NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('editorial','send')),
+  permitted_action TEXT NOT NULL CHECK (permitted_action IN ('first_email','follow_up','other')),
+  approver_id INTEGER NOT NULL REFERENCES users(id),
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','revoked','used')),
+  note TEXT,
+  created_at TEXT NOT NULL,
+  used_at TEXT,
+  send_event_id INTEGER
+);
+CREATE INDEX idx_sa_version ON send_authorizations(message_version_id, kind, status);
+-- Durable evidence of a confirmed send. event_id makes the report idempotent. The CRM never sends anything.
+CREATE TABLE send_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id TEXT NOT NULL UNIQUE,
+  message_version_id INTEGER NOT NULL REFERENCES message_versions(id),
+  authorization_id INTEGER NOT NULL REFERENCES send_authorizations(id),
+  lead_id INTEGER NOT NULL,
+  contact_id INTEGER,
+  channel TEXT NOT NULL,
+  campaign_id INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('SENT_CONFIRMED_CRM_PENDING','RECORDED')),
+  sent_at TEXT NOT NULL,
+  evidence TEXT NOT NULL,
+  reported_by INTEGER NOT NULL REFERENCES users(id),
+  activity_id INTEGER,
+  last_error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+-- Ambiguous identity matches wait here for a Chief decision. Nothing is merged automatically.
+CREATE TABLE duplicate_reviews (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  existing_lead_id INTEGER NOT NULL REFERENCES leads(id),
+  proposed TEXT NOT NULL,
+  signals TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','same','different')),
+  requested_by INTEGER NOT NULL REFERENCES users(id),
+  decided_by INTEGER REFERENCES users(id),
+  decided_at TEXT,
+  note TEXT,
+  created_at TEXT NOT NULL
+);
+`,
 ];
