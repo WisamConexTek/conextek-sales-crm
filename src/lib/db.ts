@@ -31,7 +31,17 @@ async function migrate(c: Client): Promise<number> {
   let current = Number(r.rows[0].v);
   const from = current;
   while (current < MIGRATIONS.length) {
-    await c.executeMultiple(MIGRATIONS[current]);
+    try {
+      await c.executeMultiple(MIGRATIONS[current]);
+    } catch (e) {
+      // A migration that was interrupted part-way (not atomic on every backend) is finished statement by statement:
+      // "already exists" / "duplicate column" means that step is already done; anything else is a real failure.
+      if (!/already exists|duplicate column/i.test(String((e as Error).message))) throw e;
+      const stmts = MIGRATIONS[current].split("\n").filter((l) => !l.trim().startsWith("--")).join("\n").split(/;\s*(?:\n|$)/).map((x) => x.trim()).filter(Boolean);
+      for (const sql of stmts) {
+        try { await c.execute(sql); } catch (err) { if (!/already exists|duplicate column/i.test(String((err as Error).message))) throw err; }
+      }
+    }
     current++;
     await c.execute({ sql: "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)", args: [current, now()] });
   }

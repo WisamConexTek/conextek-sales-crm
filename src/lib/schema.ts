@@ -512,7 +512,7 @@ CREATE INDEX IF NOT EXISTS idx_leads_last_activity ON leads(last_activity_at);
 `,
   `
 -- Migration 12 (additive): sending mailboxes ("senders"), per-sender warm-up/caps, deliverability guard, spam complaints.
-CREATE TABLE senders (
+CREATE TABLE IF NOT EXISTS senders (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   email TEXT NOT NULL UNIQUE,
   display_name TEXT NOT NULL,
@@ -531,13 +531,13 @@ CREATE TABLE senders (
   updated_at TEXT NOT NULL
 );
 -- Warm-up schedule: from from_date (inclusive, Asia/Hebron day) the sender may send daily_cap per day. Before the first step the cap is 0.
-CREATE TABLE sender_warmup (
+CREATE TABLE IF NOT EXISTS sender_warmup (
   sender_id INTEGER NOT NULL REFERENCES senders(id),
   from_date TEXT NOT NULL,
   daily_cap INTEGER NOT NULL,
   PRIMARY KEY (sender_id, from_date)
 );
-CREATE TABLE sender_events (
+CREATE TABLE IF NOT EXISTS sender_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   sender_id INTEGER NOT NULL REFERENCES senders(id),
   action TEXT NOT NULL,
@@ -548,8 +548,8 @@ CREATE TABLE sender_events (
   detail TEXT,
   created_at TEXT NOT NULL
 );
-CREATE INDEX idx_sender_events ON sender_events(sender_id, id);
-CREATE TABLE spam_complaints (
+CREATE INDEX IF NOT EXISTS idx_sender_events ON sender_events(sender_id, id);
+CREATE TABLE IF NOT EXISTS spam_complaints (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   sender_id INTEGER NOT NULL REFERENCES senders(id),
   lead_id INTEGER REFERENCES leads(id),
@@ -561,18 +561,18 @@ CREATE TABLE spam_complaints (
   note TEXT,
   created_at TEXT NOT NULL
 );
-CREATE INDEX idx_complaints_sender ON spam_complaints(sender_id, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_complaints_sender ON spam_complaints(sender_id, occurred_at);
 -- Existing mailbox: all history belongs to it. Its cap is the former shared daily cap (default 10).
-INSERT INTO senders (id,email,display_name,title,domain,languages,campaign_ids,daily_cap,active,created_at,updated_at)
+INSERT OR IGNORE INTO senders (id,email,display_name,title,domain,languages,campaign_ids,daily_cap,active,created_at,updated_at)
 VALUES (1,'wisam.alaysa@conextek.com','Wisam Alaysa','Owner','conextek.com','["en","ar"]',NULL,
   (SELECT CASE WHEN CAST(value AS INTEGER)=0 THEN NULL ELSE CAST(value AS INTEGER) END FROM app_settings WHERE key='daily_send_cap' AND value IS NOT NULL AND value<>''),
   1,strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'));
 UPDATE senders SET daily_cap=10 WHERE id=1 AND daily_cap IS NULL AND NOT EXISTS (SELECT 1 FROM app_settings WHERE key='daily_send_cap');
-INSERT INTO senders (id,email,display_name,title,domain,languages,campaign_ids,daily_cap,active,created_at,updated_at)
+INSERT OR IGNORE INTO senders (id,email,display_name,title,domain,languages,campaign_ids,daily_cap,active,created_at,updated_at)
 VALUES (2,'madison@conextek.us','Madison Brooks','Business Development Representative','conextek.us','["en"]',
   (SELECT NULLIF(json_group_array(id),'[]') FROM campaigns WHERE lower(name) LIKE 'us %' OR lower(name) LIKE '%china%' OR lower(name) LIKE '%canton%' OR lower(name) LIKE '%united states%'),
   NULL,1,strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'));
-INSERT INTO sender_warmup (sender_id,from_date,daily_cap) VALUES (2,'2026-11-10',5),(2,'2026-11-17',8),(2,'2026-11-24',12),(2,'2026-12-01',20),(2,'2026-12-08',25);
+INSERT OR IGNORE INTO sender_warmup (sender_id,from_date,daily_cap) VALUES (2,'2026-11-10',5),(2,'2026-11-17',8),(2,'2026-11-24',12),(2,'2026-12-01',20),(2,'2026-12-08',25);
 -- Every version and send names its sender. Existing rows default to sender 1 (no content is rewritten).
 ALTER TABLE message_versions ADD COLUMN sender_id INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE message_versions ADD COLUMN language TEXT;
@@ -583,6 +583,6 @@ CREATE INDEX IF NOT EXISTS idx_se_sender ON send_events(sender_id, sent_at);
 CREATE INDEX IF NOT EXISTS idx_act_sender ON activities(sender_id, occurred_at);
 -- Campaign priority for reserving capacity: China, then US, then Gulf (only if the Owner has not set one).
 INSERT OR IGNORE INTO app_settings (key,value,updated_at)
-SELECT 'campaign_priority', json_group_array(id), strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM (SELECT id FROM campaigns ORDER BY CASE WHEN lower(name) LIKE '%canton%' OR lower(name) LIKE '%china%' THEN 0 WHEN lower(name) LIKE 'us %' THEN 1 WHEN lower(name) LIKE '%gulf%' THEN 2 ELSE 3 END, id) HAVING COUNT(*)>0;
+SELECT 'campaign_priority', json_group_array(id), strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM (SELECT id FROM campaigns ORDER BY CASE WHEN lower(name) LIKE '%canton%' OR lower(name) LIKE '%china%' THEN 0 WHEN lower(name) LIKE 'us %' THEN 1 WHEN lower(name) LIKE '%gulf%' THEN 2 ELSE 3 END, id) WHERE EXISTS (SELECT 1 FROM campaigns);
 `,
 ];
