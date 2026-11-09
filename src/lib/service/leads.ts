@@ -45,6 +45,8 @@ export async function findDuplicates(q: { company?: string | null; website?: str
 const contactSchema = z.object({
   name: reqText(120),
   role: optText(120),
+  source_url: optText(600),
+  language: optText(40),
   email: z.preprocess((v) => (typeof v === "string" && v.trim() ? v.trim() : null), z.string().email("invalid email").nullable()),
   phone: optText(60),
   linkedin: optText(300),
@@ -76,6 +78,8 @@ const createSchema = z.object({
   campaign_id: optInt.optional(),
   is_test: optBool.optional(),
   lead_date: z.unknown().optional(),
+  /** Who really found the lead: an employee id, or "unknown". Stored as the discovery credit; the person entering it stays the registrar (imported_by). */
+  original_researcher: z.union([z.coerce.number().int(), z.literal("unknown")]).optional(),
 });
 
 /** Extra, internal options for imports (never taken from user input). */
@@ -142,7 +146,15 @@ export async function createLead(actor: Actor, input: unknown, isDemo = false, o
   const stage = d.stage || ((await one("SELECT key FROM lists WHERE kind='stage' AND active=1 ORDER BY position,id LIMIT 1"))!.key as string);
   const t = now();
   const ld = leadDateFrom(d.lead_date, t, !!opts.unknownDateByDefault);
-  const original = opts.originalEmployeeId ?? actor.id;
+  let original: number | null = opts.originalEmployeeId ?? actor.id;
+  if (d.original_researcher !== undefined) {
+    if (d.original_researcher === "unknown") original = null;
+    else {
+      if (d.original_researcher !== actor.id) requirePerm(actor, "tasks.assign");
+      if (!isDemo && !(await one("SELECT id FROM users WHERE id=?", [d.original_researcher]))) throw new HttpError(400, "original_researcher: unknown employee id (or use \"unknown\").");
+      original = d.original_researcher;
+    }
+  }
   const imported = original !== actor.id || opts.batchId || opts.unknownDateByDefault ? actor.id : null;
   const r = await run(
     `INSERT INTO leads (company,website,domain,industry,country,market,segment,language,source,source_url,owner_id,stage,service,notes,next_action,next_due_at,is_demo,created_by,created_at,updated_at,
@@ -261,44 +273,106 @@ export async function setStage(actor: Actor, leadId: number, stage: string, reas
 }
 
 /* ---------- contacts ---------- */
-export async function addContact(actor: Actor, leadId: number, input: unknown) {
-  requirePerm(actor, "leads.edit");
-  await assertLeadAccess(actor, leadId);
-  const c = parse(contactSchema, input);
-  const t = now();
-  const n = Number((await one("SELECT COUNT(*) AS n FROM contacts WHERE lead_id=?", [leadId]))!.n);
-  const r = await run(
-    `INSERT INTO contacts (lead_id,name,role,email,phone,linkedin,other_social,notes,is_primary,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-    [leadId, c.name, c.role, c.email, c.phone, c.linkedin, c.other_social, c.notes, n === 0 ? 1 : 0, t, t],
-  );
-  await audit(actor, "add_contact", "contact", r.id, { lead_id: leadId, name: c.name });
-  return r.id;
+const contactStatusOf = (c: Row) => (c.email_status === "opted_out" ? "opted_out" : c.email_status === "bounced" ? "bounced" : c.is_invalid ? "invalid" : "active");
+export const withContactStatus = (rows: Row[]) => rows.map((c) => ({ ...c, status: contactStatusOf(c) }) as Row);
+
+/** Same email anywhere in the CRM (any lead), case-insensitive. Returns what a caller may know about each match. */
+async function emailMatches(actor: Actor, email: string, isDemo: number, excludeContactId?: number) {
+  const rows = await all(
+    `SELECT c.id AS contact_id, c.lead_id, c.email_status, c.is_invalid, l.company, l.owner_id FROM contacts c JOIN leads l ON l.id=c.lead_id
+     WHERE lower(c.email)=lower(?) AND l.is_demo=? AND c.id<>?`, [email, isDemo, excludeContactId ?? 0]);
+  const s = leadScope(actor);
+  const visible = new Set((await all(`SELECT l.id FROM leads l WHERE ${s.sql}`, s.args)).map((r) => r.id as number));
+  return rows.map((r) => {
+    const open = visible.has(r.lead_id as number) || isManager(actor);
+    return { contact_id: open ? r.contact_id : null, lead_id: open ? r.lead_id : null, company: open ? r.company : null, status: contactStatusOf(r), suppressed: r.email_status === "opted_out" || r.email_status === "bounced", restricted_reference: open ? null : "this email already exists on a lead you cannot see: ask a Chief" };
+  });
+}
+function duplicateError(matches: Awaited<ReturnType<typeof emailMatches>>, email: string) {
+  const sup = matches.find((m) => m.suppressed);
+  const first = matches[0];
+  const e = new HttpError(409, sup
+    ? `Suppressed: ${email} is already in the CRM as ${sup.status === "opted_out" ? "opted out (do not contact)" : "bounced"}${sup.contact_id ? ` (contact #${sup.contact_id}, lead #${sup.lead_id})` : ""}. Nothing was created.`
+    : `Duplicate: ${email} already exists${first.contact_id ? ` as contact #${first.contact_id} on lead #${first.lead_id}` : " on a lead you cannot see"}. Nothing was created.`);
+  (e as HttpError & { duplicates?: unknown }).duplicates = matches;
+  return e;
 }
 
-const contactUpdate = contactSchema.partial().extend({ email_status: z.enum(["unknown", "ok", "bounced", "opted_out"]).optional() });
+/** Add a contact to an existing lead: global email dedupe and suppression check first. Never creates a duplicate. */
+export async function addContactDetailed(actor: Actor, leadId: number, input: unknown) {
+  if (!(isManager(actor) || can(actor, "leads.edit") || can(actor, "activity.record"))) throw new HttpError(403, "You are not allowed to add contacts.");
+  const lead = await assertLeadAccess(actor, leadId);
+  const c = parse(contactSchema.extend({ name: optText(120) }), input);
+  if (!c.name && !c.email && !c.phone && !c.linkedin) throw new HttpError(400, "Give at least a name, email, phone or LinkedIn.");
+  const warnings: string[] = [];
+  if (c.email) {
+    const m = await emailMatches(actor, c.email, lead.is_demo as number);
+    if (m.length) throw duplicateError(m, c.email);
+  }
+  if (Number((await one("SELECT COUNT(*) AS n FROM contacts WHERE lead_id=? AND email_status='opted_out'", [leadId]))!.n) > 0) warnings.push("This lead already has an opted-out contact (do not contact): sends to it stay blocked.");
+  const t = now();
+  const n = Number((await one("SELECT COUNT(*) AS n FROM contacts WHERE lead_id=?", [leadId]))!.n);
+  const name = c.name || "(no name)";
+  const r = await run(
+    `INSERT INTO contacts (lead_id,name,role,email,phone,linkedin,other_social,notes,source_url,language,is_primary,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [leadId, name, c.role, c.email, c.phone, c.linkedin, c.other_social, c.notes, c.source_url, c.language, n === 0 ? 1 : 0, t, t],
+  );
+  await run("INSERT INTO activities (lead_id,contact_id,type,title,body,actor_id,occurred_at,created_at,is_demo) VALUES (?,?,'note',?,?,?,?,?,?)",
+    [leadId, r.id, `Contact added: ${c.name || c.email || c.phone}`, `Added by ${actor.name} (${actor.via}).${c.email ? ` Email ${c.email}.` : ""}`, actor.id, t, t, lead.is_demo as number]);
+  await audit(actor, "add_contact", "contact", r.id, { lead_id: leadId, name });
+  return { id: r.id, lead_id: leadId, status: "active", warnings };
+}
+export async function addContact(actor: Actor, leadId: number, input: unknown) {
+  return (await addContactDetailed(actor, leadId, input)).id;
+}
+
+const CONTACT_STATUSES = ["active", "invalid", "bounced", "opted_out"] as const;
+const contactUpdate = contactSchema.partial().extend({ email_status: z.enum(["unknown", "ok", "bounced", "opted_out"]).optional(), status: z.enum(CONTACT_STATUSES).optional() });
 export async function updateContact(actor: Actor, contactId: number, input: Record<string, unknown>) {
-  requirePerm(actor, "leads.edit");
+  if (!(isManager(actor) || can(actor, "leads.edit"))) throw new HttpError(403, "You are not allowed to edit contacts.");
   const c0 = await one("SELECT * FROM contacts WHERE id=?", [contactId]);
   if (!c0) throw new HttpError(404, "Contact not found.");
-  await assertLeadAccess(actor, c0.lead_id);
-  const keys = Object.keys(input).filter((k) => ["name", "role", "email", "phone", "linkedin", "other_social", "notes", "email_status"].includes(k));
+  const lead = await assertLeadAccess(actor, c0.lead_id as number);
+  const keys = Object.keys(input).filter((k) => ["name", "role", "email", "phone", "linkedin", "other_social", "notes", "email_status", "source_url", "language", "status"].includes(k));
   const d = parse(contactUpdate, Object.fromEntries(keys.map((k) => [k, input[k]]))) as Record<string, unknown>;
   const sets: string[] = [];
   const args: InValue[] = [];
   const changes: Record<string, unknown> = {};
+  const setCol = (col: string, val: InValue) => { if (c0[col] === val) return; sets.push(`${col}=?`); args.push(val); changes[col] = { from: c0[col], to: val }; };
   for (const k of keys) {
+    if (k === "status") continue;
     if (d[k] === c0[k]) continue;
     if (k === "name" && !d[k]) throw new HttpError(400, "name: required");
+    if (k === "email" && d.email) {
+      const m = await emailMatches(actor, d.email as string, lead.is_demo as number, contactId);
+      if (m.length) throw duplicateError(m, d.email as string);
+    }
     // Suppression is permanent unless an Owner/Chief explicitly corrects it (audited below).
     if (k === "email_status" && (c0.email_status === "opted_out" || c0.email_status === "bounced") && d[k] !== "opted_out" && !(c0.email_status === "bounced" && d[k] === "opted_out") && !isManager(actor))
       throw new HttpError(403, `This contact is marked ${c0.email_status}. Only the Owner or Chief can correct that.`);
-    sets.push(`${k}=?`);
-    args.push(d[k] as InValue);
-    changes[k] = { from: c0[k], to: d[k] };
+    setCol(k, d[k] as InValue);
+  }
+  if (d.status) {
+    // Contacts are never deleted: their status says what they are.
+    const suppressed = c0.email_status === "opted_out" || c0.email_status === "bounced";
+    if (d.status === "opted_out" || d.status === "bounced") setCol("email_status", d.status);
+    else if (d.status === "invalid") setCol("is_invalid", 1);
+    else {
+      if (suppressed && !isManager(actor)) throw new HttpError(403, `This contact is marked ${c0.email_status}. Only the Owner or Chief can reactivate it.`);
+      setCol("is_invalid", 0);
+      if (suppressed) setCol("email_status", "ok");
+    }
   }
   if (!sets.length) return;
   await run(`UPDATE contacts SET ${sets.join(",")}, updated_at=? WHERE id=?`, [...args, now(), contactId]);
   await audit(actor, "update_contact", "contact", contactId, changes);
+}
+
+export async function getContact(actor: Actor, contactId: number) {
+  const c = await one("SELECT * FROM contacts WHERE id=?", [contactId]);
+  if (!c) throw new HttpError(404, "Contact not found.");
+  await assertLeadAccess(actor, c.lead_id as number);
+  return withContactStatus([c])[0];
 }
 
 /* ---------- reads ---------- */
@@ -332,32 +406,35 @@ export async function listLeads(actor: Actor, f: LeadFilters) {
     f.sort === "company" ? "lower(l.company) ASC"
     : f.sort === "due" ? "l.next_due_at IS NULL, l.next_due_at ASC"
     : "COALESCE(l.last_activity_at, l.created_at) DESC";
-  const total = Number((await one(`SELECT COUNT(*) AS n FROM leads l WHERE ${W}`, args))!.n);
-  const rows = await all(
+  const [totalRow, rows] = await Promise.all([one(`SELECT COUNT(*) AS n FROM leads l WHERE ${W}`, args), all(
     `SELECT l.*, u.name AS owner_name FROM leads l LEFT JOIN users u ON u.id=l.owner_id
      WHERE ${W} ORDER BY ${order} LIMIT ? OFFSET ?`,
     [...args, size, (page - 1) * size],
-  );
+  )]);
+  const total = Number(totalRow!.n);
   return { rows, total, page, pageSize: size };
 }
 
 export async function getLead(actor: Actor, id: number) {
-  await assertLeadAccess(actor, id);
-  const lead = (await one(
-    `SELECT l.*, u.name AS owner_name, cb.name AS created_by_name, ib.name AS imported_by_name FROM leads l
-     LEFT JOIN users u ON u.id=l.owner_id LEFT JOIN users cb ON cb.id=l.created_by LEFT JOIN users ib ON ib.id=l.imported_by WHERE l.id=?`,
-    [id],
-  ))!;
-  const contacts = await all("SELECT * FROM contacts WHERE lead_id=? ORDER BY is_primary DESC, id", [id]);
-  const history = await all(
-    `SELECT a.*, COALESCE(u.name,'Unknown original employee') AS actor_name, (a.actor_id IS NULL) AS actor_unknown, c.name AS contact_name, ib.name AS imported_by_name
-     FROM activities a LEFT JOIN users u ON u.id=a.actor_id LEFT JOIN contacts c ON c.id=a.contact_id LEFT JOIN users ib ON ib.id=a.imported_by
-     WHERE a.lead_id=? ORDER BY a.occurred_at DESC, a.id DESC`,
-    [id],
-  );
-  const tasks = await liveTasks(await all(
-    `SELECT t.*, u.name AS assignee_name, cu.name AS completed_by_name FROM tasks t JOIN users u ON u.id=t.assignee_id LEFT JOIN users cu ON cu.id=t.completed_by WHERE t.lead_id=? ORDER BY t.created_at DESC`,
-    [id],
-  ));
+  // The access check and every read start together (one round trip deep); nothing is returned if access is refused.
+  const [, lead0, contactRows, history, taskRows] = await Promise.all([
+    assertLeadAccess(actor, id),
+    one(
+      `SELECT l.*, u.name AS owner_name, cb.name AS created_by_name, ib.name AS imported_by_name FROM leads l
+       LEFT JOIN users u ON u.id=l.owner_id LEFT JOIN users cb ON cb.id=l.created_by LEFT JOIN users ib ON ib.id=l.imported_by WHERE l.id=?`,
+      [id],
+    ),
+    all("SELECT * FROM contacts WHERE lead_id=? ORDER BY is_primary DESC, id", [id]),
+    all(
+      `SELECT a.*, COALESCE(u.name,'Unknown original employee') AS actor_name, (a.actor_id IS NULL) AS actor_unknown, c.name AS contact_name, ib.name AS imported_by_name
+       FROM activities a LEFT JOIN users u ON u.id=a.actor_id LEFT JOIN contacts c ON c.id=a.contact_id LEFT JOIN users ib ON ib.id=a.imported_by
+       WHERE a.lead_id=? ORDER BY a.occurred_at DESC, a.id DESC`,
+      [id],
+    ),
+    all(`SELECT t.*, u.name AS assignee_name, cu.name AS completed_by_name FROM tasks t JOIN users u ON u.id=t.assignee_id LEFT JOIN users cu ON cu.id=t.completed_by WHERE t.lead_id=? ORDER BY t.created_at DESC`, [id]),
+  ]);
+  const lead = lead0!;
+  const contacts = withContactStatus(contactRows);
+  const tasks = await liveTasks(taskRows);
   return { lead, contacts, history, tasks };
 }

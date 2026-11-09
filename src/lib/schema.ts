@@ -486,4 +486,28 @@ UPDATE tasks SET due_on = date(due_at,'+2 hours') WHERE due_at IS NOT NULL AND s
 UPDATE tasks SET due_on = date(due_at,'+3 hours') WHERE due_at IS NOT NULL AND substr(due_at,12,5)='20:59' AND due_on IS NULL;
 UPDATE tasks SET scheduled_on = scheduled_input WHERE scheduled_input GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]';
 `,
+  `
+-- Migration 11 (additive): contact source/language/invalid flag, reply classification, and indexes for the filters and joins the app uses.
+ALTER TABLE contacts ADD COLUMN source_url TEXT;
+ALTER TABLE contacts ADD COLUMN language TEXT;
+ALTER TABLE contacts ADD COLUMN is_invalid INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE activities ADD COLUMN classification TEXT;
+CREATE INDEX IF NOT EXISTS idx_contacts_email_lower ON contacts(lower(email));
+CREATE INDEX IF NOT EXISTS idx_contacts_status ON contacts(email_status);
+CREATE INDEX IF NOT EXISTS idx_tasks_status_sched ON tasks(status, scheduled_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_due_at ON tasks(due_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_due_on ON tasks(due_on);
+CREATE INDEX IF NOT EXISTS idx_tasks_campaign ON tasks(campaign_id);
+CREATE INDEX IF NOT EXISTS idx_act_task ON activities(task_id);
+CREATE INDEX IF NOT EXISTS idx_act_contact ON activities(contact_id);
+CREATE INDEX IF NOT EXISTS idx_act_lead_type ON activities(lead_id, type);
+CREATE INDEX IF NOT EXISTS idx_sa_lead ON send_authorizations(lead_id, kind, status);
+CREATE INDEX IF NOT EXISTS idx_se_lead ON send_events(lead_id, status);
+CREATE INDEX IF NOT EXISTS idx_se_activity ON send_events(activity_id);
+CREATE INDEX IF NOT EXISTS idx_lc_lead ON lead_campaigns(lead_id, status);
+CREATE INDEX IF NOT EXISTS idx_mv_task ON message_versions(task_id);
+CREATE INDEX IF NOT EXISTS idx_mv_campaign ON message_versions(campaign_id);
+CREATE INDEX IF NOT EXISTS idx_leads_created_by ON leads(created_by);
+CREATE INDEX IF NOT EXISTS idx_leads_last_activity ON leads(last_activity_at);
+`,
 ];

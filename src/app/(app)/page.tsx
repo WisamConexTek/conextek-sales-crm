@@ -3,6 +3,7 @@ import { requireUser, can, isManager } from "@/lib/auth";
 import { getDashboard } from "@/lib/service/reports";
 import { sendApprovalPreview } from "@/lib/service/sends";
 import { schedule } from "@/lib/service/schedule";
+import { cached } from "@/lib/ttl-cache";
 import { assignableUsers } from "@/lib/service/users";
 import { addDays, todayYmd } from "@/lib/db";
 import { Card, Empty, Flash, LeadLink, PageHeader, Stat, StatusBadge, Badge } from "@/components/ui";
@@ -15,10 +16,14 @@ const ago = (iso: string | null | undefined) => { if (!iso) return "—"; const 
 export default async function Dashboard({ searchParams }: { searchParams: SP }) {
   const me = await requireUser();
   const sp = await searchParams;
-  const d = await getDashboard(me, { from: sget(sp, "from"), to: sget(sp, "to"), employee: snum(sp, "employee"), all: sget(sp, "all") === "1" || (!sget(sp, "from") && !sget(sp, "to")) });
-  const users = await assignableUsers();
-  const sendPrev = await sendApprovalPreview(me, 5);
-  const wk = await schedule(me, { from: todayYmd(), to: addDays(todayYmd(), 1) });
+  const opts = { from: sget(sp, "from"), to: sget(sp, "to"), employee: snum(sp, "employee"), all: sget(sp, "all") === "1" || (!sget(sp, "from") && !sget(sp, "to")) };
+  // All the dashboard's data in parallel; counters are cached for a few seconds (any web action clears them).
+  const [d, users, sendPrev, wk] = await Promise.all([
+    cached(`dash:${me.id}:${JSON.stringify(opts)}`, 5000, () => getDashboard(me, opts)),
+    assignableUsers(),
+    cached(`dash-send:${me.id}`, 5000, () => sendApprovalPreview(me, 5)),
+    cached(`dash-wk:${me.id}:${todayYmd()}`, 5000, () => schedule(me, { from: todayYmd(), to: addDays(todayYmd(), 1) })),
+  ]);
   const wkNext = wk.rows.filter((r) => r.state !== "completed").sort((a, b) => (a.state === "overdue" ? 0 : 1) - (b.state === "overdue" ? 0 : 1)).slice(0, 6);
   const teamView = can(me, "reports.view") || isManager(me);
   const today = todayYmd();

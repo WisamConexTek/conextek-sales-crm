@@ -1,6 +1,7 @@
 import { cookies } from "next/headers";
 import { requireUser, can, isManager } from "@/lib/auth";
 import { one } from "@/lib/db";
+import { cached } from "@/lib/ttl-cache";
 import { canAuthorizeSend, countPendingSendApprovals } from "@/lib/service/sends";
 import { logoutAction, toggleDemoAction } from "@/app/actions";
 import { Nav, type NavItem } from "@/components/Nav";
@@ -11,11 +12,18 @@ export const dynamic = "force-dynamic";
 
 export default async function AppLayout({ children }: { children: React.ReactNode }) {
   const me = await requireUser({ allowPasswordChange: true });
-  const mine = Number((await one("SELECT COUNT(*) n FROM tasks WHERE assignee_id=? AND is_demo=0 AND status IN ('todo','in_progress','changes_requested','approved')", [me.id]))!.n);
-  const toDecide = can(me, "approvals.decide")
-    ? Number((await one(`SELECT COUNT(*) n FROM approvals WHERE is_demo=0 AND status='pending' AND submitted_by<>? ${me.role === "owner" ? "" : "AND requires='chief'"}`, [me.id]))!.n)
-    : 0;
-  const hasDemo = Number((await one("SELECT COUNT(*) n FROM leads WHERE is_demo=1"))!.n) + Number((await one("SELECT COUNT(*) n FROM tasks WHERE is_demo=1"))!.n) > 0;
+  // Everything the menu needs, in ONE parallel round trip, cached for a few seconds per person (the web actions clear it).
+  const nav = await cached(`nav:${me.id}:${me.role}`, 5000, async () => {
+    const canSend = await canAuthorizeSend(me);
+    const [mine, toDecide, demo, sendPending] = await Promise.all([
+      one("SELECT COUNT(*) n FROM tasks WHERE assignee_id=? AND is_demo=0 AND status IN ('todo','in_progress','changes_requested','approved')", [me.id]),
+      can(me, "approvals.decide") ? one(`SELECT COUNT(*) n FROM approvals WHERE is_demo=0 AND status='pending' AND submitted_by<>? ${me.role === "owner" ? "" : "AND requires='chief'"}`, [me.id]) : Promise.resolve({ n: 0 }),
+      one("SELECT (SELECT COUNT(*) FROM leads WHERE is_demo=1) + (SELECT COUNT(*) FROM tasks WHERE is_demo=1) AS n"),
+      canSend ? countPendingSendApprovals() : Promise.resolve(null),
+    ]);
+    return { mine: Number(mine!.n), toDecide: Number(toDecide!.n), hasDemo: Number(demo!.n) > 0, canSend, sendPending: sendPending as number | null };
+  });
+  const { mine, toDecide, hasDemo } = nav;
   const hidden = (await cookies()).get("crm_hide_test")?.value === "1";
 
   const items: NavItem[] = [
@@ -24,7 +32,7 @@ export default async function AppLayout({ children }: { children: React.ReactNod
     { href: "/my-work", label: "My Work", badge: mine },
     { href: "/schedule", label: "Today & Tomorrow" },
     { href: "/approvals", label: "Approvals", badge: toDecide },
-    ...((await canAuthorizeSend(me)) ? [{ href: "/send-approvals", label: "Send approvals", badge: await countPendingSendApprovals() }] : []),
+    ...(nav.canSend ? [{ href: "/send-approvals", label: "Send approvals", badge: nav.sendPending ?? 0 }] : []),
     { href: "/reports", label: can(me, "reports.view") || isManager(me) ? "Reports" : "My numbers" },
   ];
   if (can(me, "campaigns.manage") || can(me, "reports.view") || isManager(me)) items.push({ href: "/campaigns", label: "Campaigns" });

@@ -88,7 +88,7 @@ export async function createTask(actor: Actor, input: unknown, isDemo = false) {
 }
 
 export type TaskFilters = {
-  assignee?: number; status?: string; lead?: number; overdue?: boolean; open?: boolean; includeDemo?: boolean; limit?: number;
+  assignee?: number; status?: string; lead?: number; overdue?: boolean; open?: boolean; includeDemo?: boolean; limit?: number; q?: string; page?: number; pageSize?: number;
 };
 export async function listTasks(actor: Actor, f: TaskFilters = {}): Promise<LiveTask[]> {
   const where: string[] = [];
@@ -101,6 +101,9 @@ export async function listTasks(actor: Actor, f: TaskFilters = {}): Promise<Live
   if (f.open) where.push(`t.status IN (${OPEN_TASK_STATUSES.map(() => "?").join(",")})`), args.push(...OPEN_TASK_STATUSES);
   if (f.overdue) (where.push(`t.due_at < ? AND t.status IN ('todo','in_progress','changes_requested','approved')`), args.push(now()));
   if (!f.includeDemo) where.push("t.is_demo=0");
+  if (f.q?.trim()) { const like = `%${f.q.trim().toLowerCase()}%`; where.push("(lower(t.title) LIKE ? OR lower(l.company) LIKE ?)"); args.push(like, like); }
+  const size = Math.min(Math.max(f.pageSize ?? f.limit ?? 300, 1), 300);
+  const offset = f.page && f.page > 1 ? (f.page - 1) * size : 0;
   return liveTasks(await all(
     `SELECT t.*, l.company, u.name AS assignee_name, cb.name AS created_by_name, cu.name AS completed_by_name,
             (SELECT a.id FROM approvals a WHERE a.task_id=t.id AND a.status='pending' ORDER BY a.id DESC LIMIT 1) AS pending_approval_id,
@@ -108,9 +111,17 @@ export async function listTasks(actor: Actor, f: TaskFilters = {}): Promise<Live
      FROM tasks t
      JOIN users u ON u.id=t.assignee_id JOIN users cb ON cb.id=t.created_by LEFT JOIN users cu ON cu.id=t.completed_by LEFT JOIN leads l ON l.id=t.lead_id
      ${where.length ? "WHERE " + where.join(" AND ") : ""}
-     ORDER BY (t.due_at IS NULL), t.due_at ASC, t.id DESC LIMIT ?`,
-    [...args, f.limit ?? 300],
+     ORDER BY (t.due_at IS NULL), t.due_at ASC, t.id DESC LIMIT ? OFFSET ?`,
+    [...args, size, offset],
   ));
+}
+
+/** Server-side paging for long lists: 50 per page by default; has_more tells whether there is a next page. */
+export async function listTasksPaged(actor: Actor, f: TaskFilters = {}) {
+  const size = Math.min(Math.max(f.pageSize ?? 50, 1), 200);
+  const page = Math.max(f.page ?? 1, 1);
+  const rows = await listTasks(actor, { ...f, page, pageSize: size });
+  return { rows, page, page_size: size, has_more: rows.length === size };
 }
 
 export async function getTask(actor: Actor, id: number): Promise<Row> {

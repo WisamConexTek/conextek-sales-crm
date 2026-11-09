@@ -1,6 +1,6 @@
 import { all, now, type Row } from "../db";
 import { toLocalInput } from "../format";
-import { readiness } from "./sends";
+import { readinessMany } from "./sends";
 
 /**
  * One definition of a task's REAL status, used by the schedule, the task list, the task page, the lead page and the API.
@@ -21,12 +21,18 @@ export type LiveTask = Row & { rescheduled_from_on: string | null; state: WorkSt
 export async function liveTasks(rows: Row[]): Promise<LiveTask[]> {
   const nowISO = now();
   const leadIds = [...new Set(rows.filter((r) => r.opted_out === undefined && r.lead_id).map((r) => r.lead_id as number))];
-  const optedOut = new Map<number, number>();
-  if (leadIds.length) for (const o of await all(`SELECT lead_id, COUNT(*) AS n FROM contacts WHERE email_status='opted_out' AND lead_id IN (${leadIds.map(() => "?").join(",")}) GROUP BY lead_id`, leadIds)) optedOut.set(o.lead_id as number, Number(o.n));
   // completed tasks that point at a recorded send: the send time is the real time
   const doneActs = [...new Set(rows.filter((r) => r.status === "completed" && r.activity_id && !r.sent_at).map((r) => r.activity_id as number))];
+  const optedOut = new Map<number, number>();
   const actSent = new Map<number, string>();
-  if (doneActs.length) for (const a of await all(`SELECT id, occurred_at FROM activities WHERE type='message' AND outcome='sent' AND occurred_precision='time' AND id IN (${doneActs.map(() => "?").join(",")})`, doneActs)) actSent.set(a.id as number, a.occurred_at as string);
+  // everything below is independent: one parallel round trip
+  const [oo, acts, live] = await Promise.all([
+    leadIds.length ? all(`SELECT lead_id, COUNT(*) AS n FROM contacts WHERE email_status='opted_out' AND lead_id IN (${leadIds.map(() => "?").join(",")}) GROUP BY lead_id`, leadIds) : Promise.resolve([] as Row[]),
+    doneActs.length ? all(`SELECT id, occurred_at FROM activities WHERE type='message' AND outcome='sent' AND occurred_precision='time' AND id IN (${doneActs.map(() => "?").join(",")})`, doneActs) : Promise.resolve([] as Row[]),
+    readinessMany(rows.filter((r) => r.status !== "completed" && r.status !== "cancelled" && r.message_version_id).map((r) => r.message_version_id as number)),
+  ]);
+  for (const o of oo) optedOut.set(o.lead_id as number, Number(o.n));
+  for (const a of acts) actSent.set(a.id as number, a.occurred_at as string);
   const out: LiveTask[] = [];
   for (const r0 of rows) {
     let r = r0;
@@ -41,10 +47,10 @@ export async function liveTasks(rows: Row[]): Promise<LiveTask[]> {
     let label: string | null = null;
     let sentNote: string | null = null;
     if (!done && r.message_version_id) {
-      const live = await readiness(r.message_version_id as number);
-      if (live.state === "sent") sentNote = "A send was already recorded for this message, but the task is still open (Owner/Chief can close it: POST /tasks/{id}/complete).";
-      else r = { ...r, prep_status: live.prep_status, blockers: live.blockers } as Row;
-      label = live.label;
+      const lv = live.get(r.message_version_id as number)!;
+      if (lv.state === "sent") sentNote = "A send was already recorded for this message, but the task is still open (Owner/Chief can close it: POST /tasks/{id}/complete).";
+      else r = { ...r, prep_status: lv.prep_status, blockers: lv.blockers } as Row;
+      label = lv.label;
     }
     const opted = Number(r.opted_out ?? optedOut.get(r.lead_id as number) ?? 0);
     const overdue = !done && !!at && at < nowISO;

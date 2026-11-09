@@ -2,6 +2,7 @@
 import { redirect, unstable_rethrow } from "next/navigation";
 import { revalidatePath } from "next/cache";
 import { cookies } from "next/headers";
+import { clearCache } from "@/lib/ttl-cache";
 import { HttpError, login, logout, requireUser, getSessionActor } from "@/lib/auth";
 import type { SecretState } from "@/components/SecretAction";
 import * as Users from "@/lib/service/users";
@@ -40,6 +41,7 @@ async function guard(fd: FD, fn: () => Promise<string | void>, fallback = "/") {
     unstable_rethrow(e);
     redirect(join(back, "err=" + encodeURIComponent(msgOf(e))));
   }
+  clearCache();
   revalidatePath("/", "layout");
   redirect(join(back, "ok=" + encodeURIComponent(ok)));
 }

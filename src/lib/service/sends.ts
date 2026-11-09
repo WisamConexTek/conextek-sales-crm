@@ -3,8 +3,9 @@ import { createHash } from "node:crypto";
 import { all, one, run, tx, now, type Row } from "../db";
 import { HttpError, can, isManager, requirePerm, type Actor } from "../auth";
 import { audit, parse, optText, optInt, parseEventDate, dateProblem } from "./common";
-import { assertLeadAccess } from "./leads";
+import { assertLeadAccess, leadScope } from "./leads";
 import { assertChannel } from "./campaigns";
+import { capacitySettings, sentTodayTotal } from "./capacity";
 
 /**
  * Message versions, scoped authorizations, send confirmation and recording.
@@ -133,16 +134,18 @@ export async function pendingSendApprovals(actor: Actor) {
      FROM message_versions v JOIN leads l ON l.id=v.lead_id JOIN campaigns c ON c.id=v.campaign_id JOIN users u ON u.id=v.created_by
      LEFT JOIN contacts ct ON ct.id=v.contact_id LEFT JOIN tasks t ON t.id=v.task_id
      WHERE ${WAITING} ORDER BY v.created_at, v.id LIMIT 200`);
+  const ctx = await loadEligCtx(rows);
+  const approverIds = [...new Set(rows.flatMap((v) => (ctx.auths.get(v.id as number) ?? []).filter((a) => a.kind === "editorial" && a.status === "active").map((a) => a.approver_id as number)))];
+  const names = new Map<number, string>(approverIds.length ? (await all(`SELECT id,name FROM users WHERE id IN (${inList(approverIds)})`, approverIds)).map((u) => [u.id as number, u.name as string]) : []);
   const out: Row[] = [];
   for (const v of rows) {
-    const ed = await one("SELECT a.created_at,u.name FROM send_authorizations a JOIN users u ON u.id=a.approver_id WHERE a.message_version_id=? AND a.kind='editorial' AND a.status='active' ORDER BY a.id DESC LIMIT 1", [v.id as number]);
-    const prior = await one("SELECT COUNT(*) AS n FROM activities WHERE lead_id=? AND type='message' AND message_kind='first_email' AND channel=? AND is_demo=0", [v.lead_id as number, v.channel as string]);
-    const el = await checkEligibility(actor, v.id as number).catch(() => ({ reasons: [] as string[], warnings: [] as string[] }));
+    const ed = [...(ctx.auths.get(v.id as number) ?? [])].reverse().find((a) => a.kind === "editorial" && a.status === "active");
+    const el = evaluateEligibility(v, ctx);
     out.push({
       ...v,
-      editorial_status: ed ? `Reviewed by ${ed.name}` : "Not yet reviewed",
+      editorial_status: ed ? `Reviewed by ${names.get(ed.approver_id as number)}` : "Not yet reviewed",
       editorial_reviewed: !!ed,
-      suggested_action: suggestAction(v.action_type as string | null, Number(prior!.n)),
+      suggested_action: suggestAction(v.action_type as string | null, ctx.firstSent.get(`${v.lead_id}|${v.channel}`) ?? 0),
       other_blockers: el.reasons.filter((r) => !r.startsWith("no active Owner send authorization")),
       warnings: el.warnings,
     } as Row);
@@ -182,6 +185,54 @@ export async function editVersion(actor: Actor, versionId: number, input: unknow
   await run("INSERT INTO message_decisions (message_version_id,kind,reason,new_version_id,decided_by,delegated,created_at) VALUES (?,?,?,?,?,?,?)", [versionId, "edited", d.note ?? null, r.id, actor.id, actor.role !== "owner" ? 1 : 0, now()]);
   await audit(actor, "edit_message_version", "message_version", versionId, { lead_id: v.lead_id, new_version_id: r.id, note: d.note ?? null });
   return { old_version_id: versionId, new_version_id: r.id, version: r.version };
+}
+
+/** Read-only list of message versions with their approval state, eligibility, linked task and recipient. */
+export const VERSION_STATUSES = ["waiting_editorial", "waiting_send", "approved", "sent", "rejected", "superseded"] as const;
+export async function listVersions(actor: Actor, q: { campaign_id?: number; lead_id?: number; status?: string; limit?: number; page?: number; latest_only?: boolean } = {}) {
+  if (q.status && !(VERSION_STATUSES as readonly string[]).includes(q.status)) throw new HttpError(400, `status: one of ${VERSION_STATUSES.join(", ")}.`);
+  const sc = leadScope(actor, "l");
+  const where = [sc.sql, "l.is_demo=0"];
+  const args: (string | number)[] = [...(sc.args as (string | number)[])];
+  if (q.campaign_id) (where.push("v.campaign_id=?"), args.push(q.campaign_id));
+  if (q.lead_id) (where.push("v.lead_id=?"), args.push(q.lead_id));
+  if (q.latest_only) where.push(LATEST);
+  const limit = Math.min(Math.max(q.limit ?? 50, 1), 200);
+  const page = Math.max(q.page ?? 1, 1);
+  const rows = await all(
+    `SELECT v.*, l.company, c.name AS campaign, ct.name AS recipient_name, ct.email AS recipient_email, u.name AS created_by_name,
+            COALESCE((SELECT t.id FROM tasks t WHERE t.message_version_id=v.id ORDER BY t.id LIMIT 1), v.task_id) AS linked_task_id
+     FROM message_versions v JOIN leads l ON l.id=v.lead_id JOIN campaigns c ON c.id=v.campaign_id JOIN users u ON u.id=v.created_by LEFT JOIN contacts ct ON ct.id=v.contact_id
+     WHERE ${where.join(" AND ")} ORDER BY v.id DESC LIMIT ? OFFSET ?`, [...args, q.status ? 500 : limit, q.status ? 0 : (page - 1) * limit]);
+  const ctx = await loadEligCtx(rows);
+  const out = rows.map((v) => {
+    const id = v.id as number;
+    const as = ctx.auths.get(id) ?? [];
+    const last = (kind: string) => [...as].reverse().find((a) => a.kind === kind);
+    const ed = last("editorial"), sd = last("send");
+    const isLatest = ctx.latest.get(id) === id;
+    const rejected = ctx.rejected.has(id);
+    const sent = as.some((a) => a.kind === "send" && a.status === "used");
+    const el = evaluateEligibility(v, ctx);
+    const status = sent ? "sent" : rejected ? "rejected" : !isLatest ? "superseded" : !(ed?.status === "active") ? "waiting_editorial" : !(sd?.status === "active") ? "waiting_send" : "approved";
+    return {
+      id, version: v.version, is_latest: isLatest, status, lead_id: v.lead_id, company: v.company, campaign_id: v.campaign_id, campaign: v.campaign, channel: v.channel,
+      contact_id: v.contact_id, recipient: v.contact_id ? { name: v.recipient_name, email: v.recipient_email } : null, subject: v.subject, task_id: v.linked_task_id ?? null,
+      created_by: v.created_by_name, created_at: v.created_at,
+      editorial_status: ed ? (ed.status === "active" ? "approved" : ed.status) : "not_reviewed",
+      send_status: sd ? (sd.status === "active" ? "approved" : sd.status) : "not_approved",
+      rejected, eligibility: { eligible: el.reasons.length === 0, reasons: el.reasons, codes: el.codes },
+    };
+  });
+  const filtered = q.status ? out.filter((r) => r.status === q.status) : out;
+  return q.status ? filtered.slice((page - 1) * limit, page * limit) : filtered;
+}
+
+/** Who authorized what, when, for exactly which version. */
+export async function versionAuthorizations(actor: Actor, id: number) {
+  const v = await getVersion(actor, id);
+  const auths = await all("SELECT a.id,a.kind,a.permitted_action,a.status,a.delegated,a.approver_id,u.name AS approver_name,a.note,a.channel,a.campaign_id,a.contact_id,a.created_at,a.used_at,a.send_event_id FROM send_authorizations a JOIN users u ON u.id=a.approver_id WHERE a.message_version_id=? ORDER BY a.id", [id]);
+  return { message_version_id: id, version: v.version, is_latest: v.is_latest, lead_id: v.lead_id, content_hash: v.content_hash, authorizations: auths, decisions: v.decisions };
 }
 
 /** What the Owner decided on drafts (rejections with reasons, edits with old and new text), newest first. For agents to learn from. */
@@ -240,45 +291,92 @@ export async function checkEligibility(actor: Actor, versionId: number) {
   await assertLeadAccess(actor, v.lead_id as number);
   const core = await eligibilityCore(v);
   const reasons = [...(!can(actor, "message.record_sent") ? ["you do not have message.record_sent, so this send could not be recorded"] : []), ...core.reasons];
-  return { eligible: reasons.length === 0, reasons, warnings: core.warnings, authorization_id: core.authorization_id, message_version_id: versionId };
+  return { eligible: reasons.length === 0, reasons, codes: core.codes, warnings: core.warnings, authorization_id: core.authorization_id, message_version_id: versionId };
 }
 
-/** The actor-independent rules. Used by the eligibility check, and by the task status sync (which has no actor). */
-async function eligibilityCore(v: Row) {
+/**
+ * The actor-independent eligibility rules, evaluated against data loaded ONCE for any number of versions
+ * (a handful of queries in total, not a handful per version).
+ */
+type EligCtx = {
+  latest: Map<number, number>; rejected: Map<number, string | null>; auths: Map<number, Row[]>;
+  leads: Map<number, Row>; contacts: Map<number, Row[]>; camps: Map<number, Row>; members: Map<number, Row[]>;
+  firstSent: Map<string, number>; activeSendByLead: Map<number, Row[]>; pendingByLead: Map<number, number>; recentByLead: Map<number, number>;
+  capUsed: number; cap: number;
+};
+const groupBy = <T extends Row>(rows: T[], key: string) => { const m = new Map<number, T[]>(); for (const r of rows) { const k = r[key] as number; (m.get(k) ?? m.set(k, []).get(k)!).push(r); } return m; };
+const inList = (ids: number[]) => ids.map(() => "?").join(",");
+
+async function loadEligCtx(versions: Row[]): Promise<EligCtx> {
+  const ids = [...new Set(versions.map((v) => v.id as number))];
+  const leadIds = [...new Set(versions.map((v) => v.lead_id as number))];
+  const campIds = [...new Set(versions.map((v) => v.campaign_id as number))];
+  const empty = <T,>() => new Map<number, T>();
+  if (!ids.length) return { latest: empty(), rejected: empty(), auths: empty(), leads: empty(), contacts: empty(), camps: empty(), members: empty(), firstSent: new Map(), activeSendByLead: empty(), pendingByLead: empty(), recentByLead: empty(), capUsed: 0, cap: 0 };
+  const L = inList(leadIds);
+  const [threads, rej, auths, leads, contacts, camps, members, first, rival, pending, recent, set, capUsed] = await Promise.all([
+    all(`SELECT id,lead_id,contact_id,channel,campaign_id,version FROM message_versions WHERE lead_id IN (${L})`, leadIds),
+    all(`SELECT message_version_id,reason FROM message_decisions WHERE kind='rejected' AND message_version_id IN (${inList(ids)})`, ids),
+    all(`SELECT * FROM send_authorizations WHERE message_version_id IN (${inList(ids)}) ORDER BY id`, ids),
+    all(`SELECT * FROM leads WHERE id IN (${L})`, leadIds),
+    all(`SELECT * FROM contacts WHERE lead_id IN (${L})`, leadIds),
+    all(`SELECT id,status,name FROM campaigns WHERE id IN (${inList(campIds)})`, campIds),
+    all(`SELECT lead_id,campaign_id FROM lead_campaigns WHERE status='active' AND lead_id IN (${L})`, leadIds),
+    all(`SELECT lead_id,channel,COUNT(*) AS n FROM activities WHERE type='message' AND message_kind='first_email' AND is_demo=0 AND lead_id IN (${L}) GROUP BY lead_id,channel`, leadIds),
+    all(`SELECT * FROM send_authorizations WHERE kind='send' AND status='active' AND lead_id IN (${L})`, leadIds),
+    all(`SELECT lead_id,COUNT(*) AS n FROM send_events WHERE status='SENT_CONFIRMED_CRM_PENDING' AND lead_id IN (${L}) GROUP BY lead_id`, leadIds),
+    all(`SELECT lead_id,COUNT(*) AS n FROM activities WHERE type='message' AND occurred_at>? AND lead_id IN (${L}) GROUP BY lead_id`, [new Date(Date.now() - 86400000).toISOString(), ...leadIds]),
+    capacitySettings(), sentTodayTotal(),
+  ]);
+  const latest = new Map<number, number>();
+  const best = new Map<string, Row>();
+  for (const th of threads) { const k = `${th.lead_id}|${th.contact_id ?? 0}|${th.channel}|${th.campaign_id}`; const b = best.get(k); if (!b || (th.version as number) > (b.version as number)) best.set(k, th); }
+  for (const v of versions) { const b = best.get(`${v.lead_id}|${v.contact_id ?? 0}|${v.channel}|${v.campaign_id}`); latest.set(v.id as number, (b?.id as number) ?? (v.id as number)); }
+  return {
+    latest, rejected: new Map(rej.map((r) => [r.message_version_id as number, (r.reason as string) ?? null])), auths: groupBy(auths, "message_version_id"),
+    leads: new Map(leads.map((l) => [l.id as number, l])), contacts: groupBy(contacts, "lead_id"), camps: new Map(camps.map((c) => [c.id as number, c])), members: groupBy(members, "lead_id"),
+    firstSent: new Map(first.map((f) => [`${f.lead_id}|${f.channel}`, Number(f.n)])), activeSendByLead: groupBy(rival, "lead_id"),
+    pendingByLead: new Map(pending.map((p) => [p.lead_id as number, Number(p.n)])), recentByLead: new Map(recent.map((p) => [p.lead_id as number, Number(p.n)])),
+    capUsed, cap: set.daily_cap,
+  };
+}
+
+function evaluateEligibility(v: Row, c: EligCtx) {
   const versionId = v.id as number;
   const reasons: string[] = [];
+  const codes: string[] = [];
   const warnings: string[] = [];
-  if ((await latestVersion(v)) !== v.id) reasons.push("a newer version of this message exists; authorization never carries over to edited text");
-  if (await one("SELECT 1 AS x FROM message_decisions WHERE message_version_id=? AND kind='rejected'", [versionId])) reasons.push("the Owner rejected this draft (see decisions on the version); prepare a new version");
-  const auth = await one("SELECT * FROM send_authorizations WHERE message_version_id=? AND kind='send' AND status='active' ORDER BY id DESC LIMIT 1", [versionId]);
-  if (!auth) reasons.push("no active Owner send authorization for this exact version, recipient, channel and campaign");
-  const lead = await one("SELECT * FROM leads WHERE id=?", [v.lead_id as number]);
-  if (lead?.historical_only) reasons.push("the lead is historical-only and is not an outreach prospect");
-  const bad = await one("SELECT COUNT(*) AS n FROM contacts WHERE lead_id=? AND email_status='opted_out'", [v.lead_id as number]);
-  if (Number(bad!.n) > 0) reasons.push("the lead has an opted-out contact (do not contact)");
+  const add = (code: string, text: string) => { codes.push(code); reasons.push(text); };
+  if (c.latest.get(versionId) !== versionId) add("superseded", "a newer version of this message exists; authorization never carries over to edited text");
+  if (c.rejected.has(versionId)) add("rejected", "the Owner rejected this draft (see decisions on the version); prepare a new version");
+  const auth = [...(c.auths.get(versionId) ?? [])].reverse().find((a) => a.kind === "send" && a.status === "active");
+  if (!auth) add("no_send_authorization", "no active Owner send authorization for this exact version, recipient, channel and campaign");
+  const lead = c.leads.get(v.lead_id as number);
+  const contacts = c.contacts.get(v.lead_id as number) ?? [];
+  if (lead?.historical_only) add("historical_only", "the lead is historical-only and is not an outreach prospect");
+  if (contacts.some((x) => x.email_status === "opted_out")) add("opted_out", "the lead has an opted-out contact (do not contact)");
   if (v.contact_id) {
-    const c = await one("SELECT * FROM contacts WHERE id=?", [v.contact_id as number]);
-    if (c?.email_status === "bounced") reasons.push("this contact's address bounced");
-    if (v.channel === "email" && !c?.email) reasons.push("the recipient has no email address");
+    const ct = contacts.find((x) => x.id === v.contact_id);
+    if (ct?.email_status === "bounced") add("bounced", "this contact's address bounced");
+    if (ct?.is_invalid) add("contact_invalid", "this contact is marked invalid");
+    if (v.channel === "email" && !ct?.email) add("no_email", "the recipient has no email address");
   }
-  const camp = await one("SELECT status,name FROM campaigns WHERE id=?", [v.campaign_id as number]);
-  if (camp?.status !== "active") reasons.push(`campaign "${camp?.name}" is ${camp?.status}, not active`);
-  const mem = await all("SELECT campaign_id FROM lead_campaigns WHERE lead_id=? AND status='active'", [v.lead_id as number]);
-  if (!mem.some((m) => m.campaign_id === v.campaign_id)) reasons.push("the lead is not an active member of this campaign");
-  else if (mem.length > 1) reasons.push("the lead is active in several campaigns; resolve with an explicit transfer first");
-  if (auth?.permitted_action === "first_email") {
-    const prior = await one("SELECT COUNT(*) AS n FROM activities WHERE lead_id=? AND type='message' AND message_kind='first_email' AND channel=? AND is_demo=0", [v.lead_id as number, v.channel as string]);
-    if (Number(prior!.n) > 0) reasons.push("a first email was already sent to this lead on this channel (any campaign, any date)");
-  }
-  const rival = await one("SELECT COUNT(*) AS n FROM send_authorizations a WHERE a.kind='send' AND a.status='active' AND a.lead_id=? AND a.channel=? AND a.message_version_id<>?", [v.lead_id as number, v.channel as string, versionId]);
-  if (Number(rival!.n) > 0) reasons.push("another active send authorization exists for this lead and channel (conflicting communication)");
-  const pending = await one("SELECT COUNT(*) AS n FROM send_events WHERE lead_id=? AND status='SENT_CONFIRMED_CRM_PENDING'", [v.lead_id as number]);
-  if (Number(pending!.n) > 0) reasons.push("a previous send to this lead is SENT_CONFIRMED_CRM_PENDING; reconcile it before anything else");
-  const recent = await one("SELECT COUNT(*) AS n FROM activities WHERE lead_id=? AND type='message' AND occurred_at>?", [v.lead_id as number, new Date(Date.now() - 86400000).toISOString()]);
-  if (Number(recent!.n) > 0) warnings.push("a message to this lead was recorded in the last 24 hours");
-  return { reasons, warnings, authorization_id: (auth?.id as number) ?? null };
+  const camp = c.camps.get(v.campaign_id as number);
+  if (camp?.status !== "active") add("campaign_not_active", `campaign "${camp?.name}" is ${camp?.status}, not active`);
+  const mem = c.members.get(v.lead_id as number) ?? [];
+  if (!mem.some((m) => m.campaign_id === v.campaign_id)) add("not_in_campaign", "the lead is not an active member of this campaign");
+  else if (mem.length > 1) add("several_campaigns", "the lead is active in several campaigns; resolve with an explicit transfer first");
+  if (auth?.permitted_action === "first_email" && (c.firstSent.get(`${v.lead_id}|${v.channel}`) ?? 0) > 0) add("first_email_already_sent", "a first email was already sent to this lead on this channel (any campaign, any date)");
+  if ((c.activeSendByLead.get(v.lead_id as number) ?? []).some((a) => a.channel === v.channel && a.message_version_id !== versionId)) add("conflicting_authorization", "another active send authorization exists for this lead and channel (conflicting communication)");
+  if ((c.pendingByLead.get(v.lead_id as number) ?? 0) > 0) add("crm_pending", "a previous send to this lead is SENT_CONFIRMED_CRM_PENDING; reconcile it before anything else");
+  if (c.cap > 0 && c.capUsed >= c.cap) add("daily_cap_reached", `daily send cap reached: ${c.capUsed} of ${c.cap} messages already sent today (Asia/Hebron); it can go out on the next send slot`);
+  if ((c.recentByLead.get(v.lead_id as number) ?? 0) > 0) warnings.push("a message to this lead was recorded in the last 24 hours");
+  return { reasons, codes, warnings, authorization_id: (auth?.id as number) ?? null };
 }
 
+async function eligibilityCore(v: Row) {
+  return evaluateEligibility(v, await loadEligCtx([v]));
+}
 
 /* ---------- task <-> message version: live readiness and automatic status ---------- */
 /** A draft-preparation task closes when its draft is approved; every other open outreach task is a "send" task. */
@@ -287,21 +385,43 @@ const NON_SEND = /prepar|draft|research|validat|review/i;
 
 export type Readiness = { state: "ready" | "blocked" | "sent"; prep_status: string | null; blockers: string | null; label: string | null; version_id: number };
 
-/** The real state of a message version, computed from approvals and the eligibility rules. Never stored text. */
+/** The real state of message versions, computed from approvals and the eligibility rules (batched: few queries for any number of versions). */
+export async function readinessMany(versionIds: number[]): Promise<Map<number, Readiness>> {
+  const out = new Map<number, Readiness>();
+  const uniq = [...new Set(versionIds)];
+  if (!uniq.length) return out;
+  // The latest version of each requested message, in ONE query.
+  const pairs = await all(
+    `SELECT b.id AS base_id, l.* FROM message_versions b JOIN message_versions l ON l.id = (
+       SELECT v2.id FROM message_versions v2 WHERE v2.lead_id=b.lead_id AND COALESCE(v2.contact_id,0)=COALESCE(b.contact_id,0) AND v2.channel=b.channel AND v2.campaign_id=b.campaign_id ORDER BY v2.version DESC, v2.id DESC LIMIT 1)
+     WHERE b.id IN (${inList(uniq)})`, uniq);
+  const latestOf = new Map<number, number>(pairs.map((p) => [p.base_id as number, p.id as number]));
+  const latestRows = [...new Map(pairs.map((p) => [p.id as number, p as Row])).values()];
+  const ctx = await loadEligCtx(latestRows);
+  const lastFor = new Map<number, Readiness>();
+  for (const v of latestRows) {
+    const id = v.id as number;
+    const as = ctx.auths.get(id) ?? [];
+    const blocked = (prep: string, why: string): Readiness => ({ state: "blocked", prep_status: prep, blockers: why, label: null, version_id: id });
+    let r: Readiness;
+    if (as.some((a) => a.kind === "send" && a.status === "used")) r = { state: "sent", prep_status: null, blockers: null, label: "Sent", version_id: id };
+    else if (ctx.rejected.has(id)) r = blocked("draft_needed", `Draft rejected by the Owner: ${ctx.rejected.get(id)}. Prepare a new version.`);
+    else if (!as.some((a) => a.kind === "editorial" && a.status === "active")) r = blocked("internal_review", `Waiting for the Chief's editorial review of version #${id}.`);
+    else {
+      const core = evaluateEligibility(v, ctx);
+      if (!core.authorization_id) r = blocked("user_approval_needed", `Waiting for the Owner's send approval of version #${id}.`);
+      else if (core.reasons.length) r = blocked("validation_needed", `Approved, but not sendable: ${core.reasons.join("; ")}.`);
+      else r = { state: "ready", prep_status: "ready_for_execution", blockers: null, label: "Approved, ready to send", version_id: id };
+    }
+    lastFor.set(id, r);
+  }
+  for (const [baseId, lid] of latestOf) out.set(baseId, lastFor.get(lid)!);
+  return out;
+}
 export async function readiness(versionId: number): Promise<Readiness> {
-  let v = await one("SELECT * FROM message_versions WHERE id=?", [versionId]);
-  if (!v) throw new HttpError(404, "Message version not found.");
-  v = (await one("SELECT * FROM message_versions WHERE id=?", [await latestVersion(v)]))!;
-  const id = v.id as number;
-  const blocked = (prep: string, why: string): Readiness => ({ state: "blocked", prep_status: prep, blockers: why, label: null, version_id: id });
-  if (await one("SELECT 1 AS x FROM send_authorizations WHERE message_version_id=? AND kind='send' AND status='used'", [id])) return { state: "sent", prep_status: null, blockers: null, label: "Sent", version_id: id };
-  const rej = await one("SELECT reason FROM message_decisions WHERE message_version_id=? AND kind='rejected'", [id]);
-  if (rej) return blocked("draft_needed", `Draft rejected by the Owner: ${rej.reason}. Prepare a new version.`);
-  if (!(await one("SELECT 1 AS x FROM send_authorizations WHERE message_version_id=? AND kind='editorial' AND status='active'", [id]))) return blocked("internal_review", `Waiting for the Chief's editorial review of version #${id}.`);
-  const core = await eligibilityCore(v);
-  if (!core.authorization_id) return blocked("user_approval_needed", `Waiting for the Owner's send approval of version #${id}.`);
-  if (core.reasons.length) return blocked("validation_needed", `Approved, but not sendable: ${core.reasons.join("; ")}.`);
-  return { state: "ready", prep_status: "ready_for_execution", blockers: null, label: "Approved, ready to send", version_id: id };
+  const r = (await readinessMany([versionId])).get(versionId);
+  if (!r) throw new HttpError(404, "Message version not found.");
+  return r;
 }
 
 /** Finds (and links) the open send task(s) of this message's thread, pointing them at the latest version. */

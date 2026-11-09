@@ -248,6 +248,19 @@ PUT /api/v1/settings/send-delegation            Owner only: {"user_id": 2}  to t
       </Card>
 
       <div id="history" />
+      <Card title="Contacts, replies, bounces, capacity">
+        <ul className="mb-2 list-disc space-y-1 pl-5 text-sm text-slate-700">
+          <li><b>Add a contact to an existing lead.</b> <code>POST /api/v1/leads/{"{id}"}/contacts</code> <code>{"{"}name?, role, email, phone, linkedin, source_url, language, notes{"}"}</code>. The email is checked against every lead and against suppressed (opted-out, bounced) addresses: a match is <b>409</b> with the existing contact and lead ids and nothing is created. Owner, Chief and employees with access to the lead. The lead’s history records who added it.</li>
+          <li><b>Update a contact.</b> <code>PATCH /api/v1/contacts/{"{id}"}</code> with fields and/or <code>status</code>: <code>active | invalid | bounced | opted_out</code>. Contacts are never deleted. Only the Owner or a Chief can reactivate a bounced or opted-out contact.</li>
+          <li><b>Replies.</b> <code>POST /api/v1/replies</code> <code>{"{"}lead_id, contact_id, received_at, from, subject, message_id, summary, classification{"}"}</code>, classification <code>interested | soft | not_interested | out_of_office | auto_reply | other</code>. De-duplicated by <code>message_id</code>. Stages only move up; <code>not_interested</code> moves the lead to Lost, cancels its open follow-up tasks and withdraws its active send approvals. Out-of-office and auto-replies are logged but not counted as replies.</li>
+          <li><b>Bounces.</b> <code>POST /api/v1/bounces</code> <code>{"{"}contact_id, message_id, bounced_at, reason{"}"}</code>. Marks the contact bounced and blocks future sends to it.</li>
+          <li><b>Original researcher.</b> <code>POST /leads</code> accepts <code>original_researcher</code> (employee id or <code>"unknown"</code>): the discovery credit; the person entering the lead stays the registrar.</li>
+          <li><b>Read message versions.</b> <code>GET /api/v1/message-versions?campaign_id=&amp;lead_id=&amp;status=</code> and <code>GET /api/v1/message-versions/{"{id}"}/authorizations</code>. Read-only; Chief can read but still cannot create Owner send authorizations (unless delegation is on).</li>
+          <li><b>Daily capacity.</b> <code>GET /api/v1/capacity?date=</code> (used / reserved / remaining per campaign, Asia/Hebron). <code>GET/PUT /api/v1/settings/capacity</code> <code>{"{"}daily_cap, priority:[campaign ids]{"}"}</code> (Owner; cap 10 by default, 0 = none). At the cap the eligibility check returns <code>daily_cap_reached</code>.</li>
+          <li><b>Paged task list.</b> <code>GET /api/v1/tasks?page=1&amp;page_size=50&amp;q=</code>.</li>
+        </ul>
+      </Card>
+
       <Card title="Importing historical records (past leads, sends, replies, bounces)">
         <P>
           For data that already exists in spreadsheets, mailboxes or LinkedIn. Needs the <code>history.import</code> permission (Owner always; see “Authorizing Chief” below).
