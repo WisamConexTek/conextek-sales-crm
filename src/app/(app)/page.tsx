@@ -1,10 +1,12 @@
 import Link from "next/link";
 import { requireUser, can, isManager } from "@/lib/auth";
 import { getDashboard } from "@/lib/service/reports";
+import { sendApprovalPreview } from "@/lib/service/sends";
+import { schedule } from "@/lib/service/schedule";
 import { assignableUsers } from "@/lib/service/users";
 import { addDays, todayYmd } from "@/lib/db";
 import { Card, Empty, Flash, LeadLink, PageHeader, Stat, StatusBadge, Badge } from "@/components/ui";
-import { fmtShort, pct } from "@/lib/format";
+import { fmtShort, fmtYmd, pct } from "@/lib/format";
 import { MESSAGE_KIND_LABEL, ACTIVITY_TYPE_LABEL } from "@/lib/constants";
 import { q, sget, snum, type SP, stageMeta } from "@/lib/view";
 
@@ -15,6 +17,9 @@ export default async function Dashboard({ searchParams }: { searchParams: SP }) 
   const sp = await searchParams;
   const d = await getDashboard(me, { from: sget(sp, "from"), to: sget(sp, "to"), employee: snum(sp, "employee"), all: sget(sp, "all") === "1" || (!sget(sp, "from") && !sget(sp, "to")) });
   const users = await assignableUsers();
+  const sendPrev = await sendApprovalPreview(me, 5);
+  const wk = await schedule(me, { from: todayYmd(), to: addDays(todayYmd(), 1) });
+  const wkNext = wk.rows.filter((r) => r.state !== "completed").sort((a, b) => (a.state === "overdue" ? 0 : 1) - (b.state === "overdue" ? 0 : 1)).slice(0, 6);
   const teamView = can(me, "reports.view") || isManager(me);
   const today = todayYmd();
   const range = d.all ? "All data (since the beginning)" : d.from === d.to ? (d.from === today ? "Today" : d.from) : `${d.from} → ${d.to}`;
@@ -59,6 +64,37 @@ export default async function Dashboard({ searchParams }: { searchParams: SP }) 
         <Link href="/" className="btn">Reset</Link>
       </form>
 
+      <div className="mb-5 grid gap-5 lg:grid-cols-2">
+        {sendPrev && (
+          <Card title={`Send approvals waiting: ${sendPrev.count}`} right={<Link href="/send-approvals" className="btn btn-primary btn-sm no-underline">{sendPrev.count ? "Review & approve →" : "Open →"}</Link>}>
+            {sendPrev.items.length === 0 ? <Empty>No message versions are waiting for your send approval.</Empty> : (
+              <ul className="divide-y divide-slate-100">{sendPrev.items.map((v) => (
+                <li key={v.id as number} className="py-1.5 text-sm">
+                  <div className="flex justify-between gap-2"><LeadLink id={v.lead_id as number} company={v.company as string} /><Badge tone="purple">{v.campaign as string}</Badge></div>
+                  <div className="truncate text-xs text-slate-500" dir="auto">{(v.subject as string) || "(no subject)"}</div>
+                </li>))}
+                {sendPrev.count > sendPrev.items.length && <li className="py-1.5 text-xs text-slate-500">…and {sendPrev.count - sendPrev.items.length} more</li>}
+              </ul>
+            )}
+          </Card>
+        )}
+        <Card title="Today & Tomorrow" right={<Link href="/schedule" className="text-xs">Open →</Link>}>
+          <div className="mb-2 flex flex-wrap gap-2 text-sm">
+            {(["overdue", "blocked", "ready", "completed"] as const).map((s) => <Link key={s} href={`/schedule?state=${s}`} className="no-underline"><Badge tone={s === "overdue" ? "red" : s === "blocked" ? "amber" : s === "ready" ? "green" : "blue"}>{s[0].toUpperCase() + s.slice(1)}: {wk.counts[s]}</Badge></Link>)}
+            <span className="text-xs text-slate-400">today &amp; tomorrow · live</span>
+          </div>
+          {wkNext.length === 0 ? <Empty>Nothing open for today or tomorrow.</Empty> : (
+            <ul className="divide-y divide-slate-100">{wkNext.map((r) => (
+              <li key={r.id as number} className="py-1.5 text-sm">
+                <div className="flex justify-between gap-2"><span className="min-w-0 truncate"><Link href={`/tasks/${r.id}`}>{(r.company as string) ?? r.title}</Link> <span className="text-xs text-slate-500">{(r.action_type as string) ?? (r.channel as string) ?? ""}</span></span>
+                  <span className="shrink-0 text-xs text-slate-500">{r.date_only ? `${fmtYmd(r.on as string)} · date only` : fmtShort(r.at as string)} · <Badge tone={r.state === "overdue" ? "red" : r.state === "blocked" ? "amber" : r.state === "ready" ? "green" : "gray"}>{r.state as string}</Badge></span></div>
+                {r.reason ? <div className={`text-xs ${r.state === "overdue" ? "text-red-600" : "text-slate-500"}`}>{r.reason as string}</div> : null}
+              </li>))}
+            </ul>
+          )}
+        </Card>
+      </div>
+
       <div className="mb-5 grid grid-cols-2 gap-3 lg:grid-cols-5">
         <Stat label={`Activity · ${range.toLowerCase()}`} value={d.m.first_emails + d.m.follow_ups + (d.counts.research ?? 0) + (d.counts.draft ?? 0) + (d.counts.status ?? 0) + d.m.replies}
           sub={`${d.m.first_emails} first emails · ${d.m.follow_ups} follow-ups · ${d.counts.research ?? 0} research · ${d.counts.status ?? 0} stage changes · ${d.m.leads_added} leads added`} />
@@ -67,8 +103,13 @@ export default async function Dashboard({ searchParams }: { searchParams: SP }) 
           sub={`${d.m.first_email_bounces} of ${d.m.first_emails} first emails · follow-ups: ${pct(d.followBounceRate)} (${d.m.follow_up_bounces}/${d.m.follow_ups})`} />
         <Stat label="Overdue tasks" value={d.overdueCount} tone={d.overdueCount ? "red" : undefined} href="/my-work"
           sub={d.overdueCount ? `${d.attention.overdueOld} overdue 7+ days · oldest ${ago(d.overdueTasks[0]?.due_at)} · ${d.attention.dueToday} due today` : `${d.attention.dueToday} due today · ${d.attention.dueTomorrow} tomorrow`} />
-        <Stat label="Approvals waiting" value={d.pending.chief + d.pending.wisam} href="/approvals" tone={d.pending.chief + d.pending.wisam ? "amber" : undefined}
-          sub={`${d.pending.chief} on Chief · ${d.pending.wisam} on Wisam${d.pending.chief + d.pending.wisam ? ` · oldest waiting ${ago([d.attention.oldestApproval.chief, d.attention.oldestApproval.wisam].filter(Boolean).sort()[0])}` : ""}`} />
+        {sendPrev ? (
+          <Stat label="Send approvals" value={sendPrev.count} href="/send-approvals" tone={sendPrev.count ? "amber" : undefined}
+            sub={<>waiting for your OK to send · <Link href="/approvals">{d.pending.chief + d.pending.wisam} task approvals</Link></>} />
+        ) : (
+                  <Stat label="Approvals waiting" value={d.pending.chief + d.pending.wisam} href="/approvals" tone={d.pending.chief + d.pending.wisam ? "amber" : undefined}
+            sub={`${d.pending.chief} on Chief · ${d.pending.wisam} on Wisam${d.pending.chief + d.pending.wisam ? ` · oldest waiting ${ago([d.attention.oldestApproval.chief, d.attention.oldestApproval.wisam].filter(Boolean).sort()[0])}` : ""}`} />
+        )}
       </div>
 
       <Card title="Needs attention now" className="mb-5" right={<span className="text-xs text-slate-500">live · not limited to the date range</span>}>
@@ -119,7 +160,7 @@ export default async function Dashboard({ searchParams }: { searchParams: SP }) 
           )}
         </Card>
 
-        <Card title="Approvals waiting" right={<Link href="/approvals" className="text-xs">Open →</Link>}>
+        {!sendPrev && <Card title="Approvals waiting" right={<Link href="/approvals" className="text-xs">Open →</Link>}>
           {d.pendingList.length === 0 ? <Empty>Nothing waiting for approval.</Empty> : (
             <ul className="divide-y divide-slate-100">
               {d.pendingList.map((a) => (
@@ -133,7 +174,7 @@ export default async function Dashboard({ searchParams }: { searchParams: SP }) 
               ))}
             </ul>
           )}
-        </Card>
+        </Card>}
 
         <Card title={`Overdue tasks (${d.overdueCount})`} right={<Link href="/my-work" className="text-xs">My Work →</Link>}>
           {d.overdueTasks.length === 0 ? <Empty>No overdue tasks.</Empty> : (

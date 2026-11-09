@@ -5,7 +5,7 @@ import { assignableUsers } from "@/lib/service/users";
 import { listCampaigns, listChannels, listProjects } from "@/lib/service/campaigns";
 import { addDays, todayYmd } from "@/lib/db";
 import { Badge, Card, Empty, LeadLink, PageHeader, StatusBadge } from "@/components/ui";
-import { fmtShort, fmtDate, fmtDateTime, isDateOnlyTime } from "@/lib/format";
+import { fmtShort, fmtYmd, fmtDateTime } from "@/lib/format";
 import { q, sget, snum, type SP } from "@/lib/view";
 
 const PREP: Record<string, string> = { validation_needed: "Validation needed", draft_needed: "Draft needed", internal_review: "Internal review", user_approval_needed: "User approval needed", ready_for_execution: "Ready for authorized execution" };
@@ -48,12 +48,12 @@ export default async function Schedule({ searchParams }: { searchParams: SP }) {
               <tbody className="divide-y divide-slate-100">
                 {r.rows.map((t) => (
                   <tr key={t.id} className="align-top">
-                    <td className="py-2 pr-3 whitespace-nowrap">{t.sent_at ? <>{fmtDateTime(t.sent_at)}<div className="text-xs text-emerald-700">sent at this time</div></> : isDateOnlyTime(t.at) ? <>{fmtDate(t.at)}<div className="text-xs text-slate-400">date only (no set time)</div></> : <>{fmtShort(t.at)}<div className="text-xs text-slate-400">{t.at_source === "due_at" ? "due date (no schedule)" : "scheduled"}</div></>}</td>
+                    <td className="py-2 pr-3 whitespace-nowrap">{t.sent_at ? <>{fmtDateTime(t.sent_at)}<div className="text-xs text-emerald-700">sent at this time</div></> : t.date_only ? <>{fmtYmd(t.on)}<div className="text-xs text-slate-400">date only (no set time)</div></> : <>{fmtShort(t.at)}<div className="text-xs text-slate-400">{t.at_source === "due_at" ? "due date (no schedule)" : "scheduled"}</div></>}</td>
                     <td className="pr-3">{t.employee}</td>
                     <td className="pr-3">{t.campaign ? <>{t.project}<div className="text-xs text-slate-500">{t.campaign}</div></> : <span className="text-amber-700">no campaign</span>}</td>
                     <td className="pr-3">{t.company ? <LeadLink id={t.lead_id} company={t.company} /> : "—"}<div className="text-xs text-slate-500">{t.contact ?? ""}</div></td>
                     <td className="pr-3">{t.channel ?? "—"}<div className="text-xs text-slate-500">{t.action_type ?? ""}</div></td>
-                    <td className="pr-3">{t.prep_label ? <span className="font-medium text-emerald-700">{t.prep_label}</span> : t.prep_status ? PREP[t.prep_status] : <span className="text-slate-400">not set</span>}{t.message_version_id ? <div className="text-xs text-slate-500">message version #{t.message_version_id}</div> : null}{t.state === "completed" && t.activity_id ? <div className="text-xs text-slate-500">activity #{t.activity_id}</div> : null}{t.blocked_reason && <div className="text-xs text-amber-700">Blocker: {t.blocked_reason}</div>}</td>
+                    <td className="pr-3">{t.prep_label ? <span className="font-medium text-emerald-700">{t.prep_label}</span> : t.prep_status ? PREP[t.prep_status] : <span className="text-slate-400">not set</span>}{t.message_version_id ? <div className="text-xs text-slate-500">message version #{t.message_version_id}</div> : null}{t.state === "completed" && t.activity_id ? <div className="text-xs text-slate-500">activity #{t.activity_id}</div> : null}{t.blocked_reason && <div className="text-xs text-amber-700">Blocker: {t.blocked_reason}</div>}{!t.blocked_reason && t.reason && <div className={`text-xs ${t.state === "overdue" ? "text-red-600" : "text-slate-500"}`}>{t.reason}</div>}</td>
                     <td><Badge tone={TONE[t.state as keyof typeof TONE]}>{t.state}</Badge>{t.is_overdue && t.state === "blocked" && <div className="text-xs text-red-600">also overdue</div>}<div className="mt-1"><Link href={`/tasks/${t.id}`} className="text-xs">{t.title}</Link></div><StatusBadge status={t.status} /></td>
                   </tr>
                 ))}

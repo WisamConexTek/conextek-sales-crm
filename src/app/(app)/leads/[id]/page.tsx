@@ -13,7 +13,7 @@ import {
 import { Ref } from "@/components/Ref";
 import { RecordForm } from "@/components/RecordForm";
 import { Badge, Card, DemoBadge, EmailStatusBadge, Field, Flash, Opts, OutcomeBadge, StageBadge, StatusBadge } from "@/components/ui";
-import { fmtDate, fmtDateTime, fmtEvent, isOverdue, toLocalInput, toDateInput } from "@/lib/format";
+import { fmtDate, fmtYmd, fmtDateTime, fmtEvent, isOverdue, toLocalInput, toDateInput } from "@/lib/format";
 import { ACTIVITY_TYPE_LABEL, MESSAGE_KIND_LABEL, EMAIL_STATUSES, EMAIL_STATUS_LABEL } from "@/lib/constants";
 import { sget, type SP } from "@/lib/view";
 
@@ -214,7 +214,7 @@ export default async function LeadPage({ params, searchParams }: { params: Promi
           <ul className="mb-3 divide-y divide-slate-100">
             {tasks.map((t) => (
               <li key={t.id} className="flex flex-wrap items-center justify-between gap-2 py-2">
-                <div><Link href={`/tasks/${t.id}`} className="font-medium">{t.title}</Link> <Ref kind="Task" id={t.id} href={`/tasks/${t.id}`} /><div className="text-xs text-slate-500">{t.assignee_name}{t.due_at ? ` · due ${fmtDate(t.due_at)}` : ""}{t.completed_at ? ` · completed ${fmtDateTime(t.completed_at)}${t.completed_by_name ? ` by ${t.completed_by_name}` : ""}` : ""}{t.message_version_id ? ` · message version #${t.message_version_id}` : ""}{t.sent_at ? ` · sent ${fmtDateTime(t.sent_at)}` : ""}{t.activity_id ? ` · activity #${t.activity_id}` : ""}</div></div>
+                <div><Link href={`/tasks/${t.id}`} className="font-medium">{t.title}</Link> <Ref kind="Task" id={t.id} href={`/tasks/${t.id}`} /><div className="text-xs text-slate-500">{t.assignee_name}{t.due_on || t.due_at ? ` · due ${(t.due_on ? fmtYmd(t.due_on) : fmtDate(t.due_at))}` : ""}{t.completed_at ? ` · completed ${fmtDateTime(t.completed_at)}${t.completed_by_name ? ` by ${t.completed_by_name}` : ""}` : ""}{t.message_version_id ? ` · message version #${t.message_version_id}` : ""}{t.sent_at ? ` · sent ${fmtDateTime(t.sent_at)}` : ""}{t.activity_id ? ` · activity #${t.activity_id}` : ""}</div></div>
                 <StatusBadge status={t.status} approvalFrom={t.approval_from} />
               </li>
             ))}

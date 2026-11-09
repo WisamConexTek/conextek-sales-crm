@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { InValue } from "@libsql/client";
 import { all, one, run, now, tx, type Row } from "../db";
 import { HttpError, can, requirePerm, isManager, type Actor } from "../auth";
+import { liveTasks } from "./taskview";
 import { audit, parse, optText, reqText, optDate, optBool, domainOf, assertListKey, optInt, parseEventDate, eventDateText, dateProblem, type EventDate } from "./common";
 
 /* ---------- access ---------- */
@@ -354,9 +355,9 @@ export async function getLead(actor: Actor, id: number) {
      WHERE a.lead_id=? ORDER BY a.occurred_at DESC, a.id DESC`,
     [id],
   );
-  const tasks = await all(
+  const tasks = await liveTasks(await all(
     `SELECT t.*, u.name AS assignee_name, cu.name AS completed_by_name FROM tasks t JOIN users u ON u.id=t.assignee_id LEFT JOIN users cu ON cu.id=t.completed_by WHERE t.lead_id=? ORDER BY t.created_at DESC`,
     [id],
-  );
+  ));
   return { lead, contacts, history, tasks };
 }

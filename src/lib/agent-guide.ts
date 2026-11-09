@@ -1,5 +1,5 @@
 /** The agent briefing. Served at GET /api/v1/guide (Bearer key). Bump GUIDE_VERSION when behaviour changes. */
-export const GUIDE_VERSION = "2026-11-09.4";
+export const GUIDE_VERSION = "2026-11-09.5";
 
 export const AGENT_GUIDE = `# ConexTek CRM — agent briefing (version ${GUIDE_VERSION})
 Base URL: the CRM's own address + /api/v1. Auth: header "Authorization: Bearer <your key>". Every response is {ok, data} or {ok:false, error}.
@@ -34,9 +34,12 @@ Tasks: POST /tasks {title, lead_id, assignee_id, campaign_id, channel, action_ty
   Automatic status (you do not set these, and must not work around them):
    - Chief editorial + Owner send authorization on the exact latest version and a passing eligibility check => task prep_status=ready_for_execution, blockers cleared, shown as "Approved, ready to send".
    - Revoked approval, an edit (new version), a rejection, a paused campaign etc. => back to blocked with the correct blocker text (internal_review / user_approval_needed / draft_needed / validation_needed). /schedule computes this live, so counters are always real.
-   - When that draft is approved, an open draft-preparation task (action_type containing "draft", e.g. prepare_first_email_draft) of the same lead closes by itself.
+   - When that draft is approved (or its send is recorded), an open draft-preparation task (action_type containing "draft", e.g. prepare_first_email_draft) of the same lead closes by itself.
    - POST /sends recorded => the linked send task becomes completed, with activity_id, sent_at and completed_by = the person who reported the send, whoever the assignee is (audit "task_auto_complete"). POST /sends/{event_id}/reconcile does the same once the record is saved.
-  Date-only tasks (due_at "YYYY-MM-DD") have no time of day: the 23:59 stored value is not a send time; the real time appears as sent_at once sent.
+  One status everywhere: GET /tasks, GET /tasks/{id}, the lead page and GET /schedule all return the same live fields: state (overdue|blocked|ready|planned|completed), prep_status, blockers (live for tasks linked to a message version), prep_label, reason (plain words: why blocked / held / overdue). Never trust an older cached copy.
+  Date-only tasks: send due_at or scheduled_at as "YYYY-MM-DD". They are stored and returned as a pure date: due_on / scheduled_on (due_at / scheduled_at are null, date_only:true, on:"YYYY-MM-DD"). There is no time of day; the real time appears as sent_at once sent.
+  Held by the daily send cap: Owner/Chief POST /tasks/{id}/reschedule {"scheduled_at":"<next send slot>","reason":"daily send limit reached, moved to next day"}. The task keeps its old time (rescheduled_from), shows "Held: <reason>", is no longer Overdue, and it is audit-logged. Employees and agents without manager rights cannot do this; do not edit the schedule yourself to dodge the cap.
+  Housekeeping (Owner/Chief): POST /tasks/reconcile brings tasks in line with approvals and sends that already exist (closes draft-prep tasks whose draft was approved or sent; lists send tasks still open although the send was recorded). Idempotent.
 Your work list: GET /schedule?view=today|tomorrow (state: overdue|blocked|ready|planned|completed). Do only 'ready' work, and only after the eligibility check below.
 
 ## Sending workflow (the only allowed order)

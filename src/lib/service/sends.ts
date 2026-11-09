@@ -110,6 +110,13 @@ export async function countPendingSendApprovals(): Promise<number> {
   return Number((await one(`SELECT COUNT(*) AS n FROM message_versions v JOIN leads l ON l.id=v.lead_id WHERE ${WAITING}`))!.n);
 }
 
+/** Dashboard card: how many versions wait for the Owner's send approval, and the first few. Null for people who cannot approve sends. */
+export async function sendApprovalPreview(actor: Actor, limit = 5) {
+  if (!(await canAuthorizeSend(actor))) return null;
+  const items = await all(`SELECT v.id,v.version,v.lead_id,v.channel,v.subject,l.company,c.name AS campaign FROM message_versions v JOIN leads l ON l.id=v.lead_id JOIN campaigns c ON c.id=v.campaign_id WHERE ${WAITING} ORDER BY v.created_at, v.id LIMIT ?`, [limit]);
+  return { count: await countPendingSendApprovals(), items };
+}
+
 function suggestAction(taskAction: string | null, priorFirst: number): (typeof ACTIONS)[number] {
   const t = (taskAction ?? "").toLowerCase();
   if (t.includes("follow")) return "follow_up";
@@ -311,6 +318,41 @@ async function linkSendTasks(v: Row): Promise<Row[]> {
   return linked;
 }
 
+/** Closes the open draft-preparation task(s) of this message once the draft has BOTH approvals (or has been sent). */
+export async function closePrepTasks(actor: Actor, v: Row, why: string) {
+  const id = v.id as number;
+  const has = async (kind: string) => !!(await one("SELECT 1 AS x FROM send_authorizations WHERE message_version_id=? AND kind=? AND status IN ('active','used')", [id, kind]));
+  const sent = !!(await one("SELECT 1 AS x FROM send_authorizations WHERE message_version_id=? AND kind='send' AND status='used'", [id]));
+  if (!sent && !((await has("editorial")) && (await has("send")))) return 0;
+  const preps = await all("SELECT * FROM tasks WHERE lead_id=? AND status NOT IN ('completed','cancelled') AND action_type LIKE '%draft%' COLLATE NOCASE AND (id=? OR ((channel IS NULL OR channel=?) AND (campaign_id IS NULL OR campaign_id=?)))", [v.lead_id as number, (v.task_id as number) ?? 0, v.channel as string, v.campaign_id as number]);
+  for (const t of preps) {
+    const ts = now();
+    const note = `Auto-closed: ${why} (version #${id})`;
+    await run("UPDATE tasks SET status='completed', completed_at=?, completed_by=?, completion_note=?, message_version_id=COALESCE(message_version_id,?), blockers=NULL, updated_at=? WHERE id=?", [ts, actor.id, note, id, ts, t.id as number]);
+    await run("INSERT INTO activities (lead_id,task_id,type,title,body,actor_id,occurred_at,created_at,is_demo) VALUES (?,?,'task',?,?,?,?,?,?)", [t.lead_id as number, t.id as number, `Task completed: ${t.title}`, note, actor.id, ts, ts, t.is_demo as number]);
+    await audit(actor, "task_auto_complete", "task", t.id as number, { reason: why, message_version_id: id });
+  }
+  return preps.length;
+}
+
+/**
+ * Owner/Chief: bring every task in line with the approvals and sends that already exist (stored blockers, draft-prep tasks that should have closed).
+ * Idempotent. Never completes a send task by itself: those are listed for you to close with a proving activity.
+ */
+export async function reconcileTasks(actor: Actor) {
+  if (!isManager(actor)) throw new HttpError(403, "Only the Owner or a Chief can reconcile tasks.");
+  const versions = await all(`SELECT v.id FROM message_versions v JOIN leads l ON l.id=v.lead_id WHERE l.is_demo=0 AND ${LATEST}`);
+  let prepClosed = 0;
+  for (const v of versions) {
+    const before = Number((await one("SELECT COUNT(*) AS n FROM tasks WHERE status='completed' AND completion_note LIKE 'Auto-closed:%'"))!.n);
+    await syncTasks(actor, v.id as number);
+    prepClosed += Number((await one("SELECT COUNT(*) AS n FROM tasks WHERE status='completed' AND completion_note LIKE 'Auto-closed:%'"))!.n) - before;
+  }
+  const sentOpen = await all("SELECT t.id,t.title,t.lead_id,t.message_version_id,e.activity_id FROM tasks t JOIN send_authorizations a ON a.message_version_id=t.message_version_id AND a.kind='send' AND a.status='used' LEFT JOIN send_events e ON e.id=a.send_event_id WHERE t.status NOT IN ('completed','cancelled')");
+  await audit(actor, "reconcile_tasks", "task", null, { versions: versions.length, prep_closed: prepClosed });
+  return { versions_checked: versions.length, prep_tasks_closed: prepClosed, sent_but_task_open: sentOpen };
+}
+
 /** Keeps stored task fields in line with the real approval state, and closes the draft-preparation task once its draft is approved. */
 export async function syncTasks(actor: Actor, versionId: number) {
   try {
@@ -325,17 +367,8 @@ export async function syncTasks(actor: Actor, versionId: number) {
       await run("UPDATE tasks SET prep_status=?, blockers=?, updated_at=? WHERE id=?", [r.prep_status, blockers, now(), t.id as number]);
       await audit(actor, "task_auto_status", "task", t.id as number, { message_version_id: v.id, from: { prep_status: t.prep_status, blockers: t.blockers }, to: { prep_status: r.prep_status, blockers } });
     }
-    // draft approved (editorial + send) -> the preparation task closes by itself
-    const approved = r.state === "ready" || (r.state === "blocked" && r.prep_status === "validation_needed");
-    if (approved) {
-      const preps = await all("SELECT * FROM tasks WHERE lead_id=? AND status NOT IN ('completed','cancelled') AND (action_type LIKE '%draft%' COLLATE NOCASE) AND (channel IS NULL OR channel=?) AND (campaign_id IS NULL OR campaign_id=?)", [v.lead_id as number, v.channel as string, v.campaign_id as number]);
-      for (const t of preps) {
-        const ts = now();
-        await run("UPDATE tasks SET status='completed', completed_at=?, completed_by=?, completion_note=?, message_version_id=?, blockers=NULL, updated_at=? WHERE id=?", [ts, actor.id, `Auto-closed: draft version #${v.id} was approved`, v.id as number, ts, t.id as number]);
-        await run("INSERT INTO activities (lead_id,task_id,type,title,body,actor_id,occurred_at,created_at,is_demo) VALUES (?,?,'task',?,?,?,?,?,?)", [t.lead_id as number, t.id as number, `Task completed: ${t.title}`, `Auto-closed: draft version #${v.id} was approved`, actor.id, ts, ts, t.is_demo as number]);
-        await audit(actor, "task_auto_complete", "task", t.id as number, { reason: "draft approved", message_version_id: v.id });
-      }
-    }
+    // draft approved (editorial + send, still active or already used by a send) -> the preparation task closes by itself
+    await closePrepTasks(actor, v, "draft approved");
   } catch (e) {
     console.error("task sync failed", e);
   }
@@ -438,6 +471,7 @@ async function recordEvent(actor: Actor, eventId: string) {
     return { ...(await sendEventView(eventId)), message: "The message was sent but the CRM record is pending. Do NOT resend. Stop sending in this run and POST /sends/{event_id}/reconcile." };
   }
   await audit(actor, "record_send", "send_event", e.id as number, { event_id: eventId });
+  try { const sv = await one("SELECT * FROM message_versions WHERE id=?", [e.message_version_id as number]); if (sv) await closePrepTasks(actor, sv, "send recorded"); } catch (err) { console.error("prep close failed", err); }
   return sendEventView(eventId);
 }
 

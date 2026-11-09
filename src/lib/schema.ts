@@ -475,4 +475,15 @@ UPDATE tasks SET message_version_id = (
 WHERE EXISTS (SELECT 1 FROM message_versions v WHERE v.task_id=tasks.id);
 CREATE INDEX idx_tasks_version ON tasks(message_version_id);
 `,
+  `
+-- Migration 10 (additive): date-only deadlines are kept as pure dates; a held task records why it was moved.
+ALTER TABLE tasks ADD COLUMN due_on TEXT;
+ALTER TABLE tasks ADD COLUMN scheduled_on TEXT;
+ALTER TABLE tasks ADD COLUMN hold_reason TEXT;
+ALTER TABLE tasks ADD COLUMN rescheduled_from TEXT;
+-- Backfill the pure date for existing date-only tasks (stored earlier as 23:59 local = 21:59Z in winter, 20:59Z in summer for Asia/Hebron). due_at itself is untouched.
+UPDATE tasks SET due_on = date(due_at,'+2 hours') WHERE due_at IS NOT NULL AND substr(due_at,12,5)='21:59';
+UPDATE tasks SET due_on = date(due_at,'+3 hours') WHERE due_at IS NOT NULL AND substr(due_at,12,5)='20:59' AND due_on IS NULL;
+UPDATE tasks SET scheduled_on = scheduled_input WHERE scheduled_input GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]';
+`,
 ];

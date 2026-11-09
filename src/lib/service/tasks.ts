@@ -7,6 +7,7 @@ import { audit, parse, optText, optInt, optDate, optBool, reqText, assertListKey
 import { assertLeadAccess } from "./leads";
 import { assertChannel, PREP_STATUSES } from "./campaigns";
 import { parseWhen } from "./common";
+import { liveTasks, dateOnlyOf, type LiveTask } from "./taskview";
 
 /* ================= tasks ================= */
 
@@ -73,9 +74,9 @@ export async function createTask(actor: Actor, input: unknown, isDemo = false) {
 
   const t = now();
   const r = await run(
-    `INSERT INTO tasks (lead_id,assignee_id,created_by,title,instructions,task_type,approval_from,due_at,is_demo,created_at,updated_at,scheduled_at,scheduled_input,channel,action_type,prep_status,blockers,campaign_id)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-    [d.lead_id, assignee, actor.id, d.title, d.instructions, d.task_type, approvalFrom, d.due_at, isTest ? 1 : 0, t, t, sch.at, sch.input, d.channel ?? null, d.action_type ?? null, d.prep_status ?? null, d.blockers ?? null, d.campaign_id ?? null],
+    `INSERT INTO tasks (lead_id,assignee_id,created_by,title,instructions,task_type,approval_from,due_at,is_demo,created_at,updated_at,scheduled_at,scheduled_input,channel,action_type,prep_status,blockers,campaign_id,due_on,scheduled_on)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [d.lead_id, assignee, actor.id, d.title, d.instructions, d.task_type, approvalFrom, d.due_at, isTest ? 1 : 0, t, t, sch.at, sch.input, d.channel ?? null, d.action_type ?? null, d.prep_status ?? null, d.blockers ?? null, d.campaign_id ?? null, dateOnlyOf(d.due_at), dateOnlyOf(sch.at)],
   );
   if (d.lead_id)
     await run(
@@ -89,7 +90,7 @@ export async function createTask(actor: Actor, input: unknown, isDemo = false) {
 export type TaskFilters = {
   assignee?: number; status?: string; lead?: number; overdue?: boolean; open?: boolean; includeDemo?: boolean; limit?: number;
 };
-export async function listTasks(actor: Actor, f: TaskFilters = {}): Promise<Row[]> {
+export async function listTasks(actor: Actor, f: TaskFilters = {}): Promise<LiveTask[]> {
   const where: string[] = [];
   const args: InValue[] = [];
   const viewAll = can(actor, "tasks.view_all") || isManager(actor);
@@ -100,7 +101,7 @@ export async function listTasks(actor: Actor, f: TaskFilters = {}): Promise<Row[
   if (f.open) where.push(`t.status IN (${OPEN_TASK_STATUSES.map(() => "?").join(",")})`), args.push(...OPEN_TASK_STATUSES);
   if (f.overdue) (where.push(`t.due_at < ? AND t.status IN ('todo','in_progress','changes_requested','approved')`), args.push(now()));
   if (!f.includeDemo) where.push("t.is_demo=0");
-  return all(
+  return liveTasks(await all(
     `SELECT t.*, l.company, u.name AS assignee_name, cb.name AS created_by_name, cu.name AS completed_by_name,
             (SELECT a.id FROM approvals a WHERE a.task_id=t.id AND a.status='pending' ORDER BY a.id DESC LIMIT 1) AS pending_approval_id,
             (SELECT COUNT(*) FROM task_notes n WHERE n.task_id=t.id) AS note_count
@@ -109,7 +110,7 @@ export async function listTasks(actor: Actor, f: TaskFilters = {}): Promise<Row[
      ${where.length ? "WHERE " + where.join(" AND ") : ""}
      ORDER BY (t.due_at IS NULL), t.due_at ASC, t.id DESC LIMIT ?`,
     [...args, f.limit ?? 300],
-  );
+  ));
 }
 
 export async function getTask(actor: Actor, id: number): Promise<Row> {
@@ -119,7 +120,7 @@ export async function getTask(actor: Actor, id: number): Promise<Row> {
     [id],
   );
   if (!t || (t.assignee_id !== actor.id && !can(actor, "tasks.view_all") && !isManager(actor))) throw new HttpError(404, "Task not found.");
-  return t;
+  return (await liveTasks([t]))[0];
 }
 
 /** One task with its full note history, approvals and a single chronological timeline (who did what, when). */
@@ -210,7 +211,7 @@ export async function updateTask(actor: Actor, id: number, input: Record<string,
     if (!canManage && !(isCreator && isAssignee)) throw new HttpError(403, "Only a manager can change the task's details, due date or assignee.");
     if (d.title !== undefined) set("title", d.title);
     if (d.instructions !== undefined) set("instructions", d.instructions);
-    if (d.due_at !== undefined) set("due_at", d.due_at);
+    if (d.due_at !== undefined) { set("due_at", d.due_at); set("due_on", dateOnlyOf(d.due_at)); }
     if (d.assignee_id !== undefined && d.assignee_id !== null) {
       if (!canManage) throw new HttpError(403, "Only a manager can reassign tasks.");
       if (!(await one("SELECT id FROM users WHERE id=? AND active=1", [d.assignee_id]))) throw new HttpError(400, "assignee_id: unknown or disabled employee.");
@@ -229,7 +230,7 @@ export async function updateTask(actor: Actor, id: number, input: Record<string,
   if (d.channel !== undefined) { await assertChannel(d.channel); set("channel", d.channel); }
   if (d.action_type !== undefined) set("action_type", d.action_type);
   if (d.campaign_id !== undefined) { await assertCampaign(d.campaign_id); set("campaign_id", d.campaign_id); }
-  if (d.scheduled_at !== undefined) { const sch = schedule(d.scheduled_at); set("scheduled_at", sch.at); set("scheduled_input", sch.input); }
+  if (d.scheduled_at !== undefined) { const sch = schedule(d.scheduled_at); set("scheduled_at", sch.at); set("scheduled_input", sch.input); set("scheduled_on", dateOnlyOf(sch.at)); }
   if (!sets.length) return;
   const stmts = [{ sql: `UPDATE tasks SET ${sets.join(",")}, updated_at=? WHERE id=?`, args: [...args, now(), id] as InValue[] }];
   if (d.status === "cancelled")
@@ -244,6 +245,31 @@ export async function updateTask(actor: Actor, id: number, input: Record<string,
     await run(`INSERT INTO activities (lead_id,task_id,type,title,actor_id,occurred_at,created_at,is_demo) VALUES (?,?,?,?,?,?,?,?)`,
       [t.lead_id, id, "task", `Task cancelled: ${t.title}`, actor.id, now(), now(), t.is_demo]);
   await audit(actor, "update_task", "task", id, changes);
+}
+
+/**
+ * Owner/Chief deliberately holds a task (for example the daily send cap is reached) and moves it to the next send slot.
+ * The reason is stored on the task and shown in plain words; the old time is kept; the task is no longer overdue.
+ */
+export async function rescheduleTask(actor: Actor, id: number, input: unknown) {
+  if (!isManager(actor)) throw new HttpError(403, "Only the Owner or a Chief can reschedule a task.");
+  const d = parse(z.object({ scheduled_at: z.string().min(8, "required: the next send slot (ISO time with offset, or YYYY-MM-DD)"), reason: z.string().trim().min(3, "reason: say why it is moved (for example: daily send limit reached)").max(500) }), input);
+  const t = await getTask(actor, id);
+  if (["completed", "cancelled"].includes(t.status as string)) throw new HttpError(400, `Task is already ${t.status}.`);
+  const sch = schedule(d.scheduled_at);
+  if (!sch.at) throw new HttpError(400, "scheduled_at: required.");
+  const raw = (await one("SELECT scheduled_at,due_at FROM tasks WHERE id=?", [id]))!;
+  const was = (raw.scheduled_at ?? raw.due_at ?? null) as string | null;
+  if (was && sch.at <= was) throw new HttpError(400, "scheduled_at: the new slot must be later than the current one.");
+  const ts = now();
+  // The deadline moves with the slot when it was earlier, so reports do not keep counting a deliberate hold as overdue.
+  const moveDue = !raw.due_at || (raw.due_at as string) < sch.at;
+  await tx([
+    { sql: `UPDATE tasks SET scheduled_at=?, scheduled_input=?, scheduled_on=?, hold_reason=?, rescheduled_from=?${moveDue ? ", due_at=?, due_on=?" : ""}, updated_at=? WHERE id=?`, args: [sch.at, sch.input, dateOnlyOf(sch.at), d.reason, was, ...(moveDue ? [sch.at, dateOnlyOf(sch.at)] : []), ts, id] as InValue[] },
+    ...(t.lead_id ? [{ sql: "INSERT INTO activities (lead_id,task_id,type,title,body,actor_id,occurred_at,created_at,is_demo) VALUES (?,?,'task',?,?,?,?,?,?)", args: [t.lead_id as number, id, `Task rescheduled: ${t.title}`, `Held: ${d.reason}`, actor.id, ts, ts, t.is_demo as number] as InValue[] }] : []),
+  ]);
+  await audit(actor, "reschedule_task", "task", id, { from: was, to: sch.at, reason: d.reason });
+  return { id, scheduled_at: dateOnlyOf(sch.at) ? null : sch.at, on: dateOnlyOf(sch.at), hold_reason: d.reason, rescheduled_from: was };
 }
 
 export type CompleteTaskInput = {

@@ -27,3 +27,6 @@ export function toDateInput(iso?: string | null): string {
 export function isDateOnlyTime(iso?: string | null): boolean {
   return !!iso && toLocalInput(iso).endsWith("T23:59");
 }
+
+/** A pure date (YYYY-MM-DD) shown as a date, with no timezone shift and no time. */
+export const fmtYmd = (ymd?: string | null) => (ymd ? new Intl.DateTimeFormat("en-GB", { timeZone: "UTC", day: "numeric", month: "short", year: "numeric" }).format(new Date(`${ymd}T00:00:00Z`)) : "—");

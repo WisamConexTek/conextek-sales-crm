@@ -1,12 +1,12 @@
 import type { InValue } from "@libsql/client";
 import { all, one, localMidnight, addDays, todayYmd, TZ, now, type Row } from "../db";
 import { HttpError, can, isManager, type Actor } from "../auth";
-import { readiness } from "./sends";
+import { liveTasks, STATES, type WorkState } from "./taskview";
+export { STATES };
+export type { WorkState };
 
 /* ---------- Today / Tomorrow / any-date work view ---------- */
 
-export const STATES = ["overdue", "blocked", "ready", "planned", "completed"] as const;
-export type WorkState = (typeof STATES)[number];
 const isYmd = (v?: string | null): v is string => !!v && /^\d{4}-\d{2}-\d{2}$/.test(v);
 
 /**
@@ -33,7 +33,7 @@ export async function schedule(actor: Actor, f: ScheduleFilters = {}) {
   if (f.channel) (where.push("t.channel=?"), args.push(f.channel));
   if (!f.includeTest) where.push("t.is_demo=0");
   const rows = await all(
-    `SELECT t.id,t.title,t.status,t.task_type,t.action_type,t.channel,t.prep_status,t.blockers,t.scheduled_at,t.scheduled_input,t.due_at,t.lead_id,t.assignee_id,t.campaign_id,t.is_demo,t.message_version_id,t.sent_at,t.activity_id,t.completed_at,
+    `SELECT t.id,t.title,t.status,t.task_type,t.action_type,t.channel,t.prep_status,t.blockers,t.scheduled_at,t.scheduled_input,t.due_at,t.lead_id,t.assignee_id,t.campaign_id,t.is_demo,t.message_version_id,t.sent_at,t.activity_id,t.completed_at,t.due_on,t.scheduled_on,t.hold_reason,
             COALESCE(t.scheduled_at,t.due_at) AS at, CASE WHEN t.scheduled_at IS NOT NULL THEN 'scheduled_at' ELSE 'due_at' END AS at_source,
             u.name AS employee, c.name AS campaign, p.name AS project, l.company,
             (SELECT ct.name FROM contacts ct WHERE ct.lead_id=t.lead_id ORDER BY ct.is_primary DESC, ct.id LIMIT 1) AS contact,
@@ -41,26 +41,7 @@ export async function schedule(actor: Actor, f: ScheduleFilters = {}) {
      FROM tasks t JOIN users u ON u.id=t.assignee_id LEFT JOIN leads l ON l.id=t.lead_id
      LEFT JOIN campaigns c ON c.id=t.campaign_id LEFT JOIN projects p ON p.id=c.project_id
      WHERE ${where.join(" AND ")} ORDER BY COALESCE(t.scheduled_at,t.due_at), t.id LIMIT 500`, args);
-  const nowISO = now();
-  type Out = Row & { state: WorkState; is_overdue: boolean; blocked_reason: string | null; prep_label: string | null };
-  const out: Out[] = [];
-  for (const r0 of rows) {
-    let r = r0;
-    const done = r.status === "completed" || r.status === "cancelled";
-    let label: string | null = null;
-    let sentNote: string | null = null;
-    // A task linked to a message version shows the REAL approval state, computed now, not whatever text was stored.
-    if (!done && r.message_version_id) {
-      const live = await readiness(r.message_version_id as number);
-      if (live.state === "sent") sentNote = "A send was already recorded for this message but the task is still open (Owner/Chief can close it: POST /tasks/{id}/complete).";
-      else r = { ...r, prep_status: live.prep_status, blockers: live.blockers } as Row;
-      label = live.label;
-    }
-    const overdue = !done && (r.at as string) < nowISO;
-    const blocked = !done && (!!(r.blockers as string | null)?.trim() || r.prep_status === "validation_needed" || Number(r.opted_out) > 0 || !!sentNote);
-    const state: WorkState = done ? "completed" : blocked ? "blocked" : overdue ? "overdue" : r.prep_status === "ready_for_execution" ? "ready" : "planned";
-    out.push({ ...r, state, is_overdue: overdue, prep_label: label, blocked_reason: blocked ? (Number(r.opted_out) > 0 ? "lead has an opted-out contact" : sentNote ?? ((r.blockers as string) || "validation needed")) : null } as Out);
-  }
+  const out = (await liveTasks(rows)).map((r) => ({ ...r, at: r.date_only ? null : r.at }) as typeof r);
   const filtered = f.state ? out.filter((r) => r.state === f.state) : out;
   const counts = Object.fromEntries(STATES.map((s) => [s, out.filter((r) => r.state === s).length]));
   return { timezone: TZ(), from, to, counts, total: filtered.length, rows: filtered };
@@ -131,8 +112,8 @@ export async function leadOperations(actor: Actor, leadId: number) {
   const auths = await one("SELECT COUNT(*) AS n FROM send_authorizations WHERE lead_id=? AND kind='send' AND status='active'", [leadId]);
   let nextTask = next as Row | null;
   if (nextTask?.message_version_id) {
-    const live = await readiness(nextTask.message_version_id as number);
-    if (live.state !== "sent") nextTask = { ...nextTask, prep_status: live.prep_status, blockers: live.blockers, prep_label: live.label } as Row;
+    const [lt] = await liveTasks([nextTask]);
+    nextTask = { ...nextTask, prep_status: lt.prep_status, blockers: lt.blockers, prep_label: lt.prep_label } as Row;
   }
   void actor;
   return { next_task: nextTask, last_communication: (last as Row | null), restrictions: restr, crm_pending_sends: Number(pend!.n), active_send_authorizations: Number(auths!.n) };

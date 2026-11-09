@@ -7,7 +7,7 @@ import { listLeads } from "@/lib/service/leads";
 import { updateTaskAction, submitTaskAction, completeTaskAction, createTaskAction } from "@/app/actions";
 import { Card, Empty, Field, Flash, LeadLink, Opts, PageHeader, StatusBadge, DemoBadge } from "@/components/ui";
 import { Ref } from "@/components/Ref";
-import { fmtDateTime, isOverdue } from "@/lib/format";
+import { fmtDateTime, fmtYmd, isOverdue } from "@/lib/format";
 import { demoOn, q, sget, snum, type SP } from "@/lib/view";
 import type { Row } from "@/lib/db";
 
@@ -38,7 +38,7 @@ export default async function MyWork({ searchParams }: { searchParams: SP }) {
 
   const TaskCard = ({ t }: { t: Row }) => {
     const mine = t.assignee_id === me.id;
-    const overdue = isOverdue(t.due_at) && ["todo", "in_progress", "changes_requested", "approved"].includes(t.status);
+    const overdue = !!t.due_overdue && ["todo", "in_progress", "changes_requested", "approved"].includes(t.status);
     const editable = !["completed", "cancelled"].includes(t.status);
     return (
       <div className={`rounded-md border p-3 ${t.status === "changes_requested" ? "border-red-200 bg-red-50/40" : "border-slate-200"}`}>
@@ -48,7 +48,7 @@ export default async function MyWork({ searchParams }: { searchParams: SP }) {
             <div className="mt-0.5 text-xs text-slate-500">
               {t.lead_id ? <LeadLink id={t.lead_id} company={t.company} /> : "No lead"}
               {" · "}{t.assignee_name}{t.task_type ? ` · ${typeLab[t.task_type] ?? t.task_type}` : ""} · assigned by {t.created_by_name}
-              {t.due_at && <> · <span className={overdue ? "font-medium text-red-600" : ""}>due {fmtDateTime(t.due_at)}{overdue ? " (overdue)" : ""}</span></>}
+              {(t.due_at || t.due_on) && <> · <span className={overdue ? "font-medium text-red-600" : ""}>due {t.due_on ? `${fmtYmd(t.due_on)} (date only)` : fmtDateTime(t.due_at)}{overdue ? " (overdue)" : ""}</span></>}
             </div>
           </div>
           <StatusBadge status={t.status} approvalFrom={t.approval_from} />

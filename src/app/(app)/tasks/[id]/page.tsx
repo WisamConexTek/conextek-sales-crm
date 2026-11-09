@@ -7,7 +7,7 @@ import { getTaskDetail, type TaskDetail } from "@/lib/service/tasks";
 import { getLists } from "@/lib/service/lists";
 import { Badge, Card, DemoBadge, LeadLink, StatusBadge } from "@/components/ui";
 import { Ref } from "@/components/Ref";
-import { fmtDateTime, toLocalInput } from "@/lib/format";
+import { fmtDateTime, fmtYmd, toLocalInput } from "@/lib/format";
 
 const EVENT: Record<string, { label: string; tone: "gray" | "blue" | "green" | "amber" | "red" | "purple" }> = {
   task_created: { label: "Task created", tone: "gray" },
@@ -51,7 +51,7 @@ export default async function TaskPage({ params }: { params: Promise<{ id: strin
           <div><dt className="text-xs font-medium uppercase tracking-wide text-slate-500">Assigned to</dt><dd>{t.assignee_name}</dd></div>
           <div><dt className="text-xs font-medium uppercase tracking-wide text-slate-500">Assigned by</dt><dd>{t.created_by_name} · {fmtDateTime(t.created_at)}</dd></div>
           <div><dt className="text-xs font-medium uppercase tracking-wide text-slate-500">Type</dt><dd>{t.task_type ? typeLab[t.task_type] ?? t.task_type : "—"}</dd></div>
-          <div><dt className="text-xs font-medium uppercase tracking-wide text-slate-500">Due</dt><dd>{t.due_at ? fmtDateTime(t.due_at) : "—"}</dd></div>
+          <div><dt className="text-xs font-medium uppercase tracking-wide text-slate-500">Due</dt><dd>{t.due_on ? `${fmtYmd(t.due_on)} (date only)` : t.due_at ? fmtDateTime(t.due_at) : "—"}</dd></div>
           <div><dt className="text-xs font-medium uppercase tracking-wide text-slate-500">Approval from</dt><dd>{t.approval_from ? (t.approval_from === "wisam" ? "Wisam" : "Chief") : "Not needed"}</dd></div>
           {t.completed_at && <div><dt className="text-xs font-medium uppercase tracking-wide text-slate-500">Completed</dt><dd>{fmtDateTime(t.completed_at)}{t.completed_by_name ? ` by ${t.completed_by_name}` : ""}</dd></div>}
           {t.message_version_id && <div><dt className="text-xs font-medium uppercase tracking-wide text-slate-500">Message version</dt><dd>#{t.message_version_id}{t.sent_at ? ` · sent ${fmtDateTime(t.sent_at)}` : ""}</dd></div>}
@@ -74,7 +74,7 @@ export default async function TaskPage({ params }: { params: Promise<{ id: strin
             <input type="hidden" name="id" value={t.id} /><input type="hidden" name="_back" value={`/tasks/${t.id}`} />
             {manage && <>
               <div><label className="label">Scheduled time</label><input type="datetime-local" name="scheduled_at" defaultValue={toLocalInput(t.scheduled_at)} className="input" /></div>
-              <div><label className="label">Due</label><input type="datetime-local" name="due_at" defaultValue={toLocalInput(t.due_at)} className="input" /></div>
+              <div><label className="label">Due</label>{t.due_on ? <input type="date" name="due_at" defaultValue={t.due_on} className="input" /> : <input type="datetime-local" name="due_at" defaultValue={toLocalInput(t.due_at)} className="input" />}</div>
               <div><label className="label">Campaign</label><select name="campaign_id" defaultValue={t.campaign_id ?? ""} className="input"><option value="">—</option>{camps.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}</select></div>
               <div><label className="label">Channel</label><select name="channel" defaultValue={t.channel ?? ""} className="input"><option value="">—</option>{channels.map((c) => <option key={c.key} value={c.key}>{c.name}</option>)}</select></div>
               <div><label className="label">Action</label><input name="action_type" defaultValue={t.action_type ?? ""} className="input w-40" placeholder="send_first_email" /></div>

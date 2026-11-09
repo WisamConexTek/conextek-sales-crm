@@ -196,8 +196,7 @@ async function main() {
   console.log("Tasks follow the approval and send flow");
   const T = await import("../src/lib/service/tasks");
   const SCH = await import("../src/lib/service/schedule");
-  const FMT = await import("../src/lib/format");
-  const tl = await mkLead("Task Flow Co", "tf@flow.test");
+    const tl = await mkLead("Task Flow Co", "tf@flow.test");
   const today = new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Hebron" });
   const prepT = (await T.createTask(owner, { lead_id: tl.id, assignee_id: hunter.id, title: "Prepare first email", action_type: "prepare_first_email_draft", channel: "email", campaign_id: camp, due_at: today }) as unknown as number);
   const sendT = (await T.createTask(owner, { lead_id: tl.id, assignee_id: hunter.id, title: "Send first email", action_type: "first_email", channel: "email", campaign_id: camp, due_at: today, prep_status: "user_approval_needed", blockers: "Waiting for approval" }) as unknown as number);
@@ -215,7 +214,13 @@ async function main() {
   ok(sr.state === "ready" && sr.prep_label === "Approved, ready to send" && sr.message_version_id === tv1, "Today & Tomorrow shows it Ready, 'Approved, ready to send', with the version id");
   ok(sch1.counts.ready >= 1 && sch1.counts.ready === sch1.rows.filter((r) => r.state === "ready").length, "the counters come from the live state");
   ok((await trow(prepT)).status === "completed" && /approved/.test(String((await trow(prepT)).completion_note)), "the draft-preparation task closed by itself when its draft was approved");
-  ok(FMT.isDateOnlyTime(sr.at as string), "a date-only due date is recognised, so 23:59 is not shown as a send time");
+  ok(sr.date_only === true && sr.on === today && sr.at === null && sr.due_at === null, "a date-only due date is a pure date: no time of day is exposed");
+  const rawDue = await trow(sendT);
+  ok(rawDue.due_on === today, "the task stores the pure date (due_on)");
+  const tlist = (await T.listTasks(owner, { lead: tl.id })).find((x) => x.id === sendT)!;
+  const tget = await T.getTask(owner, sendT);
+  ok(tlist.state === sr.state && tget.state === sr.state && tlist.prep_status === sr.prep_status && tget.prep_status === "ready_for_execution" && tget.blockers === null, "GET /tasks, the task page and /schedule give the same live status");
+  ok((await L.getLead(owner, tl.id)).tasks.find((x) => x.id === sendT)!.state === sr.state, "the lead page gives the same status too");
   // edit -> back to blocked, task follows the newest version
   const ed2 = await S.editVersion(owner, tv1, { body: "Edited by owner" });
   ok((await trow(sendT)).message_version_id === ed2.new_version_id && (await trow(sendT)).prep_status === "internal_review", "an edit points the task at the new version and blocks it again");
@@ -253,6 +258,27 @@ async function main() {
   ok((await trow(rTask)).message_version_id === rv1, "a version with no task id adopts the one open outreach task of that lead");
   await S.rejectVersion(owner, rv1, "Wrong tone for this dealer");
   ok(/rejected/i.test(String((await trow(rTask)).blockers)) && /Wrong tone/.test(String((await trow(rTask)).blockers)) && (await trow(rTask)).prep_status === "draft_needed", "a rejection blocks the task with the reason");
+
+  // prep task that was still open when the send happened (e.g. created before this logic existed): the send closes it, and reconcile heals old ones
+  const lateT = (await T.createTask(owner, { lead_id: tl.id, assignee_id: hunter.id, title: "Prepare follow-up draft", action_type: "prepare_follow_up_draft", channel: "email", campaign_id: camp }) as unknown as number);
+  const recT = await S.reconcileTasks(chief);
+  ok((await trow(lateT)).status === "completed" && recT.prep_tasks_closed >= 1, "reconcile closes a draft-prep task whose draft was approved and sent");
+  const recT2 = await S.reconcileTasks(chief);
+  ok(recT2.prep_tasks_closed === 0, "reconcile is idempotent");
+  await throws(() => S.reconcileTasks(emp), "employees cannot reconcile", /Owner or a Chief/);
+  // hold / reschedule
+  const heldT = (await T.createTask(owner, { lead_id: rt.id, assignee_id: hunter.id, title: "Held send", action_type: "follow_up", channel: "email", campaign_id: camp, scheduled_at: new Date(Date.now() - 3600000).toISOString(), due_at: new Date(Date.now() - 3600000).toISOString(), prep_status: "ready_for_execution" }) as unknown as number);
+  ok((await SCH.schedule(owner, { from: today, to: today })).rows.some((r) => r.id === heldT && r.state === "overdue" && /not sent yet|passed/i.test(String(r.reason))), "an overdue item explains itself in plain words");
+  await throws(() => T.rescheduleTask(emp, heldT, { scheduled_at: "2099-01-01", reason: "x" }), "employees cannot reschedule", /Owner or a Chief/);
+  await throws(() => T.rescheduleTask(chief, heldT, { scheduled_at: new Date(Date.now() + 86400000).toISOString(), reason: "" }), "a reason is required", /reason/);
+  const slot = new Date(Date.now() + 86400000).toISOString();
+  await T.rescheduleTask(chief, heldT, { scheduled_at: slot, reason: "daily send limit reached, moved to next day" });
+  const held = (await T.listTasks(owner, { lead: rt.id })).find((x) => x.id === heldT)!;
+  ok(held.state !== "overdue" && held.hold_reason === "daily send limit reached, moved to next day" && held.rescheduled_from && held.due_overdue === false, "a deliberate hold is not Overdue, keeps the old time and the reason");
+  ok(Number((await one("SELECT COUNT(*) AS n FROM audit_log WHERE action='reschedule_task' AND entity_id=?", [String(heldT)]))!.n) === 1, "the reschedule is audit-logged");
+  const prev = await S.sendApprovalPreview(owner, 5);
+  ok(prev !== null && prev.count === (await S.countPendingSendApprovals()) && prev.items.length <= 5 && (prev.items.length === 0 || (prev.items[0].company && prev.items[0].campaign)), "dashboard preview: count and first few versions with lead, company, campaign");
+  ok((await S.sendApprovalPreview(hunter)) === null, "people who cannot approve sends get no send-approval card");
 
   console.log(`\n${pass} passed, ${fail} failed`);
   for (const f of [DB, `${DB}-wal`, `${DB}-shm`]) rmSync(f, { force: true });
