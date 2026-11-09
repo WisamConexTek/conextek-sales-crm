@@ -204,7 +204,7 @@ GET  /api/v1/messages/versions/{id}
 
 # 3. Authorizations (bound to ONE version, recipient, channel, campaign and action)
 POST /api/v1/authorizations     {"message_version_id","kind":"editorial|send","permitted_action":"first_email|follow_up|other","note"}
-  editorial: Chief/Owner (approvals.decide). send: Owner only.      DELETE /api/v1/authorizations/{id} revokes.
+  editorial: Chief/Owner (approvals.decide). send: Owner only (or the Chief the Owner has delegated to).      DELETE /api/v1/authorizations/{id} revokes.
 
 # 4. Before sending: validate (authorization, suppression, campaign, history, recording capability)
 GET  /api/v1/sends/eligibility?message_version_id=7   → {eligible, reasons[], warnings[]}
@@ -217,6 +217,13 @@ POST /api/v1/sends/{event_id}/reconcile     records the missing activity exactly
 GET  /api/v1/sends?status=SENT_CONFIRMED_CRM_PENDING`}</Code>
         <ul className="mb-2 list-disc space-y-1 pl-5 text-sm text-slate-700">
           <li><b>Blocked (409) with reasons:</b> no active Owner authorization for this exact version, a newer version exists, opted-out or bounced contact, historical-only lead, campaign not active, lead not an active member of that campaign (or active in several), a first email already sent on that channel in any campaign or date, a conflicting active authorization, or an unreconciled pending send for the lead.</li>
+          <li><b>Owner send approval (screen + API).</b> The Owner opens <b>Send approvals</b> in the menu (<code>/send-approvals</code>): every latest message version still waiting for permission to send, with lead, company, recipient, campaign, subject, full text and editorial review status. <b>Approve send</b> on one version, or tick several and <b>Approve selected</b>. Choose the permitted action (first email / follow-up / other) per row. Editing a version voids its approval and the new version returns to the list. Each approval stands alone: one that fails (for example a stale version) does not stop the others.
+            <Code>{`GET  /api/v1/authorizations/pending             Owner or delegate: versions waiting, with body, recipient, editorial status, suggested_action, other_blockers
+POST /api/v1/authorizations/bulk                {"items":[{"message_version_id":7,"permitted_action":"first_email"},…]}  max 100 → {approved, results[]}
+POST /api/v1/authorizations                     single approval (kind "send" needs Owner or the delegate)`}</Code></li>
+          <li><b>Delegating send approval to a Chief (optional, Owner only).</b> On the Send approvals page the Owner picks a Chief and turns delegation <b>ON</b> or <b>OFF</b>; it is off by default and takes effect immediately. While ON, that one Chief can open the queue and approve sends; nobody else can. Every approval made under delegation is flagged <code>delegated</code>, shown in the “Recent send approvals” table, and written to the audit log as <code>authorize_send_delegated</code> (who, which version, when); turning delegation on or off is logged too. Approvals already made stay valid when delegation is switched off; the Owner can revoke any of them (<code>DELETE /authorizations/{"{id}"}</code>).
+            <Code>{`GET /api/v1/settings/send-delegation            → {enabled, delegate_user_id, delegate_name}
+PUT /api/v1/settings/send-delegation            Owner only: {"user_id": 2}  to turn ON for that Chief, {"user_id": null} to turn OFF`}</Code></li>
           <li><b>Race-safe:</b> an authorization is consumed by one atomic claim; with several simultaneous workers exactly one send is recorded.</li>
           <li>None of this needs <code>history.import</code>; it works with ordinary permissions.</li>
         </ul>

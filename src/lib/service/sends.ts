@@ -54,25 +54,121 @@ async function latestVersion(v: Row) {
 }
 
 /* ---------- authorizations ---------- */
+/** Who may create SEND authorizations: the Owner, or the one Chief the Owner has delegated to (switchable at any time). */
+const DELEGATE_KEY = "send_delegate_user_id";
+export async function getSendDelegate(): Promise<number | null> {
+  const r = await one("SELECT value FROM app_settings WHERE key=?", [DELEGATE_KEY]);
+  return r?.value ? Number(r.value) : null;
+}
+export async function canAuthorizeSend(actor: Actor): Promise<boolean> {
+  if (actor.role === "owner") return true;
+  return actor.role === "chief" && (await getSendDelegate()) === actor.id;
+}
+export async function setSendDelegation(actor: Actor, userId: number | null) {
+  if (actor.role !== "owner") throw new HttpError(403, "Only the Owner can change who may approve sends.");
+  if (userId != null) {
+    const u = await one("SELECT id,role,active,name FROM users WHERE id=?", [userId]);
+    if (!u || !u.active) throw new HttpError(400, "user_id: unknown or disabled user.");
+    if (u.role !== "chief") throw new HttpError(400, "user_id: send approval can only be delegated to a Chief.");
+  }
+  const from = await getSendDelegate();
+  await run("INSERT INTO app_settings (key,value,updated_by,updated_at) VALUES (?,?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_by=excluded.updated_by, updated_at=excluded.updated_at", [DELEGATE_KEY, userId == null ? null : String(userId), actor.id, now()]);
+  await audit(actor, userId == null ? "send_delegation_off" : "send_delegation_on", "user", userId ?? from ?? 0, { from, to: userId });
+  return { delegate_user_id: userId };
+}
+export async function sendDelegationStatus() {
+  const id = await getSendDelegate();
+  const u = id ? await one("SELECT id,name,username FROM users WHERE id=?", [id]) : null;
+  return { enabled: !!id, delegate_user_id: id, delegate_name: (u?.name as string) ?? null };
+}
+
 export async function authorize(actor: Actor, input: unknown) {
   const d = parse(z.object({ message_version_id: z.coerce.number().int(), kind: z.enum(["editorial", "send"]), permitted_action: z.enum(ACTIONS), note: optText(500).optional() }), input);
-  if (d.kind === "send") { if (actor.role !== "owner") throw new HttpError(403, "Only the Owner can authorize a send. A Chief's editorial approval is not permission to send."); }
+  if (d.kind === "send") { if (!(await canAuthorizeSend(actor))) throw new HttpError(403, "Only the Owner (or the Chief the Owner has delegated to) can authorize a send. A Chief's editorial approval is not permission to send."); }
   else if (!can(actor, "approvals.decide") && actor.role !== "owner") throw new HttpError(403, "Editorial approval needs approvals.decide (Chief or Owner).");
   const v = await one("SELECT * FROM message_versions WHERE id=?", [d.message_version_id]);
   if (!v) throw new HttpError(400, "message_version_id: unknown version.");
   if ((await latestVersion(v)) !== v.id) throw new HttpError(409, "That is not the latest version of this message. Review the newest version; authorization never carries over to edited text.");
   const same = await one("SELECT id FROM send_authorizations WHERE message_version_id=? AND kind=? AND permitted_action=? AND status='active'", [v.id as number, d.kind, d.permitted_action]);
   if (same) return { id: same.id as number, created: false };
-  const r = await run("INSERT INTO send_authorizations (message_version_id,lead_id,contact_id,channel,campaign_id,kind,permitted_action,approver_id,note,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
-    [v.id as number, v.lead_id as number, (v.contact_id as number) ?? null, v.channel as string, v.campaign_id as number, d.kind, d.permitted_action, actor.id, d.note ?? null, now()]);
-  await audit(actor, `authorize_${d.kind}`, "message_version", v.id as number, { authorization_id: r.id, action: d.permitted_action });
+  const delegated = d.kind === "send" && actor.role !== "owner" ? 1 : 0;
+  const r = await run("INSERT INTO send_authorizations (message_version_id,lead_id,contact_id,channel,campaign_id,kind,permitted_action,approver_id,note,created_at,delegated) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+    [v.id as number, v.lead_id as number, (v.contact_id as number) ?? null, v.channel as string, v.campaign_id as number, d.kind, d.permitted_action, actor.id, d.note ?? null, now(), delegated]);
+  await audit(actor, delegated ? "authorize_send_delegated" : `authorize_${d.kind}`, "message_version", v.id as number, { authorization_id: r.id, action: d.permitted_action, ...(delegated ? { delegated: true, approver: actor.name } : {}) });
   return { id: r.id, created: true };
+}
+
+/* ---------- send-approval queue (Owner / delegate) ---------- */
+const LATEST = "v.id = (SELECT v2.id FROM message_versions v2 WHERE v2.lead_id=v.lead_id AND COALESCE(v2.contact_id,0)=COALESCE(v.contact_id,0) AND v2.channel=v.channel AND v2.campaign_id=v.campaign_id ORDER BY v2.version DESC LIMIT 1)";
+const WAITING = `${LATEST} AND l.is_demo=0 AND NOT EXISTS (SELECT 1 FROM send_authorizations a WHERE a.message_version_id=v.id AND a.kind='send' AND a.status IN ('active','used'))`;
+
+export async function countPendingSendApprovals(): Promise<number> {
+  return Number((await one(`SELECT COUNT(*) AS n FROM message_versions v JOIN leads l ON l.id=v.lead_id WHERE ${WAITING}`))!.n);
+}
+
+function suggestAction(taskAction: string | null, priorFirst: number): (typeof ACTIONS)[number] {
+  const t = (taskAction ?? "").toLowerCase();
+  if (t.includes("follow")) return "follow_up";
+  if (t.includes("first")) return "first_email";
+  return priorFirst > 0 ? "follow_up" : "first_email";
+}
+
+/** Latest versions that nobody has authorized to send yet, with everything needed to decide. */
+export async function pendingSendApprovals(actor: Actor) {
+  if (!(await canAuthorizeSend(actor))) throw new HttpError(403, "Only the Owner (or the delegated Chief) can approve sends.");
+  const rows = await all(
+    `SELECT v.id,v.version,v.lead_id,v.contact_id,v.channel,v.campaign_id,v.task_id,v.subject,v.body,v.created_at,l.company,c.name AS campaign,
+            ct.name AS recipient_name,ct.email AS recipient_email,u.name AS prepared_by,t.action_type
+     FROM message_versions v JOIN leads l ON l.id=v.lead_id JOIN campaigns c ON c.id=v.campaign_id JOIN users u ON u.id=v.created_by
+     LEFT JOIN contacts ct ON ct.id=v.contact_id LEFT JOIN tasks t ON t.id=v.task_id
+     WHERE ${WAITING} ORDER BY v.created_at, v.id LIMIT 200`);
+  const out: Row[] = [];
+  for (const v of rows) {
+    const ed = await one("SELECT a.created_at,u.name FROM send_authorizations a JOIN users u ON u.id=a.approver_id WHERE a.message_version_id=? AND a.kind='editorial' AND a.status='active' ORDER BY a.id DESC LIMIT 1", [v.id as number]);
+    const prior = await one("SELECT COUNT(*) AS n FROM activities WHERE lead_id=? AND type='message' AND message_kind='first_email' AND channel=? AND is_demo=0", [v.lead_id as number, v.channel as string]);
+    const el = await checkEligibility(actor, v.id as number).catch(() => ({ reasons: [] as string[], warnings: [] as string[] }));
+    out.push({
+      ...v,
+      editorial_status: ed ? `Reviewed by ${ed.name}` : "Not yet reviewed",
+      editorial_reviewed: !!ed,
+      suggested_action: suggestAction(v.action_type as string | null, Number(prior!.n)),
+      other_blockers: el.reasons.filter((r) => !r.startsWith("no active Owner send authorization")),
+      warnings: el.warnings,
+    } as Row);
+  }
+  return out;
+}
+
+/** Approve several versions; each one stands alone (one failing does not stop the rest). */
+export async function approveSends(actor: Actor, items: { message_version_id: number; permitted_action: string; note?: string }[]) {
+  if (!(await canAuthorizeSend(actor))) throw new HttpError(403, "Only the Owner (or the delegated Chief) can approve sends.");
+  if (!items.length) throw new HttpError(400, "items: nothing selected.");
+  if (items.length > 100) throw new HttpError(400, "items: at most 100 at a time.");
+  const results = [];
+  for (const it of items) {
+    try {
+      const r = await authorize(actor, { message_version_id: it.message_version_id, kind: "send", permitted_action: it.permitted_action, note: it.note });
+      results.push({ message_version_id: it.message_version_id, status: r.created ? "approved" : "already_approved", authorization_id: r.id });
+    } catch (e) {
+      results.push({ message_version_id: it.message_version_id, status: "error", error: (e as Error).message });
+    }
+  }
+  return { approved: results.filter((r) => r.status === "approved").length, results };
+}
+
+/** Who approved what, when (the delegation audit view). */
+export async function recentSendAuthorizations(actor: Actor, limit = 50) {
+  if (!(await canAuthorizeSend(actor))) throw new HttpError(403, "Not allowed.");
+  return all(
+    `SELECT a.id,a.message_version_id,v.version,l.company,a.permitted_action,a.status,a.delegated,u.name AS approver,a.created_at
+     FROM send_authorizations a JOIN message_versions v ON v.id=a.message_version_id JOIN leads l ON l.id=a.lead_id JOIN users u ON u.id=a.approver_id
+     WHERE a.kind='send' ORDER BY a.id DESC LIMIT ?`, [limit]);
 }
 
 export async function revoke(actor: Actor, authId: number) {
   const a = await one("SELECT * FROM send_authorizations WHERE id=?", [authId]);
   if (!a) throw new HttpError(404, "Authorization not found.");
-  if (a.kind === "send" ? actor.role !== "owner" : !can(actor, "approvals.decide") && actor.role !== "owner") throw new HttpError(403, "You cannot revoke this authorization.");
+  if (a.kind === "send" ? !(await canAuthorizeSend(actor)) : !can(actor, "approvals.decide") && actor.role !== "owner") throw new HttpError(403, "You cannot revoke this authorization.");
   const r = await run("UPDATE send_authorizations SET status='revoked' WHERE id=? AND status='active'", [authId]);
   if (!r.changes) throw new HttpError(409, "Only an active authorization can be revoked.");
   await audit(actor, "revoke_authorization", "message_version", a.message_version_id as number, { authorization_id: authId });

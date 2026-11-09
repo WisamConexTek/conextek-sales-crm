@@ -9,6 +9,7 @@ import * as Lists from "@/lib/service/lists";
 import * as Leads from "@/lib/service/leads";
 import * as Tasks from "@/lib/service/tasks";
 import * as Campaigns from "@/lib/service/campaigns";
+import * as Sends from "@/lib/service/sends";
 import { recordActivity } from "@/lib/service/activities";
 import { prepareImport, commitImport } from "@/lib/service/csv";
 import { correctLeadDates, type DateFixRow } from "@/lib/service/history";
@@ -313,4 +314,24 @@ export async function enrolLeadAction(fd: FD) {
     const r = await Campaigns.enrolLead(a, n(fd, "lead_id"), { campaign_id: n(fd, "campaign_id"), ...(from ? { transfer_from_campaign_id: Number(from) } : {}), note: s(fd, "note") });
     return r.changed ? (from ? "Lead transferred. History kept." : "Lead added to the campaign.") : "Already in that campaign.";
   }, "/campaigns");
+}
+
+export async function approveSendsAction(fd: FD) {
+  const a = await requireUser();
+  await guard(fd, async () => {
+    const only = s(fd, "only");
+    const ids = only ? [Number(only)] : fd.getAll("v").map(Number);
+    const r = await Sends.approveSends(a, ids.map((id) => ({ message_version_id: id, permitted_action: s(fd, `action_${id}`) || "first_email" })));
+    const bad = r.results.filter((x) => x.status === "error");
+    if (bad.length && !r.approved) throw new HttpError(409, bad.map((b) => `#${b.message_version_id}: ${b.error}`).join(" | "));
+    return `Send approved for ${r.approved} message${r.approved === 1 ? "" : "s"}.${bad.length ? ` ${bad.length} failed: ${bad.map((b) => `#${b.message_version_id} ${b.error}`).join(" | ")}` : ""}`;
+  }, "/send-approvals");
+}
+export async function setSendDelegationAction(fd: FD) {
+  const a = await requireUser();
+  await guard(fd, async () => {
+    const uid = s(fd, "user_id");
+    await Sends.setSendDelegation(a, uid ? Number(uid) : null);
+    return uid ? "Send approval delegated." : "Delegation turned off.";
+  }, "/send-approvals");
 }

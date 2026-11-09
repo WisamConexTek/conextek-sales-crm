@@ -434,4 +434,15 @@ CREATE TABLE duplicate_reviews (
   created_at TEXT NOT NULL
 );
 `,
+  `
+-- Migration 7 (additive): Owner-controlled delegation of send authorization.
+CREATE TABLE app_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT,
+  updated_by INTEGER REFERENCES users(id),
+  updated_at TEXT NOT NULL
+);
+-- 1 when the authorization was made by a delegate (not the Owner). Existing rows stay 0.
+ALTER TABLE send_authorizations ADD COLUMN delegated INTEGER NOT NULL DEFAULT 0;
+`,
 ];

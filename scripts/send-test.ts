@@ -126,6 +126,45 @@ async function main() {
   ok((await S.listSends(owner)).length >= 4 && (await S.listSends(owner, "SENT_CONFIRMED_CRM_PENDING")).length === 0, "send events are listable by status");
   void all;
 
+  console.log("Owner send-approval queue and delegation");
+  const q1 = await mkLead("Queue One", "q1@q.test"), q2 = await mkLead("Queue Two", "q2@q.test"), q3 = await mkLead("Queue Three", "q3@q.test");
+  const qv = [] as number[];
+  for (const [i, q] of [q1, q2, q3].entries()) qv.push((await S.createVersion(emp, { lead_id: q.id, contact_id: q.cid, channel: "email", campaign_id: camp, subject: `Subj ${i}`, body: `Body ${i}` })).id);
+  await S.authorize(chief, { message_version_id: qv[0], kind: "editorial", permitted_action: "first_email" });
+  const pend0 = await S.pendingSendApprovals(owner);
+  const row0 = pend0.find((r) => r.id === qv[0])!, row1 = pend0.find((r) => r.id === qv[1])!;
+  ok(qv.every((id) => pend0.some((r) => r.id === id)), "queue lists versions waiting for send approval");
+  ok(row0.company === "Queue One" && row0.recipient_email === "q1@q.test" && row0.campaign === "Send Test" && row0.subject === "Subj 0" && row0.body === "Body 0", "each row shows lead, recipient, campaign, subject and full body");
+  ok(row0.editorial_reviewed === true && String(row0.editorial_status).includes("Chief") && row1.editorial_reviewed === false, "editorial review status is shown");
+  ok(!pend0.some((r) => r.id === v2.id), "versions that already have a send approval are not in the queue");
+  await throws(() => S.pendingSendApprovals(hunter), "employees cannot open the queue", /Owner/);
+  await throws(() => S.pendingSendApprovals(chief), "Chief cannot open the queue without delegation", /Owner/);
+  const bulk = await S.approveSends(owner, [{ message_version_id: qv[0], permitted_action: "first_email" }, { message_version_id: qv[1], permitted_action: "first_email" }, { message_version_id: 999999, permitted_action: "first_email" }]);
+  ok(bulk.approved === 2 && bulk.results[2].status === "error", "bulk approval approves each selected version; one bad id does not stop the rest");
+  ok((await S.checkEligibility(emp, qv[0])).eligible && (await S.checkEligibility(emp, qv[1])).eligible && !(await S.checkEligibility(emp, qv[2])).eligible, "approved versions become eligible; unselected stays blocked");
+  const again2 = await S.approveSends(owner, [{ message_version_id: qv[0], permitted_action: "first_email" }]);
+  ok(again2.results[0].status === "already_approved", "approving twice is harmless");
+  const qv0b = (await S.createVersion(emp, { lead_id: q1.id, contact_id: q1.cid, channel: "email", campaign_id: camp, subject: "Subj 0", body: "Body 0 EDITED" })).id;
+  ok(!(await S.checkEligibility(emp, qv[0])).eligible && (await S.pendingSendApprovals(owner)).some((r) => r.id === qv0b), "editing cancels the approval and the new version returns to the queue");
+  // delegation
+  ok((await S.sendDelegationStatus()).enabled === false, "delegation starts OFF");
+  await throws(() => S.setSendDelegation(chief, chief.id), "only the Owner can change delegation", /Owner/);
+  await throws(() => S.setSendDelegation(owner, emp.id), "delegation is only possible to a Chief", /Chief/);
+  await throws(() => S.authorize(chief, { message_version_id: qv[2], kind: "send", permitted_action: "first_email" }), "Chief still cannot approve while OFF", /Owner/);
+  await S.setSendDelegation(owner, chief.id);
+  ok((await S.sendDelegationStatus()).enabled && (await S.pendingSendApprovals(chief)).length > 0, "with delegation ON the Chief sees the queue");
+  const del = await S.approveSends(chief, [{ message_version_id: qv[2], permitted_action: "first_email" }]);
+  const dRow = await one("SELECT delegated,approver_id FROM send_authorizations WHERE message_version_id=? AND kind='send'", [qv[2]]);
+  const dAudit = await one("SELECT actor_name,entity_id,created_at,detail FROM audit_log WHERE action='authorize_send_delegated' ORDER BY id DESC LIMIT 1");
+  ok(del.approved === 1 && dRow!.delegated === 1 && dRow!.approver_id === chief.id, "a delegated approval is flagged and names the Chief");
+  ok(dAudit && dAudit.actor_name === "Chief" && dAudit.entity_id === String(qv[2]) && dAudit.created_at, "the delegated approval is in the audit log (who, which version, when)");
+  ok(Number((await one("SELECT COUNT(*) AS n FROM audit_log WHERE action IN ('send_delegation_on')"))!.n) === 1, "switching delegation on is itself logged");
+  await throws(() => S.authorize(hunter, { message_version_id: qv[2], kind: "send", permitted_action: "first_email" }), "delegation does not extend to anyone else", /Owner/);
+  await S.setSendDelegation(owner, null);
+  await throws(() => S.authorize(chief, { message_version_id: qv0b, kind: "send", permitted_action: "first_email" }), "turning it OFF takes effect immediately", /Owner/);
+  ok((await S.checkEligibility(emp, qv[2])).eligible, "approvals already made under delegation stay valid after it is turned off");
+  ok((await S.recentSendAuthorizations(owner)).some((r) => r.delegated === 1), "the audit list shows delegated approvals");
+
   console.log(`\n${pass} passed, ${fail} failed`);
   for (const f of [DB, `${DB}-wal`, `${DB}-shm`]) rmSync(f, { force: true });
   process.exit(fail ? 1 : 0);

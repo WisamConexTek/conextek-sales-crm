@@ -1,6 +1,7 @@
 import { cookies } from "next/headers";
 import { requireUser, can, isManager } from "@/lib/auth";
 import { one } from "@/lib/db";
+import { canAuthorizeSend, countPendingSendApprovals } from "@/lib/service/sends";
 import { logoutAction, toggleDemoAction } from "@/app/actions";
 import { Nav, type NavItem } from "@/components/Nav";
 import Link from "next/link";
@@ -23,6 +24,7 @@ export default async function AppLayout({ children }: { children: React.ReactNod
     { href: "/my-work", label: "My Work", badge: mine },
     { href: "/schedule", label: "Today & Tomorrow" },
     { href: "/approvals", label: "Approvals", badge: toDecide },
+    ...((await canAuthorizeSend(me)) ? [{ href: "/send-approvals", label: "Send approvals", badge: await countPendingSendApprovals() }] : []),
     { href: "/reports", label: can(me, "reports.view") || isManager(me) ? "Reports" : "My numbers" },
   ];
   if (can(me, "campaigns.manage") || can(me, "reports.view") || isManager(me)) items.push({ href: "/campaigns", label: "Campaigns" });

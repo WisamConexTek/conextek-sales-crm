@@ -1,4 +1,4 @@
-# ConexTek CRM — agent briefing (version 2026-11-08.3)
+# ConexTek CRM — agent briefing (version 2026-11-09.1)
 Base URL: the CRM's own address + /api/v1. Auth: header "Authorization: Bearer <your key>". Every response is {ok, data} or {ok:false, error}.
 Re-read this guide (GET /api/v1/guide) at the start of each run; if "version" changed, behaviour changed. Full reference for humans: /api-docs.
 
@@ -30,7 +30,7 @@ Your work list: GET /schedule?view=today|tomorrow (state: overdue|blocked|ready|
 
 ## Sending workflow (the only allowed order)
 1. POST /messages/versions {lead_id, contact_id, channel, campaign_id, task_id, subject, body} -> version id. Any edit = a new version; older authorizations are voided.
-2. Chief: POST /authorizations {message_version_id, kind:"editorial", permitted_action}. Owner: kind:"send".
+2. Chief: POST /authorizations {message_version_id, kind:"editorial", permitted_action}. SEND authorization is made only by the Owner (Send approvals screen, or POST /authorizations / POST /authorizations/bulk) or by the one Chief the Owner has delegated to (GET /settings/send-delegation shows the status). You, the agent, can never authorize your own sends. If eligibility says there is no send authorization, tell the Owner which version ids are waiting (GET /authorizations/pending if you are permitted) and stop.
 3. GET /sends/eligibility?message_version_id=ID -> must be eligible:true. If not, read reasons[] and stop (do not work around).
 4. Send in the browser. Then POST /sends {event_id (unique, stable), message_version_id, sent_at (exact, with offset), evidence (message-id/link)}.
 5. Read the response: status RECORDED = done. status SENT_CONFIRMED_CRM_PENDING (stop_further_sends:true) = STOP the run, do not resend, call POST /sends/{event_id}/reconcile (safe to repeat) until RECORDED.
