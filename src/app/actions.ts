@@ -11,6 +11,7 @@ import * as Leads from "@/lib/service/leads";
 import * as Tasks from "@/lib/service/tasks";
 import * as Campaigns from "@/lib/service/campaigns";
 import * as Sends from "@/lib/service/sends";
+import * as Senders from "@/lib/service/senders";
 import { recordActivity } from "@/lib/service/activities";
 import { prepareImport, commitImport } from "@/lib/service/csv";
 import { correctLeadDates, type DateFixRow } from "@/lib/service/history";
@@ -345,7 +346,7 @@ export async function rejectDraftAction(fd: FD) {
 export async function editDraftAction(fd: FD) {
   const a = await requireUser();
   await guard(fd, async () => {
-    const r = await Sends.editVersion(a, Number(s(fd, "id")), { subject: s(fd, "subject"), body: s(fd, "body"), note: s(fd, "note") });
+    const r = await Sends.editVersion(a, Number(s(fd, "id")), { subject: s(fd, "subject"), body: s(fd, "body"), note: s(fd, "note"), sender_id: s(fd, "sender_id") || undefined });
     return `Saved as version #${r.new_version_id}. It still needs your send approval below.`;
   }, "/send-approvals");
 }
@@ -356,4 +357,37 @@ export async function setSendDelegationAction(fd: FD) {
     await Sends.setSendDelegation(a, uid ? Number(uid) : null);
     return uid ? "Send approval delegated." : "Delegation turned off.";
   }, "/send-approvals");
+}
+
+/* ---------- senders (Owner) ---------- */
+const csvIds = (fd: FD, k: string) => fd.getAll(k).map(String).filter(Boolean).map(Number);
+export async function createSenderAction(fd: FD) {
+  const a = await requireUser();
+  await guard(fd, async () => {
+    const r = await Senders.createSender(a, { email: s(fd, "email"), display_name: s(fd, "display_name"), title: s(fd, "title"), languages: fd.getAll("languages").map(String), campaign_ids: fd.get("all_campaigns") ? null : csvIds(fd, "campaign_ids"), daily_cap: s(fd, "daily_cap") === "" ? 0 : Number(s(fd, "daily_cap")) });
+    return `Sender ${r.email} added (daily cap 0 until you set a cap or a warm-up schedule).`;
+  }, "/settings?tab=senders");
+}
+export async function updateSenderAction(fd: FD) {
+  const a = await requireUser();
+  await guard(fd, async () => {
+    const id = Number(s(fd, "id"));
+    await Senders.updateSender(a, id, { email: s(fd, "email"), display_name: s(fd, "display_name"), title: s(fd, "title"), languages: fd.getAll("languages").map(String), campaign_ids: fd.get("all_campaigns") ? null : csvIds(fd, "campaign_ids"), daily_cap: s(fd, "daily_cap") === "" ? null : Number(s(fd, "daily_cap")), active: s(fd, "active") === "1" });
+    return "Sender saved.";
+  }, "/settings?tab=senders");
+}
+export async function setWarmupAction(fd: FD) {
+  const a = await requireUser();
+  await guard(fd, async () => {
+    await Senders.setWarmup(a, Number(s(fd, "id")), { steps: Senders.stepsFromText(s(fd, "steps")) });
+    return "Warm-up schedule saved.";
+  }, "/settings?tab=senders");
+}
+export async function pauseSenderAction(fd: FD) {
+  const a = await requireUser();
+  await guard(fd, async () => { await Senders.pauseSender(a, Number(s(fd, "id")), s(fd, "reason")); return "Sender paused: cold sends are blocked until you resume it."; }, safeBack(fd, "/settings?tab=senders"));
+}
+export async function resumeSenderAction(fd: FD) {
+  const a = await requireUser();
+  await guard(fd, async () => { await Senders.resumeSender(a, Number(s(fd, "id")), s(fd, "reason")); return "Sender resumed."; }, safeBack(fd, "/settings?tab=senders"));
 }

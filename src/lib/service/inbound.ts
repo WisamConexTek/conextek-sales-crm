@@ -3,6 +3,7 @@ import { all, one, run, tx, now, type Row } from "../db";
 import { HttpError, requirePerm, type Actor } from "../auth";
 import { audit, parse, optText, parseEventDate, dateProblem } from "./common";
 import { assertLeadAccess } from "./leads";
+import { evaluateDeliverability, resolveSender } from "./senders";
 
 /**
  * Recording what came IN (replies, bounces). Nothing here sends anything.
@@ -49,15 +50,15 @@ export async function recordReply(actor: Actor, input: unknown) {
 
   const auto = AUTO.includes(d.classification);
   const parent = await one(
-    `SELECT id FROM activities WHERE lead_id=? AND type='message' AND outcome='sent' AND occurred_at<=? ${contact ? "AND (contact_id=? OR contact_id IS NULL)" : ""} ORDER BY occurred_at DESC, id DESC LIMIT 1`,
+    `SELECT id,COALESCE(sender_id,1) AS sender_id FROM activities WHERE lead_id=? AND type='message' AND outcome='sent' AND occurred_at<=? ${contact ? "AND (contact_id=? OR contact_id IS NULL)" : ""} ORDER BY occurred_at DESC, id DESC LIMIT 1`,
     contact ? [d.lead_id, at, contact.id as number] : [d.lead_id, at]);
   const t = now();
   const body = `${d.summary}${d.from ? `\n\nFrom: ${d.from}` : ""}`;
   const r = await run(
-    `INSERT INTO activities (lead_id,contact_id,parent_id,type,channel,outcome,title,body,ref,actor_id,occurred_at,created_at,is_demo,occurred_precision,external_id,classification)
-     VALUES (?,?,?,?,'email',?,?,?,?,?,?,?,?,'time',?,?)`,
+    `INSERT INTO activities (lead_id,contact_id,parent_id,type,channel,outcome,title,body,ref,actor_id,occurred_at,created_at,is_demo,occurred_precision,external_id,classification,sender_id)
+     VALUES (?,?,?,?,'email',?,?,?,?,?,?,?,?,'time',?,?,?)`,
     [d.lead_id, (contact?.id as number) ?? null, (parent?.id as number) ?? null, auto ? "note" : "reply", auto ? null : "reply_received",
-      auto ? `Auto-reply (${d.classification.replace("_", " ")}): ${d.subject ?? ""}`.trim() : d.subject ?? "Reply", body, d.message_id, actor.id, at, t, lead.is_demo as number, ext, d.classification]);
+      auto ? `Auto-reply (${d.classification.replace("_", " ")}): ${d.subject ?? ""}`.trim() : d.subject ?? "Reply", body, d.message_id, actor.id, at, t, lead.is_demo as number, ext, d.classification, (parent?.sender_id as number) ?? null]);
   const stmts: { sql: string; args: (string | number | null)[] }[] = [
     { sql: "UPDATE leads SET last_activity_at = CASE WHEN last_activity_at IS NULL OR last_activity_at < ? THEN ? ELSE last_activity_at END, updated_at=? WHERE id=?", args: [at, at, t, d.lead_id] },
   ];
@@ -106,6 +107,8 @@ const bounceSchema = z.object({
   message_id: optText(500),
   bounced_at: z.string().min(8, "required: ISO time with offset"),
   reason: optText(1000),
+  sender_id: z.coerce.number().int().optional(),
+  sender_email: optText(200).optional(),
 });
 
 export async function recordBounce(actor: Actor, input: unknown) {
@@ -123,7 +126,7 @@ export async function recordBounce(actor: Actor, input: unknown) {
   let parent: Row | null = null;
   let matchedBy = "none";
   if (d.message_id) {
-    parent = await one("SELECT a.* FROM activities a JOIN send_events e ON e.activity_id=a.id WHERE a.lead_id=? AND e.evidence LIKE ? ORDER BY a.id DESC LIMIT 1", [lead.id as number, `%${d.message_id}%`]);
+    parent = await one("SELECT a.*, COALESCE(a.sender_id,1) AS sender_id FROM activities a JOIN send_events e ON e.activity_id=a.id WHERE a.lead_id=? AND e.evidence LIKE ? ORDER BY a.id DESC LIMIT 1", [lead.id as number, `%${d.message_id}%`]);
     if (parent) matchedBy = "message_id in the send evidence";
     else if ((parent = await one("SELECT * FROM activities WHERE lead_id=? AND type='message' AND outcome='sent' AND ref=? ORDER BY id DESC LIMIT 1", [lead.id as number, d.message_id]))) matchedBy = "message reference";
   }
@@ -136,16 +139,19 @@ export async function recordBounce(actor: Actor, input: unknown) {
     if (already) return { duplicate: true, activity_id: already.id as number, note: "a bounce was already recorded for that message" };
   }
   const t = now();
+  const explicit = await resolveSender({ sender_id: d.sender_id, sender_email: d.sender_email });
+  const senderId = explicit ?? ((parent?.sender_id as number) ?? (await one("SELECT COALESCE(sender_id,1) AS s FROM activities WHERE lead_id=? AND type='message' AND outcome='sent' ORDER BY occurred_at DESC,id DESC LIMIT 1", [lead.id as number]))?.s as number ?? null);
   const r = await run(
-    `INSERT INTO activities (lead_id,contact_id,parent_id,type,message_kind,channel,outcome,title,body,ref,actor_id,occurred_at,created_at,is_demo,occurred_precision,external_id)
-     VALUES (?,?,?,'outcome',?,?,'bounced',?,?,?,?,?,?,?,'time',?)`,
-    [lead.id as number, d.contact_id, (parent?.id as number) ?? null, (parent?.message_kind as string) ?? null, (parent?.channel as string) ?? "email", `Bounce: ${contact.email ?? contact.name}`, d.reason, d.message_id, actor.id, at, t, lead.is_demo as number, ext]);
+    `INSERT INTO activities (lead_id,contact_id,parent_id,type,message_kind,channel,outcome,title,body,ref,actor_id,occurred_at,created_at,is_demo,occurred_precision,external_id,sender_id)
+     VALUES (?,?,?,'outcome',?,?,'bounced',?,?,?,?,?,?,?,'time',?,?)`,
+    [lead.id as number, d.contact_id, (parent?.id as number) ?? null, (parent?.message_kind as string) ?? null, (parent?.channel as string) ?? "email", `Bounce: ${contact.email ?? contact.name}`, d.reason, d.message_id, actor.id, at, t, lead.is_demo as number, ext, senderId]);
   const stmts: { sql: string; args: (string | number | null)[] }[] = [
     { sql: "UPDATE leads SET last_activity_at = CASE WHEN last_activity_at IS NULL OR last_activity_at < ? THEN ? ELSE last_activity_at END, updated_at=? WHERE id=?", args: [at, at, t, lead.id as number] },
   ];
   // never downgrade an opt-out to a bounce
   if (contact.email_status !== "opted_out") stmts.push({ sql: "UPDATE contacts SET email_status='bounced', updated_at=? WHERE id=?", args: [t, d.contact_id] });
   await tx(stmts);
-  await audit(actor, "record_bounce", "contact", d.contact_id, { activity_id: r.id, message_id: d.message_id, matched_by: matchedBy });
-  return { duplicate: false, activity_id: r.id, contact_status: contact.email_status === "opted_out" ? "opted_out" : "bounced", parent_message_activity_id: (parent?.id as number) ?? null, matched_by: matchedBy, eligibility: "future sends to this contact are blocked (contact bounced)" };
+  await audit(actor, "record_bounce", "contact", d.contact_id, { activity_id: r.id, message_id: d.message_id, matched_by: matchedBy, sender_id: senderId });
+  const guard = senderId && !lead.is_demo ? await evaluateDeliverability(actor, senderId) : { paused: false as boolean, reason: undefined as string | undefined };
+  return { duplicate: false, activity_id: r.id, contact_status: contact.email_status === "opted_out" ? "opted_out" : "bounced", parent_message_activity_id: (parent?.id as number) ?? null, matched_by: matchedBy, sender_id: senderId, sender_paused: guard.paused, sender_pause_reason: guard.reason ?? null, eligibility: "future sends to this contact are blocked (contact bounced)" };
 }

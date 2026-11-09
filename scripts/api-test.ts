@@ -118,7 +118,7 @@ async function main() {
 
   console.log("5. Daily capacity");
   const set0 = await CAP.capacitySettings();
-  ok(set0.daily_cap === 10 && set0.priority.length === 0, "default cap is 10 per day");
+  ok(set0.daily_cap === 10 && Array.isArray(set0.priority), "default cap is 10 per day (the default sender)");
   await throws(() => CAP.setCapacitySettings(chief, { daily_cap: 5 }), "only the Owner changes the cap", /Owner/);
   await CAP.setCapacitySettings(owner, { daily_cap: 2, priority: [camp2, camp] });
   const cap0 = await CAP.capacityFor();

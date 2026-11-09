@@ -5,7 +5,8 @@ import { listUsers, listKeys, canManageKeysFor } from "@/lib/service/users";
 import { getLists } from "@/lib/service/lists";
 import { all, one } from "@/lib/db";
 import { demoCount } from "@/lib/service/demo";
-import { loadDemoAction, removeDemoAction, createUserAction, addListItemAction, updateListItemAction, moveListItemAction } from "@/app/actions";
+import { listSenders, senderLog, sendersHealth } from "@/lib/service/senders";
+import { createSenderAction, updateSenderAction, setWarmupAction, pauseSenderAction, resumeSenderAction, loadDemoAction, removeDemoAction, createUserAction, addListItemAction, updateListItemAction, moveListItemAction } from "@/app/actions";
 import { SecretAction } from "@/components/SecretAction";
 import { Badge, Card, Field, Flash, PageHeader } from "@/components/ui";
 import { fmtDateTime } from "@/lib/format";
@@ -17,8 +18,8 @@ export default async function Settings({ searchParams }: { searchParams: SP }) {
   if (!isManager(me)) redirect("/");
   const sp = await searchParams;
   const owner = me.role === "owner";
-  const tab = sget(sp, "tab") === "lists" && owner ? "lists" : sget(sp, "tab") === "history" ? "history" : "team";
-  const tabs: [string, string][] = [["team", "Team & permissions"], ...(owner ? [["lists", "Lists & stages"] as [string, string]] : []), ["history", "Change history"]];
+  const tab = sget(sp, "tab") === "lists" && owner ? "lists" : sget(sp, "tab") === "senders" && owner ? "senders" : sget(sp, "tab") === "history" ? "history" : "team";
+  const tabs: [string, string][] = [["team", "Team & permissions"], ...(owner ? [["lists", "Lists & stages"] as [string, string], ["senders", "Senders & warm-up"] as [string, string]] : []), ["history", "Change history"]];
 
   return (
     <div className="space-y-5">
@@ -29,6 +30,7 @@ export default async function Settings({ searchParams }: { searchParams: SP }) {
       </div>
       {tab === "team" && <Team owner={owner} me={me} />}
       {tab === "lists" && owner && <Lists />}
+      {tab === "senders" && owner && <Senders />}
       {tab === "history" && <History page={snum(sp, "page") ?? 1} action={sget(sp, "action")} />}
     </div>
   );
@@ -160,5 +162,96 @@ async function History({ page, action }: { page: number; action?: string }) {
           <div className="flex gap-2">{page > 1 && <Link className="btn btn-sm" href={`/settings${q({ tab: "history", action, page: page - 1 })}`}>← Newer</Link>}{page < pages && <Link className="btn btn-sm" href={`/settings${q({ tab: "history", action, page: page + 1 })}`}>Older →</Link>}</div></div>
       )}
     </Card>
+  );
+}
+
+const STATUS_TONE: Record<string, "green" | "amber" | "red" | "gray"> = { active: "green", warming_up: "amber", paused: "red", inactive: "gray" };
+const STATUS_LABEL: Record<string, string> = { active: "Active", warming_up: "Warming up", paused: "Paused", inactive: "Off" };
+const LANG_LABEL: Record<string, string> = { en: "English", ar: "Arabic", zh: "Chinese" };
+
+async function Senders() {
+  const [senders, camps, log, health] = await Promise.all([listSenders(), all("SELECT id,name FROM campaigns ORDER BY id"), senderLog({} as never), sendersHealth()]);
+  const hmap = new Map(health.map((h) => [h.sender_id, h]));
+  const back = "/settings?tab=senders";
+  return (
+    <div className="space-y-5">
+      <p className="text-sm text-slate-600">A sender is the mailbox a message is sent <b>from</b> by your browser workflow. The CRM never sends. Each sender has its own daily cap (or a warm-up schedule), languages, and campaigns. A version, a send and its capacity are always charged to one sender. Times are Asia/Hebron.</p>
+      {senders.map((x) => {
+        const h = hmap.get(x.id)!;
+        return (
+          <Card key={x.id} title={`${x.display_name} <${x.email}>`} right={<Badge tone={STATUS_TONE[x.status]}>{STATUS_LABEL[x.status]}</Badge>}>
+            <div className="mb-3 flex flex-wrap gap-x-6 gap-y-1 text-sm text-slate-600">
+              <span>Today: <b>{h.used_today}</b> of <b>{h.daily_cap === null ? "no cap" : h.daily_cap}</b>{h.warmup_not_started ? " (warm-up not started)" : ""}</span>
+              <span>7 days: <b>{h.sent_7d}</b> sent · <b>{h.bounces_7d}</b> bounces{h.bounce_rate_7d !== null ? ` (${(h.bounce_rate_7d * 100).toFixed(1)}%)` : ""} · <b>{h.replies_7d}</b> replies · <b>{h.complaints_7d}</b> complaints</span>
+            </div>
+            {x.paused_at && (
+              <div className="mb-3 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-900">
+                <b>Paused {x.pause_kind === "auto" ? "automatically (deliverability guard)" : "by the Owner"}</b> on {fmtDateTime(x.paused_at)}: {x.pause_reason}. Cold sends from this mailbox are blocked until you resume it.
+                <form action={resumeSenderAction} className="mt-2 flex gap-2"><input type="hidden" name="_back" value={back} /><input type="hidden" name="id" value={x.id} />
+                  <input name="reason" className="input" placeholder="Why is it safe to resume? (required)" required minLength={3} /><button className="btn btn-primary">Resume</button></form>
+              </div>
+            )}
+            <form action={updateSenderAction} className="grid gap-3 md:grid-cols-6">
+              <input type="hidden" name="_back" value={back} /><input type="hidden" name="id" value={x.id} />
+              <Field label="Email"><input name="email" defaultValue={x.email} className="input" required /></Field>
+              <Field label="Display name"><input name="display_name" defaultValue={x.display_name} className="input" required /></Field>
+              <Field label="Title"><input name="title" defaultValue={x.title ?? ""} className="input" /></Field>
+              <Field label="Daily cap (blank = no cap; ignored while a warm-up schedule exists)"><input name="daily_cap" type="number" min={0} defaultValue={x.daily_cap ?? ""} className="input" /></Field>
+              <Field label="Status"><select name="active" defaultValue={x.active ? "1" : "0"} className="input"><option value="1">On</option><option value="0">Off</option></select></Field>
+              <div />
+              <div className="md:col-span-2"><span className="label">Languages allowed</span>
+                <div className="flex gap-3 pt-1 text-sm">{Object.entries(LANG_LABEL).map(([k, l]) => <label key={k} className="flex items-center gap-1"><input type="checkbox" name="languages" value={k} defaultChecked={x.languages.includes(k)} />{l}</label>)}</div></div>
+              <div className="md:col-span-3"><span className="label">Campaigns / markets allowed</span>
+                <div className="flex flex-wrap gap-3 pt-1 text-sm">
+                  <label className="flex items-center gap-1"><input type="checkbox" name="all_campaigns" value="1" defaultChecked={x.campaign_ids === null} />All campaigns</label>
+                  {camps.map((c) => <label key={c.id as number} className="flex items-center gap-1"><input type="checkbox" name="campaign_ids" value={c.id as number} defaultChecked={x.campaign_ids?.includes(c.id as number)} />{c.name}</label>)}
+                </div></div>
+              <div className="flex items-end"><button className="btn btn-primary">Save sender</button></div>
+            </form>
+            <div className="mt-4 grid gap-4 border-t border-slate-100 pt-4 md:grid-cols-2">
+              <form action={setWarmupAction}>
+                <input type="hidden" name="_back" value={back} /><input type="hidden" name="id" value={x.id} />
+                <label className="label">Warm-up schedule (one line per step: date from which it applies, then messages per day)</label>
+                <textarea name="steps" rows={6} className="input font-mono text-xs" defaultValue={x.warmup.map((s) => `${s.from_date}: ${s.daily_cap}`).join("\n")} placeholder={"2026-11-10: 5\n2026-11-17: 8"} />
+                <p className="mt-1 text-xs text-slate-500">The last step stays in force. Before the first date the cap is 0. Leave empty to switch warm-up off and use the daily cap above. Today&apos;s cap: <b>{x.cap_today.cap === null ? "none" : x.cap_today.cap}</b>.</p>
+                <button className="btn btn-sm mt-2">Save warm-up</button>
+              </form>
+              {!x.paused_at && (
+                <form action={pauseSenderAction}>
+                  <input type="hidden" name="_back" value={back} /><input type="hidden" name="id" value={x.id} />
+                  <label className="label">Pause cold sends from this mailbox</label>
+                  <input name="reason" className="input" placeholder="Reason (required, shown to everyone)" required minLength={3} />
+                  <p className="mt-1 text-xs text-slate-500">It also pauses itself if its 7-day bounce rate goes above 3% or it gets any spam complaint. Only you can resume it.</p>
+                  <button className="btn btn-sm mt-2">Pause sender</button>
+                </form>
+              )}
+            </div>
+          </Card>
+        );
+      })}
+      <Card title="Add a sender">
+        <form action={createSenderAction} className="grid gap-3 md:grid-cols-5">
+          <input type="hidden" name="_back" value={back} />
+          <Field label="Email"><input name="email" type="email" className="input" required /></Field>
+          <Field label="Display name"><input name="display_name" className="input" required /></Field>
+          <Field label="Title"><input name="title" className="input" /></Field>
+          <Field label="Daily cap"><input name="daily_cap" type="number" min={0} defaultValue={0} className="input" /></Field>
+          <div className="flex items-end"><button className="btn btn-primary">Add sender</button></div>
+          <div className="md:col-span-5 flex flex-wrap gap-4 text-sm"><span className="label">Languages</span>
+            {Object.entries(LANG_LABEL).map(([k, l]) => <label key={k} className="flex items-center gap-1"><input type="checkbox" name="languages" value={k} defaultChecked={k === "en"} />{l}</label>)}
+            <span className="label">Campaigns</span><label className="flex items-center gap-1"><input type="checkbox" name="all_campaigns" value="1" defaultChecked />All</label>
+            {camps.map((c) => <label key={c.id as number} className="flex items-center gap-1"><input type="checkbox" name="campaign_ids" value={c.id as number} />{c.name}</label>)}</div>
+        </form>
+      </Card>
+      <Card title="Sender history (who paused, resumed or changed, and why)">
+        {log.length === 0 ? <p className="text-sm text-slate-500">Nothing yet.</p> : (
+          <ul className="divide-y divide-slate-100 text-sm">
+            {log.map((e) => (
+              <li key={e.id as number} className="py-1.5"><span className="text-slate-500">{fmtDateTime(e.created_at as string)}</span> · <b>{e.email as string}</b> · {String(e.action).replace("_", " ")}{e.reason ? <> — {e.reason as string}</> : null} <span className="text-slate-500">by {e.actor_name as string}{e.auto ? " (automatic)" : ""}</span></li>
+            ))}
+          </ul>
+        )}
+      </Card>
+    </div>
   );
 }

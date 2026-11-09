@@ -186,11 +186,11 @@ export async function leadsCsv(actor: Actor, filters: LeadFilters): Promise<stri
   return Papa.unparse(out.map((o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, safe(v)]))));
 }
 
-export async function reportCsv(actor: Actor, g: Granularity, at?: string, employee?: number | null, range?: { all?: boolean; from?: string; to?: string }): Promise<string> {
+export async function reportCsv(actor: Actor, g: Granularity, at?: string, employee?: number | null, range?: { all?: boolean; from?: string; to?: string }, sender?: number | null): Promise<string> {
   requirePerm(actor, "reports.export");
   const r = range && (range.all || range.from)
-    ? await getRangeReport(actor, { ...range, employee })
-    : await getReport(actor, { granularity: g, at, employee });
+    ? await getRangeReport(actor, { ...range, employee, sender })
+    : await getReport(actor, { granularity: g, at, employee, sender });
   const pct = (a: number, b: number) => (rate(a, b) == null ? "" : `${(rate(a, b)! * 100).toFixed(1)}%`);
   const rows = r.buckets.map((b) => ({
     period: b.label, leads_added: b.m.leads_added, first_emails_sent: b.m.first_emails, first_email_bounces: b.m.first_email_bounces,

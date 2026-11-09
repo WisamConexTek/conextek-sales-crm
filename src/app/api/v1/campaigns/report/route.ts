@@ -1,3 +1,3 @@
 import { route, num } from "@/lib/api";
 import { campaignReport } from "@/lib/service/schedule";
-export const GET = route(async ({ actor, url }) => campaignReport(actor, num(url.searchParams.get("campaign_id"))));
+export const GET = route(async ({ actor, url }) => campaignReport(actor, num(url.searchParams.get("campaign_id")), num(url.searchParams.get("sender_id"))));

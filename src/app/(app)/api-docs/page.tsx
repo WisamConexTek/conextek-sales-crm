@@ -256,8 +256,19 @@ PUT /api/v1/settings/send-delegation            Owner only: {"user_id": 2}  to t
           <li><b>Bounces.</b> <code>POST /api/v1/bounces</code> <code>{"{"}contact_id, message_id, bounced_at, reason{"}"}</code>. Marks the contact bounced and blocks future sends to it.</li>
           <li><b>Original researcher.</b> <code>POST /leads</code> accepts <code>original_researcher</code> (employee id or <code>"unknown"</code>): the discovery credit; the person entering the lead stays the registrar.</li>
           <li><b>Read message versions.</b> <code>GET /api/v1/message-versions?campaign_id=&amp;lead_id=&amp;status=</code> and <code>GET /api/v1/message-versions/{"{id}"}/authorizations</code>. Read-only; Chief can read but still cannot create Owner send authorizations (unless delegation is on).</li>
-          <li><b>Daily capacity.</b> <code>GET /api/v1/capacity?date=</code> (used / reserved / remaining per campaign, Asia/Hebron). <code>GET/PUT /api/v1/settings/capacity</code> <code>{"{"}daily_cap, priority:[campaign ids]{"}"}</code> (Owner; cap 10 by default, 0 = none). At the cap the eligibility check returns <code>daily_cap_reached</code>.</li>
+          <li><b>Daily capacity, per sender.</b> <code>GET /api/v1/capacity?date=</code> returns used / reserved / remaining for each <b>sender</b> and for each campaign (Asia/Hebron), plus <code>pushed_to_next_day</code>: approved tasks that did not fit, after higher-priority campaigns (default China, then US, then Gulf) reserved first. <code>GET/PUT /api/v1/settings/capacity</code> sets the campaign <code>priority</code> (Owner). At a sender&apos;s cap the eligibility check returns <code>daily_cap_reached</code>.</li>
           <li><b>Paged task list.</b> <code>GET /api/v1/tasks?page=1&amp;page_size=50&amp;q=</code>.</li>
+        </ul>
+      </Card>
+
+      <Card title="Senders (multiple mailboxes, warm-up, deliverability guard)">
+        <ul className="mb-2 list-disc space-y-1 pl-5 text-sm text-slate-700">
+          <li><b>Read.</b> <code>GET /api/v1/senders</code>, <code>GET /api/v1/senders/{"{id}"}</code>, <code>GET /api/v1/senders/health</code> (today used/cap, 7-day sent, bounces, replies, complaints, status), <code>GET /api/v1/senders/log</code> (who paused/resumed and why).</li>
+          <li><b>Owner only.</b> <code>POST /senders</code>, <code>PATCH /senders/{"{id}"}</code> <code>{"{"}email, display_name, title, domain, languages, campaign_ids, daily_cap, active{"}"}</code>; <code>PUT /senders/{"{id}"}/warmup</code> <code>{"{"}steps:[{"{"}from_date, daily_cap{"}"}]{"}"}</code>; <code>POST /senders/{"{id}"}/pause</code> and <code>/resume</code> <code>{"{"}reason{"}"}</code>. The same controls are in Settings → Senders &amp; warm-up.</li>
+          <li><b>On versions and sends.</b> <code>POST /messages/versions</code> and <code>/messages/versions/{"{id}"}/edit</code> accept <code>sender_id</code> or <code>sender_email</code>; a thread keeps its sender. Message versions, send events and recorded activities carry <code>sender_id</code>. <code>GET /message-versions</code> shows <code>sender</code>, <code>language</code> and takes <code>?sender_id=</code>.</li>
+          <li><b>Eligibility codes.</b> <code>sender_inactive</code>, <code>sender_language_mismatch</code>, <code>sender_campaign_not_allowed</code>, <code>sender_thread_mismatch</code>, <code>sender_paused_deliverability</code>, and <code>daily_cap_reached</code> (per sender).</li>
+          <li><b>Deliverability guard.</b> A 7-day bounce rate above 3% or any spam complaint pauses cold sends for that sender until the Owner resumes it. <code>POST /bounces</code> is charged to the sender of the bounced message; <code>POST /complaints</code> <code>{"{"}sender_id|sender_email, lead_id?, contact_id?, message_id?, note?{"}"}</code> records a spam complaint (the contact is blocked).</li>
+          <li><b>Reports.</b> <code>GET /reports?sender=&lt;id|email&gt;</code> and <code>GET /campaigns/report?sender_id=</code> filter by mailbox; reports also return <code>by_sender</code>.</li>
         </ul>
       </Card>
 

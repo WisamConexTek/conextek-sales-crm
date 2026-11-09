@@ -2,6 +2,7 @@ import Link from "next/link";
 import { requireUser, can, isManager } from "@/lib/auth";
 import { getReport, getRangeReport, rate, type Granularity, type Metrics } from "@/lib/service/reports";
 import { assignableUsers } from "@/lib/service/users";
+import { listSenders } from "@/lib/service/senders";
 import { Card, PageHeader, Stat } from "@/components/ui";
 import { pct } from "@/lib/format";
 import { todayYmd } from "@/lib/db";
@@ -11,6 +12,7 @@ const COLS: [keyof Metrics | "fb" | "fub", string][] = [
   ["leads_added", "Leads added"], ["first_emails", "First emails"], ["fb", "First-email bounce"], ["follow_ups", "Follow-ups"], ["fub", "Follow-up bounce"],
   ["replies", "Replies"], ["meetings", "Meetings"], ["won", "Won"], ["lost", "Lost"], ["completed", "Tasks done"],
 ];
+const SCOLS: [keyof Metrics | "fb" | "fub", string][] = [["first_emails", "First emails"], ["fb", "First-email bounce"], ["follow_ups", "Follow-ups"], ["fub", "Follow-up bounce"], ["replies", "Replies"], ["reply_leads", "Leads that replied"]];
 const cell = (m: Metrics, k: keyof Metrics | "fb" | "fub") =>
   k === "fb" ? (m.first_emails ? `${pct(rate(m.first_email_bounces, m.first_emails))} (${m.first_email_bounces}/${m.first_emails})` : "—")
   : k === "fub" ? (m.follow_ups ? `${pct(rate(m.follow_up_bounces, m.follow_ups))} (${m.follow_up_bounces}/${m.follow_ups})` : "—")
@@ -21,10 +23,10 @@ export default async function Reports({ searchParams }: { searchParams: SP }) {
   const sp = await searchParams;
   const g = (["day", "week", "month"].includes(sget(sp, "g") ?? "") ? sget(sp, "g") : "day") as Granularity;
   if (sget(sp, "all") === "1" || sget(sp, "from") || (!sget(sp, "g") && !sget(sp, "at"))) return RangeView({ me, sp });
-  const r = await getReport(me, { granularity: g, at: sget(sp, "at"), employee: snum(sp, "employee") });
-  const users = await assignableUsers();
+  const r = await getReport(me, { granularity: g, at: sget(sp, "at"), employee: snum(sp, "employee"), sender: snum(sp, "sender") });
+  const [users, senders] = await Promise.all([assignableUsers(), listSenders()]);
   const team = can(me, "reports.view") || isManager(me);
-  const base = { g, employee: r.employee ?? undefined };
+  const base = { g, employee: r.employee ?? undefined, sender: r.sender ?? undefined };
   const t = r.totals;
   const title = { day: "Daily", week: "Weekly", month: "Monthly" }[g];
 
@@ -43,12 +45,13 @@ export default async function Reports({ searchParams }: { searchParams: SP }) {
           <form className="ml-auto flex items-end gap-2">
             <input type="hidden" name="g" value={g} /><input type="hidden" name="at" value={r.at} />
             <div><label className="label">Employee</label><select name="employee" defaultValue={r.employee ?? ""} className="input"><option value="">Everyone</option>{users.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}</select></div>
+            <div><label className="label">Sender</label><select name="sender" defaultValue={r.sender ?? ""} className="input"><option value="">All senders</option>{senders.map((x) => <option key={x.id} value={x.id}>{x.display_name} ({x.email})</option>)}</select></div>
             <button className="btn">Apply</button>
           </form>
         )}
       </div>
 
-      <RangeForm team={team} users={users} employee={r.employee} />
+      <RangeForm team={team} users={users} senders={senders} employee={r.employee} sender={r.sender} />
       <UnknownNotice c={r.unknownCounts} canFix={can(me, "history.import")} />
 
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4 lg:grid-cols-6">
@@ -82,6 +85,20 @@ export default async function Reports({ searchParams }: { searchParams: SP }) {
         </Card>
       )}
 
+      {team && r.bySender.length > 0 && (
+        <Card title={`By sender${r.sender ? " (filtered)" : ""}${` — ${r.current.label}`}`}>
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[700px] text-sm">
+              <thead className="border-b border-slate-200"><tr><th className="th">Sender</th>{SCOLS.map(([, l]) => <th key={l} className="th">{l}</th>)}</tr></thead>
+              <tbody className="divide-y divide-slate-100">
+                {r.bySender.map((x) => <tr key={x.sender_id}><td className="td font-medium">{x.name}<div className="text-xs font-normal text-slate-500">{x.email}</div></td>{SCOLS.map(([k]) => <td key={k} className="td whitespace-nowrap">{cell(x.m, k)}</td>)}</tr>)}
+              </tbody>
+            </table>
+          </div>
+          <p className="mt-2 text-xs text-slate-500">Messages, replies and bounces are charged to the mailbox that sent the message. Leads added, stage moves and tasks are not sender-based{r.sender ? " and are left out of this filtered view" : ""}.</p>
+        </Card>
+      )}
+
       <Card title={`${title} breakdown`}>
         <div className="overflow-x-auto">
           <table className="w-full min-w-[900px] text-sm">
@@ -109,14 +126,15 @@ export default async function Reports({ searchParams }: { searchParams: SP }) {
 }
 
 type U = { id: number; name: string } | Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
-function RangeForm({ team, users, employee, from, to }: { team: boolean; users: U[]; employee: number | null; from?: string; to?: string }) {
+function RangeForm({ team, users, senders, employee, sender, from, to }: { team: boolean; users: U[]; senders: { id: number; display_name: string; email: string }[]; employee: number | null; sender: number | null; from?: string; to?: string }) {
   return (
     <form className="card flex flex-wrap items-end gap-3 p-3">
       <div><label className="label">From</label><input type="date" name="from" defaultValue={from} className="input" required /></div>
       <div><label className="label">To</label><input type="date" name="to" defaultValue={to} className="input" /></div>
       {team && <div><label className="label">Employee</label><select name="employee" defaultValue={employee ?? ""} className="input"><option value="">Everyone</option>{users.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}</select></div>}
+      {team && <div><label className="label">Sender</label><select name="sender" defaultValue={sender ?? ""} className="input"><option value="">All senders</option>{senders.map((x) => <option key={x.id} value={x.id}>{x.display_name} ({x.email})</option>)}</select></div>}
       <button className="btn">Custom period</button>
-      <Link href={`/reports${q({ all: 1, employee })}`} className="btn btn-primary">All data (since the beginning)</Link>
+      <Link href={`/reports${q({ all: 1, employee, sender })}`} className="btn btn-primary">All data (since the beginning)</Link>
     </form>
   );
 }
@@ -132,20 +150,20 @@ function UnknownNotice({ c, canFix }: { c: { leads: number; activities: number }
 
 async function RangeView({ me, sp }: { me: Awaited<ReturnType<typeof requireUser>>; sp: Record<string, string | string[] | undefined> }) {
   const all = sget(sp, "all") === "1" || !sget(sp, "from");
-  const r = await getRangeReport(me, { all, from: sget(sp, "from"), to: sget(sp, "to"), employee: snum(sp, "employee") });
-  const users = await assignableUsers();
+  const r = await getRangeReport(me, { all, from: sget(sp, "from"), to: sget(sp, "to"), employee: snum(sp, "employee"), sender: snum(sp, "sender") });
+  const [users, senders] = await Promise.all([assignableUsers(), listSenders()]);
   const team = can(me, "reports.view") || isManager(me);
   const t = r.totals;
   const title = all ? `All data · ${r.from} → ${r.to} (+ unknown dates)` : `${r.from} → ${r.to}`;
   const brk = { day: "Daily", week: "Weekly", month: "Monthly" }[r.breakdown];
-  const exp = q({ all: all ? 1 : undefined, from: all ? undefined : r.from, to: all ? undefined : r.to, employee: r.employee });
+  const exp = q({ all: all ? 1 : undefined, from: all ? undefined : r.from, to: all ? undefined : r.to, employee: r.employee, sender: r.sender });
   return (
     <div className="space-y-5">
       <PageHeader title={team ? "Reports" : "My numbers"} sub={`${title} · timezone ${r.tz} · counted from logged records only`}>
         <Link href="/reports?g=day" className="btn">Daily / weekly / monthly</Link>
         {can(me, "reports.export") && <Link href={`/export/report${exp}`} className="btn">Export CSV</Link>}
       </PageHeader>
-      <RangeForm team={team} users={users} employee={r.employee} from={r.from} to={r.to} />
+      <RangeForm team={team} users={users} senders={senders} employee={r.employee} sender={r.sender} from={r.from} to={r.to} />
       <UnknownNotice c={r.unknownCounts} canFix={can(me, "history.import")} />
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4 lg:grid-cols-6">
         <Stat label="Leads added" value={t.leads_added} sub={r.unknown ? `${r.unknown.leads_added} with unknown date` : undefined} />
@@ -174,6 +192,20 @@ async function RangeView({ me, sp }: { me: Awaited<ReturnType<typeof requireUser
           </div>
         </Card>
       )}
+      {team && r.bySender.length > 0 && (
+        <Card title={`By sender${r.sender ? " (filtered)" : ""}${""}`}>
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[700px] text-sm">
+              <thead className="border-b border-slate-200"><tr><th className="th">Sender</th>{SCOLS.map(([, l]) => <th key={l} className="th">{l}</th>)}</tr></thead>
+              <tbody className="divide-y divide-slate-100">
+                {r.bySender.map((x) => <tr key={x.sender_id}><td className="td font-medium">{x.name}<div className="text-xs font-normal text-slate-500">{x.email}</div></td>{SCOLS.map(([k]) => <td key={k} className="td whitespace-nowrap">{cell(x.m, k)}</td>)}</tr>)}
+              </tbody>
+            </table>
+          </div>
+          <p className="mt-2 text-xs text-slate-500">Messages, replies and bounces are charged to the mailbox that sent the message. Leads added, stage moves and tasks are not sender-based{r.sender ? " and are left out of this filtered view" : ""}.</p>
+        </Card>
+      )}
+
       <Card title={`${brk} breakdown (dated records only)`}>
         <div className="overflow-x-auto">
           <table className="w-full min-w-[900px] text-sm">

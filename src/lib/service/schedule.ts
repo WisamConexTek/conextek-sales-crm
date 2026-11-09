@@ -60,17 +60,21 @@ export const CAMPAIGN_REPORT_RULES = {
 
 const rateOf = (n: number, d: number) => ({ numerator: n, denominator: d, value: d ? n / d : null });
 
-export async function campaignReport(actor: Actor, campaignId?: number) {
+export async function campaignReport(actor: Actor, campaignId?: number, senderId?: number) {
   if (!can(actor, "reports.view") && !isManager(actor)) throw new HttpError(403, "Campaign reports are for managers.");
   const camps = await all(`SELECT c.id,c.key,c.name,c.status,c.objective,c.target_markets,p.name AS project,u.name AS owner_name FROM campaigns c JOIN projects p ON p.id=c.project_id LEFT JOIN users u ON u.id=c.owner_id ${campaignId ? "WHERE c.id=?" : ""} ORDER BY c.id`, campaignId ? [campaignId] : []);
   if (campaignId && !camps.length) throw new HttpError(404, "Campaign not found.");
   const n = async (sql: string, a: InValue[]) => Number((await one(sql, a))!.n);
+  if (senderId !== undefined && !(await one("SELECT id FROM senders WHERE id=?", [senderId]))) throw new HttpError(400, "sender: unknown sender.");
+  const sx = senderId !== undefined ? ` AND COALESCE(a.sender_id,pa.sender_id,1)=${Number(senderId)}` : "";
   const join = `FROM lead_campaigns lc JOIN leads l ON l.id=lc.lead_id AND l.is_demo=0
     JOIN activities a ON a.lead_id=lc.lead_id AND a.is_demo=0 AND a.occurred_precision<>'unknown'
       AND (lc.is_original=1 OR a.occurred_at>=lc.joined_at) AND (lc.ended_at IS NULL OR a.occurred_at<lc.ended_at)
-    WHERE lc.campaign_id=?`;
+    LEFT JOIN activities pa ON pa.id=a.parent_id
+    WHERE lc.campaign_id=?${sx}`;
+  const senderNames = new Map((await all("SELECT id,email,display_name FROM senders")).map((r) => [r.id as number, r]));
   const nowISO = now();
-  type CampRow = Row & { id: number; name: string; status: string; project: string; owner_name: string | null; target_markets: string | null; objective: string | null; unique_leads: number; unique_leads_historical_only: number; preparation_backlog: number; approved_scheduled: number; planned_tasks: number; completed_tasks: number; first_emails: number; follow_ups: number; leads_emailed: number; replies: number; reply_leads: number; positive_reply_leads: number; meetings: number; won: number; lost: number; closed: number; rates: Record<string, ReturnType<typeof rateOf>> };
+  type CampRow = Row & { by_sender: { sender_id: number; email: string | null; name: string | null; first_emails: number; follow_ups: number; first_email_bounces: number; replies: number }[]; sender_filter: number | null; id: number; name: string; status: string; project: string; owner_name: string | null; target_markets: string | null; objective: string | null; unique_leads: number; unique_leads_historical_only: number; preparation_backlog: number; approved_scheduled: number; planned_tasks: number; completed_tasks: number; first_emails: number; follow_ups: number; leads_emailed: number; replies: number; reply_leads: number; positive_reply_leads: number; meetings: number; won: number; lost: number; closed: number; rates: Record<string, ReturnType<typeof rateOf>> };
   const result: CampRow[] = [];
   for (const c of camps) {
     const id = c.id as number;
@@ -89,8 +93,13 @@ export async function campaignReport(actor: Actor, campaignId?: number) {
     const approved = await n(`SELECT COUNT(*) AS n FROM tasks t WHERE t.campaign_id=? AND t.is_demo=0 AND ${OPEN} AND t.scheduled_at>=? AND EXISTS (SELECT 1 FROM message_versions v JOIN send_authorizations a ON a.message_version_id=v.id WHERE v.task_id=t.id AND a.kind='send' AND a.status='active')`, [id, nowISO]);
     const planned = await n(`SELECT COUNT(*) AS n FROM tasks t WHERE t.campaign_id=? AND t.is_demo=0 AND ${OPEN} AND t.scheduled_at IS NOT NULL`, [id]);
     const completedTasks = await n("SELECT COUNT(*) AS n FROM tasks t WHERE t.campaign_id=? AND t.is_demo=0 AND t.status='completed'", [id]);
+    const split = await all(`SELECT COALESCE(a.sender_id,pa.sender_id,1) AS sid,
+        SUM(a.type='message' AND a.message_kind='first_email') AS first_emails, SUM(a.type='message' AND a.message_kind='follow_up') AS follow_ups,
+        SUM(a.type='message' AND a.message_kind='first_email' AND EXISTS (SELECT 1 FROM activities b WHERE b.parent_id=a.id AND b.outcome='bounced')) AS first_email_bounces,
+        SUM(a.type='reply') AS replies ${join} AND a.type IN ('message','reply') GROUP BY 1`, [id]);
     result.push({
-      ...c, unique_leads: uniq, unique_leads_historical_only: hist,
+      ...c, by_sender: split.map((r) => ({ sender_id: r.sid, email: senderNames.get(r.sid as number)?.email ?? null, name: senderNames.get(r.sid as number)?.display_name ?? null, first_emails: Number(r.first_emails), follow_ups: Number(r.follow_ups), first_email_bounces: Number(r.first_email_bounces), replies: Number(r.replies) })),
+      sender_filter: senderId ?? null, unique_leads: uniq, unique_leads_historical_only: hist,
       preparation_backlog: backlog, approved_scheduled: approved, planned_tasks: planned, completed_tasks: completedTasks,
       first_emails: firstEmails, follow_ups: followUps, leads_emailed: leadsEmailed, replies, reply_leads: replyLeads, positive_reply_leads: positive,
       meetings: await stageCount("meeting"), won: await stageCount("won"), lost: await stageCount("lost"), closed: await stageCount("closed"),

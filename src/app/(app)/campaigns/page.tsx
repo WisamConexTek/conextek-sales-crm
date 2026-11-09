@@ -1,11 +1,12 @@
 import Link from "next/link";
 import { requireUser, can, isManager } from "@/lib/auth";
 import { campaignReport } from "@/lib/service/schedule";
+import { listSenders } from "@/lib/service/senders";
 import { unassignedLeads } from "@/lib/service/campaigns";
 import { assignableUsers } from "@/lib/service/users";
 import { Badge, Card, Empty, Flash, LeadLink, PageHeader } from "@/components/ui";
 import { createCampaignAction, setCampaignStatusAction, enrolLeadAction } from "@/app/actions";
-import { sget, type SP } from "@/lib/view";
+import { sget, snum, type SP } from "@/lib/view";
 import { pct } from "@/lib/format";
 
 const rate = (r: { numerator: number; denominator: number; value: number | null }) => (r.denominator ? `${pct(r.value)} (${r.numerator}/${r.denominator})` : "—");
@@ -14,7 +15,8 @@ const STATUS = { draft: "gray", active: "green", paused: "amber", closed: "blue"
 export default async function Campaigns({ searchParams }: { searchParams: SP }) {
   const me = await requireUser();
   const sp = await searchParams;
-  const rep = await campaignReport(me);
+  const senderFilter = snum(sp, "sender");
+  const [rep, senders] = await Promise.all([campaignReport(me, undefined, senderFilter), listSenders()]);
   const manage = can(me, "campaigns.manage");
   const users = await assignableUsers();
   const un = manage ? await unassignedLeads(me, 1, 50) : null;
@@ -22,6 +24,11 @@ export default async function Campaigns({ searchParams }: { searchParams: SP }) 
     <div className="space-y-5">
       <PageHeader title="Campaigns" sub="ConexTek · unique leads, preparation backlog, approved scheduled work and actual activity" />
       <Flash ok={sget(sp, "ok")} err={sget(sp, "err")} />
+      <form className="card flex flex-wrap items-end gap-3 p-3">
+        <div><label className="label">Sender</label><select name="sender" defaultValue={senderFilter ?? ""} className="input"><option value="">All senders</option>{senders.map((x) => <option key={x.id} value={x.id}>{x.display_name} ({x.email})</option>)}</select></div>
+        <button className="btn">Filter</button>
+        {senderFilter ? <span className="text-xs text-slate-500">Message, reply and bounce numbers below are for this sender only; lead and task counts are not sender-based.</span> : null}
+      </form>
       <div className="grid gap-4 lg:grid-cols-3">
         {rep.campaigns.map((c) => (
           <Card key={c.id} title={c.name} right={<Badge tone={STATUS[c.status as keyof typeof STATUS]}>{c.status}</Badge>}>
@@ -38,6 +45,7 @@ export default async function Campaigns({ searchParams }: { searchParams: SP }) 
               <dt className="text-slate-500">Meetings · Won · Lost</dt><dd>{c.meetings} · {c.won} · {c.lost}</dd>
               <dt className="text-slate-500">Reply rate</dt><dd>{rate(c.rates.reply_rate)}</dd>
               <dt className="text-slate-500">First-email bounce rate</dt><dd>{rate(c.rates.first_email_bounce_rate)}</dd>
+              {!senderFilter && c.by_sender.length > 1 && <><dt className="text-slate-500">By sender (1st / follow-up / replies)</dt><dd className="text-xs">{c.by_sender.map((x) => <div key={x.sender_id}>{x.name ?? x.sender_id}: {x.first_emails} / {x.follow_ups} / {x.replies}</div>)}</dd></>}
               <dt className="text-slate-500">Positive ÷ replied</dt><dd>{rate(c.rates.positive_reply_rate)}</dd>
             </dl>
             {manage && (

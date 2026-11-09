@@ -6,6 +6,6 @@ export const GET = route(async ({ actor, url }) => {
   const p = url.searchParams;
   return reportApi(actor, {
     all: p.get("all") === "1", from: p.get("from") ?? undefined, to: p.get("to") ?? undefined,
-    period: (p.get("period") ?? undefined) as Granularity | undefined, at: p.get("at") ?? undefined, employee: p.get("employee"),
+    period: (p.get("period") ?? undefined) as Granularity | undefined, at: p.get("at") ?? undefined, employee: p.get("employee"), sender: p.get("sender"),
   });
 });

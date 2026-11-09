@@ -7,6 +7,7 @@ import { approveSendsAction, editDraftAction, rejectDraftAction, setSendDelegati
 import { fmtDateTime } from "@/lib/format";
 import { sget, type SP } from "@/lib/view";
 import { all } from "@/lib/db";
+import { listSenders } from "@/lib/service/senders";
 
 export default async function SendApprovals({ searchParams }: { searchParams: SP }) {
   const me = await requireUser();
@@ -15,6 +16,7 @@ export default async function SendApprovals({ searchParams }: { searchParams: SP
     return <div><PageHeader title="Send approvals" /><Card><p className="text-sm text-slate-600">Only the Owner, or the Chief the Owner has delegated to, can approve sending a message.</p></Card></div>;
   }
   const [rows, recent, delegation, decisions] = await Promise.all([pendingSendApprovals(me), recentSendAuthorizations(me, 30), sendDelegationStatus(), listDecisions(me, { limit: 15 })]);
+  const senderList = await listSenders();
   const chiefs = me.role === "owner" ? (await all("SELECT id,name FROM users WHERE role='chief' AND active=1 ORDER BY id")) : [];
   void assignableUsers;
   return (
@@ -41,6 +43,7 @@ export default async function SendApprovals({ searchParams }: { searchParams: SP
                     <Badge tone="gray">Version #{v.id as number} (v{v.version as number})</Badge>
                     <Badge tone="purple">{v.campaign as string}</Badge>
                     <Badge tone="blue">{v.channel as string}</Badge>
+                    <Badge tone="sky">From: {v.sender_name as string} &lt;{v.sender_email as string}&gt;</Badge>
                     <Badge tone={v.editorial_reviewed ? "green" : "amber"}>{v.editorial_status as string}</Badge>
                   </div>
                   <div className="mt-1 text-xs text-slate-500">To: <b className="text-slate-700">{(v.recipient_name as string) ?? "shared inbox"}{v.recipient_email ? ` <${v.recipient_email}>` : ""}</b> · prepared by {v.prepared_by as string} · {fmtDateTime(v.created_at as string)}</div>
@@ -71,6 +74,7 @@ export default async function SendApprovals({ searchParams }: { searchParams: SP
                 <summary className="cursor-pointer text-sm font-medium">{v.company as string} · version #{v.id as number} · {v.channel as string}</summary>
                 <form action={editDraftAction} className="mt-3 space-y-2">
                   <input type="hidden" name="_back" value="/send-approvals" /><input type="hidden" name="id" value={v.id as number} />
+                  <div><label className="label">Send from</label><select name="sender_id" defaultValue={v.sender_id as number} className="input">{senderList.map((x) => <option key={x.id} value={x.id}>{x.display_name} &lt;{x.email}&gt;{x.active ? "" : " (off)"}{x.paused_at ? " (paused)" : ""}</option>)}</select></div>
                   <div><label className="label">Subject</label><input name="subject" defaultValue={(v.subject as string) ?? ""} className="input" dir="auto" /></div>
                   <div><label className="label">Message</label><textarea name="body" required rows={10} defaultValue={v.body as string} className="input font-mono text-sm" dir="auto" /></div>
                   <div><label className="label">What you changed and why (optional, helps the agents)</label><input name="note" className="input" /></div>

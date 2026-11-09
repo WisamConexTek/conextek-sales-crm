@@ -3,6 +3,7 @@ import { requireUser, can, isManager } from "@/lib/auth";
 import { getDashboard } from "@/lib/service/reports";
 import { sendApprovalPreview } from "@/lib/service/sends";
 import { schedule } from "@/lib/service/schedule";
+import { sendersHealth } from "@/lib/service/senders";
 import { cached } from "@/lib/ttl-cache";
 import { assignableUsers } from "@/lib/service/users";
 import { addDays, todayYmd } from "@/lib/db";
@@ -18,11 +19,12 @@ export default async function Dashboard({ searchParams }: { searchParams: SP }) 
   const sp = await searchParams;
   const opts = { from: sget(sp, "from"), to: sget(sp, "to"), employee: snum(sp, "employee"), all: sget(sp, "all") === "1" || (!sget(sp, "from") && !sget(sp, "to")) };
   // All the dashboard's data in parallel; counters are cached for a few seconds (any web action clears them).
-  const [d, users, sendPrev, wk] = await Promise.all([
+  const [d, users, sendPrev, wk, sh] = await Promise.all([
     cached(`dash:${me.id}:${JSON.stringify(opts)}`, 5000, () => getDashboard(me, opts)),
     assignableUsers(),
     cached(`dash-send:${me.id}`, 5000, () => sendApprovalPreview(me, 5)),
     cached(`dash-wk:${me.id}:${todayYmd()}`, 5000, () => schedule(me, { from: todayYmd(), to: addDays(todayYmd(), 1) })),
+    isManager(me) ? cached("dash-senders", 5000, () => sendersHealth()) : Promise.resolve(null),
   ]);
   const wkNext = wk.rows.filter((r) => r.state !== "completed").sort((a, b) => (a.state === "overdue" ? 0 : 1) - (b.state === "overdue" ? 0 : 1)).slice(0, 6);
   const teamView = can(me, "reports.view") || isManager(me);
@@ -68,6 +70,35 @@ export default async function Dashboard({ searchParams }: { searchParams: SP }) 
         <button className="btn btn-primary">Apply</button>
         <Link href="/" className="btn">Reset</Link>
       </form>
+
+      {sh && (
+        <div className="mb-5">
+          <Card title="Senders health" right={me.role === "owner" ? <Link href="/settings?tab=senders" className="text-xs">Manage senders →</Link> : undefined}>
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[640px] text-sm">
+                <thead className="border-b border-slate-200"><tr>{["Sender", "Status", "Today (used / cap)", "7-day sent", "Bounces", "Replies", "Complaints"].map((h) => <th key={h} className="th">{h}</th>)}</tr></thead>
+                <tbody className="divide-y divide-slate-100">
+                  {sh.map((x) => (
+                    <tr key={x.sender_id}>
+                      <td className="td"><div className="font-medium">{x.display_name}</div><div className="text-xs text-slate-500">{x.email}</div></td>
+                      <td className="td">
+                        <Badge tone={x.status === "active" ? "green" : x.status === "warming_up" ? "amber" : x.status === "paused" ? "red" : "gray"}>{{ active: "Active", warming_up: "Warming up", paused: "Paused", inactive: "Off" }[x.status]}</Badge>
+                        {x.paused && <div className="mt-1 max-w-xs text-xs text-red-700">{x.paused.kind === "auto" ? "Auto-paused: " : "Paused: "}{x.paused.reason}</div>}
+                      </td>
+                      <td className="td whitespace-nowrap">{x.used_today} / {x.daily_cap === null ? "no cap" : x.daily_cap}{x.warmup_not_started ? <span className="text-xs text-slate-500"> (warm-up not started)</span> : null}</td>
+                      <td className="td">{x.sent_7d}</td>
+                      <td className={`td whitespace-nowrap ${x.bounce_rate_7d !== null && x.bounce_rate_7d > 0.03 ? "font-semibold text-red-600" : ""}`}>{x.bounces_7d}{x.bounce_rate_7d !== null ? ` (${pct(x.bounce_rate_7d)})` : ""}</td>
+                      <td className="td">{x.replies_7d}</td>
+                      <td className={`td ${x.complaints_7d ? "font-semibold text-red-600" : ""}`}>{x.complaints_7d}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <p className="mt-2 text-xs text-slate-500">A sender is paused automatically when its 7-day bounce rate is above 3% or it gets any spam complaint. Only the Owner can resume it.</p>
+          </Card>
+        </div>
+      )}
 
       <div className="mb-5 grid gap-5 lg:grid-cols-2">
         {sendPrev && (

@@ -52,33 +52,34 @@ const ALL_TO = "9999-12-31T00:00:00.000Z";
  *   leads -> lead_date (original date), sends/replies/stage changes -> occurred_at, bounces -> the bounce's own date.
  * Rows whose date is unknown are never placed in a period; they are only counted in the "all data" view.
  */
-async function fetchRaw(fromISO: string, toISO: string, employee?: number, withUnknown = false): Promise<Raw> {
+async function fetchRaw(fromISO: string, toISO: string, employee?: number, withUnknown = false, sender?: number): Promise<Raw> {
   const e = ea_(employee);
+  const sA = sender !== undefined ? [sender] : [];
   const pActs = all(
-    `SELECT a.type,a.message_kind,a.outcome,a.actor_id,a.lead_id,a.occurred_at,sl.flag AS stage_flag, (a.occurred_precision='unknown') AS unk,
+    `SELECT a.type,a.message_kind,a.outcome,a.actor_id,a.lead_id,a.occurred_at,sl.flag AS stage_flag, (a.occurred_precision='unknown') AS unk, CASE WHEN a.type='status' THEN NULL ELSE COALESCE(a.sender_id,pp.sender_id,1) END AS sender_id,
             EXISTS(SELECT 1 FROM activities b WHERE b.parent_id=a.id AND b.outcome='bounced') AS has_bounce
-     FROM activities a LEFT JOIN lists sl ON sl.kind='stage' AND sl.key=a.stage_to
-     WHERE a.is_demo=0 AND a.type IN ('message','reply','status')
+     FROM activities a LEFT JOIN lists sl ON sl.kind='stage' AND sl.key=a.stage_to LEFT JOIN activities pp ON pp.id=a.parent_id
+     WHERE a.is_demo=0 AND a.type IN ('message','reply','status')${sender !== undefined ? " AND a.type<>'status' AND COALESCE(a.sender_id,pp.sender_id,1)=?" : ""}
        AND ((a.occurred_precision<>'unknown' AND a.occurred_at>=? AND a.occurred_at<?)${withUnknown ? " OR a.occurred_precision='unknown'" : ""})
      ${ef("a.actor_id", employee)}`,
-    [fromISO, toISO, ...e],
+    [...sA, fromISO, toISO, ...e],
   );
   // A bounce is attributed to the employee who sent the message, and dated when the bounce happened.
   const pBounces = all(
-    `SELECT 'bounce' AS type,a.message_kind,a.outcome,p.actor_id AS actor_id,a.lead_id,a.occurred_at,NULL AS stage_flag,(a.occurred_precision='unknown') AS unk, 0 AS has_bounce
+    `SELECT 'bounce' AS type,a.message_kind,a.outcome,p.actor_id AS actor_id,a.lead_id,a.occurred_at,NULL AS stage_flag,(a.occurred_precision='unknown') AS unk, COALESCE(a.sender_id,p.sender_id,1) AS sender_id, 0 AS has_bounce
      FROM activities a JOIN activities p ON p.id=a.parent_id
-     WHERE a.is_demo=0 AND a.type='outcome' AND a.outcome='bounced'
+     WHERE a.is_demo=0 AND a.type='outcome' AND a.outcome='bounced'${sender !== undefined ? " AND COALESCE(a.sender_id,p.sender_id,1)=?" : ""}
        AND ((a.occurred_precision<>'unknown' AND a.occurred_at>=? AND a.occurred_at<?)${withUnknown ? " OR a.occurred_precision='unknown'" : ""})
      ${ef("p.actor_id", employee)}`,
-    [fromISO, toISO, ...e],
+    [...sA, fromISO, toISO, ...e],
   );
   const pLeads = all(
     `SELECT created_by AS uid, lead_date AS at FROM leads
-     WHERE is_demo=0 AND historical_only=0 AND ((lead_date>=? AND lead_date<?)${withUnknown ? " OR lead_date IS NULL" : ""}) ${ef("created_by", employee)}`,
+     WHERE is_demo=0 AND historical_only=0${sender !== undefined ? " AND 0" : ""} AND ((lead_date>=? AND lead_date<?)${withUnknown ? " OR lead_date IS NULL" : ""}) ${ef("created_by", employee)}`,
     [fromISO, toISO, ...e],
   );
   const pTasks = all(
-    `SELECT assignee_id AS uid, completed_at AS at FROM tasks WHERE is_demo=0 AND status='completed' AND completed_at>=? AND completed_at<? ${ef("assignee_id", employee)}`,
+    `SELECT assignee_id AS uid, completed_at AS at FROM tasks WHERE is_demo=0${sender !== undefined ? " AND 0" : ""} AND status='completed' AND completed_at>=? AND completed_at<? ${ef("assignee_id", employee)}`,
     [fromISO, toISO, ...e],
   );
   const [acts, bounces, leads, tasks] = await Promise.all([pActs, pBounces, pLeads, pTasks]);
@@ -87,13 +88,14 @@ async function fetchRaw(fromISO: string, toISO: string, employee?: number, withU
 
 /** mode: "dated" = only rows dated inside the range; "all" = those plus unknown-date rows; "unknown" = only unknown-date rows. */
 type Mode = "dated" | "all" | "unknown";
-function aggregate(raw: Raw, fromISO: string, toISO: string, uid?: number, mode: Mode = "dated"): Metrics {
+function aggregate(raw: Raw, fromISO: string, toISO: string, uid?: number, mode: Mode = "dated", sid?: number): Metrics {
   const m = zero();
   const replyLeads = new Set<number>();
   const take = (unk: boolean, t: string | null) =>
     unk || t == null ? mode !== "dated" : mode !== "unknown" && t >= fromISO && t < toISO;
   for (const a of raw.acts) {
     if (uid !== undefined && (a.actor_id ?? 0) !== uid) continue;
+    if (sid !== undefined && a.sender_id !== sid) continue;
     if (!take(!!Number(a.unk), a.occurred_at)) continue;
     if (a.type === "message" && a.outcome === "sent") {
       if (a.message_kind === "first_email") (m.first_emails++, (m.first_email_cohort_bounces += Number(a.has_bounce) ? 1 : 0));
@@ -109,8 +111,8 @@ function aggregate(raw: Raw, fromISO: string, toISO: string, uid?: number, mode:
     }
   }
   m.reply_leads = replyLeads.size;
-  for (const l of raw.leads) if ((uid === undefined || (l.uid ?? 0) === uid) && take(l.at == null, l.at)) m.leads_added++;
-  if (mode !== "unknown") for (const t of raw.tasks) if (inRange(t.at, fromISO, toISO) && (uid === undefined || t.uid === uid)) m.completed++;
+  if (sid === undefined) for (const l of raw.leads) if ((uid === undefined || (l.uid ?? 0) === uid) && take(l.at == null, l.at)) m.leads_added++;
+  if (sid === undefined && mode !== "unknown") for (const t of raw.tasks) if (inRange(t.at, fromISO, toISO) && (uid === undefined || t.uid === uid)) m.completed++;
   return m;
 }
 const inRange = (t: string, f: string, to: string) => t >= f && t < to;
@@ -157,8 +159,14 @@ export function periodLabel(startYmd: string, g: Granularity): string {
 
 const isYmd = (v?: string | null): v is string => !!v && /^\d{4}-\d{2}-\d{2}$/.test(v);
 
+/** The same message numbers split by sending mailbox (a sender filter narrows the list to that mailbox). */
+async function splitBySender(raw: Raw, fromISO: string, toISO: string, mode: Mode, only?: number) {
+  const senders = await all("SELECT id,email,display_name FROM senders ORDER BY id");
+  return senders.filter((s) => only === undefined || s.id === only).map((s) => ({ sender_id: s.id as number, email: s.email as string, name: s.display_name as string, m: aggregate(raw, fromISO, toISO, undefined, mode, s.id as number) }));
+}
 /** A custom "from → to" period or "since the beginning": totals plus a breakdown (days/weeks/months by length). */
-async function getRangeReport(actor: Actor, opts: { all?: boolean; from?: string; to?: string; employee?: number | null }) {
+async function getRangeReport(actor: Actor, opts: { all?: boolean; from?: string; to?: string; employee?: number | null; sender?: number | null }) {
+  const sender = opts.sender ? opts.sender : undefined;
   const employee = scopeEmployee(actor, opts.employee);
   const all_ = !!opts.all;
   const today = todayYmd();
@@ -181,7 +189,7 @@ async function getRangeReport(actor: Actor, opts: { all?: boolean; from?: string
   }
   const fromISO = all_ ? ALL_FROM : localMidnight(from).toISOString();
   const toISO = all_ ? ALL_TO : localMidnight(addDays(to, 1)).toISOString();
-  const raw = await fetchRaw(fromISO, toISO, employee, all_);
+  const raw = await fetchRaw(fromISO, toISO, employee, all_, sender);
 
   const days = Math.round((localMidnight(to).getTime() - localMidnight(from).getTime()) / 86400000) + 1;
   const g: Granularity = days <= 31 ? "day" : days <= 200 ? "week" : "month";
@@ -205,14 +213,17 @@ async function getRangeReport(actor: Actor, opts: { all?: boolean; from?: string
     if (Object.values(um).some(Boolean)) byEmployee.push({ user: { id: 0, name: UNKNOWN_EMPLOYEE, role: "unknown", active: 1 }, m: um, overdue: 0 });
   }
   const totalOverdue = employee === 0 ? 0 : employee ? overdue.get(employee) ?? 0 : [...overdue.values()].reduce((a, b) => a + b, 0);
+  const bySender = await splitBySender(raw, fromISO, toISO, all_ ? "all" : "dated", sender);
   return {
+    bySender, sender: sender ?? null,
     mode: (all_ ? "all" : "range") as "all" | "range", from, to, breakdown: g, tz: TZ(), employee: employee ?? null,
     buckets, totals, unknown, byEmployee, totalOverdue, unknownCounts: await unknownDateCounts(employee),
   };
 }
 export { getRangeReport };
 
-export async function getReport(actor: Actor, opts: { granularity: Granularity; at?: string; employee?: number | null }) {
+export async function getReport(actor: Actor, opts: { granularity: Granularity; at?: string; employee?: number | null; sender?: number | null }) {
+  const sender = opts.sender ? opts.sender : undefined;
   const g = opts.granularity;
   const employee = scopeEmployee(actor, opts.employee);
   const count = g === "day" ? 14 : 12;
@@ -222,7 +233,7 @@ export async function getReport(actor: Actor, opts: { granularity: Granularity; 
   const endYmd = nextStart(starts[starts.length - 1], g);
   const fromISO = localMidnight(starts[0]).toISOString();
   const toISO = localMidnight(endYmd).toISOString();
-  const raw = await fetchRaw(fromISO, toISO, employee);
+  const raw = await fetchRaw(fromISO, toISO, employee, false, sender);
 
   const buckets = starts.map((s) => {
     const f = localMidnight(s).toISOString();
@@ -242,7 +253,9 @@ export async function getReport(actor: Actor, opts: { granularity: Granularity; 
   }
   const totals = cur.m;
   const totalOverdue = employee === 0 ? 0 : employee ? overdue.get(employee) ?? 0 : [...overdue.values()].reduce((a, b) => a + b, 0);
+  const bySender = await splitBySender(raw, cur.from, cur.to, "dated", sender);
   return {
+    bySender, sender: sender ?? null,
     granularity: g, at, tz: TZ(), employee: employee ?? null, buckets, current: cur,
     prevStart: prevStart(starts[0], g), nextStart: endYmd, byEmployee, totals, totalOverdue, unknownCounts: await unknownDateCounts(employee),
   };
@@ -410,10 +423,18 @@ export const REPORT_RULES = {
   sends: "first_emails = message records with kind first_email; follow_ups = kind follow_up; kind other is not counted in either. Counted by kind, whatever the channel.",
   replies: "replies = number of inbound reply records (not conversations). reply_leads = distinct leads with at least one reply in the period.",
   bounces: "first_email_bounces / follow_up_bounces are bounce EVENTS dated when the bounce happened (a bounce takes the kind of its message). Event-basis rate = bounces in the period ÷ sends in the period, so a late bounce lands in the later period and the rate can mix cohorts. *_cohort_bounces = messages SENT in the period that have a bounce (any date): the send-cohort view; cohort rate = cohort_bounces ÷ sends.",
+  senders: "Filter with sender=<id|email>. Messages, replies and bounces are charged to the mailbox that sent the message (replies/bounces follow the message they answer; records from before senders existed belong to the default sender wisam.alaysa@conextek.com). With a sender filter, leads added, tasks completed and stage moves (meetings/won/lost) are not sender-based and are left out. `by_sender` splits the same period by mailbox.",
   excluded: "Test data (is_test) and historical-only (suppressed) entities as 'leads added' are excluded; replies/bounces recorded on historical-only entities still count on their dates.",
 };
 
-export async function reportApi(actor: Actor, p: { all?: boolean; from?: string; to?: string; period?: Granularity; at?: string; employee?: string | null }) {
+export async function reportApi(actor: Actor, p: { all?: boolean; from?: string; to?: string; period?: Granularity; at?: string; employee?: string | null; sender?: string | null }) {
+  let sender: number | null = null;
+  if (p.sender) {
+    const sr = /^\d+$/.test(p.sender) ? await one("SELECT id FROM senders WHERE id=?", [Number(p.sender)]) : await one("SELECT id FROM senders WHERE lower(email)=lower(?)", [p.sender]);
+    if (!sr) throw new HttpError(400, `sender: no sender "${p.sender}". Use an id or an email address (GET /senders).`);
+    sender = sr.id as number;
+  }
+  const bySenderOut = (l: { sender_id: number; email: string; name: string; m: Metrics }[]) => l.map((x) => ({ sender_id: x.sender_id, email: x.email, name: x.name, ...x.m, ...rates(x.m) }));
   let emp: number | null = null;
   if (p.employee) {
     if (/^unknown$/i.test(p.employee)) emp = 0;
@@ -428,10 +449,10 @@ export async function reportApi(actor: Actor, p: { all?: boolean; from?: string;
     follow_up_cohort_bounce_rate: rate(m.follow_up_cohort_bounces, m.follow_ups),
   });
   if (p.all || p.from) {
-    const r = await getRangeReport(actor, { all: p.all, from: p.from, to: p.to, employee: emp });
-    return { view: r.mode, from: p.all ? null : r.from, to: r.to, timezone: r.tz, breakdown: r.breakdown, employee: r.employee, totals: r.totals, rates: rates(r.totals), unknown: r.unknown, unknown_counts: r.unknownCounts, by_employee: r.byEmployee.map((e) => ({ employee_id: e.user.id, name: e.user.name, ...e.m })), buckets: r.buckets.map((b) => ({ label: b.label, from: b.from, to: b.to, ...b.m })), rules: REPORT_RULES };
+    const r = await getRangeReport(actor, { all: p.all, from: p.from, to: p.to, employee: emp, sender });
+    return { view: r.mode, from: p.all ? null : r.from, to: r.to, timezone: r.tz, breakdown: r.breakdown, employee: r.employee, sender: r.sender, by_sender: bySenderOut(r.bySender), totals: r.totals, rates: rates(r.totals), unknown: r.unknown, unknown_counts: r.unknownCounts, by_employee: r.byEmployee.map((e) => ({ employee_id: e.user.id, name: e.user.name, ...e.m })), buckets: r.buckets.map((b) => ({ label: b.label, from: b.from, to: b.to, ...b.m })), rules: REPORT_RULES };
   }
   const g = p.period && ["day", "week", "month"].includes(p.period) ? p.period : "day";
-  const r = await getReport(actor, { granularity: g, at: p.at, employee: emp });
-  return { view: "period", period: g, at: r.at, timezone: r.tz, employee: r.employee, totals: r.totals, rates: rates(r.totals), unknown_counts: r.unknownCounts, by_employee: r.byEmployee.map((e) => ({ employee_id: e.user.id, name: e.user.name, ...e.m })), buckets: r.buckets.map((b) => ({ label: b.label, from: b.from, to: b.to, ...b.m })), rules: REPORT_RULES };
+  const r = await getReport(actor, { granularity: g, at: p.at, employee: emp, sender });
+  return { view: "period", period: g, at: r.at, timezone: r.tz, employee: r.employee, sender: r.sender, by_sender: bySenderOut(r.bySender), totals: r.totals, rates: rates(r.totals), unknown_counts: r.unknownCounts, by_employee: r.byEmployee.map((e) => ({ employee_id: e.user.id, name: e.user.name, ...e.m })), buckets: r.buckets.map((b) => ({ label: b.label, from: b.from, to: b.to, ...b.m })), rules: REPORT_RULES };
 }
