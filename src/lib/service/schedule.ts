@@ -33,7 +33,7 @@ export async function schedule(actor: Actor, f: ScheduleFilters = {}) {
   if (f.channel) (where.push("t.channel=?"), args.push(f.channel));
   if (!f.includeTest) where.push("t.is_demo=0");
   const rows = await all(
-    `SELECT t.id,t.title,t.status,t.task_type,t.action_type,t.channel,t.prep_status,t.blockers,t.scheduled_at,t.scheduled_input,t.due_at,t.lead_id,t.assignee_id,t.campaign_id,t.is_demo,t.message_version_id,t.sent_at,t.activity_id,t.completed_at,t.due_on,t.scheduled_on,t.hold_reason,
+    `SELECT t.id,t.title,t.status,t.task_type,t.action_type,t.channel,t.prep_status,t.blockers,t.scheduled_at,t.scheduled_input,t.due_at,t.lead_id,t.assignee_id,t.campaign_id,t.is_demo,t.message_version_id,t.sent_at,t.activity_id,t.completed_at,t.due_on,t.scheduled_on,t.hold_reason,t.rescheduled_from,
             COALESCE(t.scheduled_at,t.due_at) AS at, CASE WHEN t.scheduled_at IS NOT NULL THEN 'scheduled_at' ELSE 'due_at' END AS at_source,
             u.name AS employee, c.name AS campaign, p.name AS project, l.company,
             (SELECT ct.name FROM contacts ct WHERE ct.lead_id=t.lead_id ORDER BY ct.is_primary DESC, ct.id LIMIT 1) AS contact,

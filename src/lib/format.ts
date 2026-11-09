@@ -3,9 +3,12 @@ import { TZ } from "./db";
 const fmt = (o: Intl.DateTimeFormatOptions, iso?: string | null) =>
   iso ? new Intl.DateTimeFormat("en-GB", { timeZone: TZ(), ...o }).format(new Date(iso)) : "—";
 
-export const fmtDateTime = (iso?: string | null) => fmt({ day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", hour12: false }, iso);
+/** "5:00 PM" in the app timezone (12-hour). Display only: the API keeps ISO timestamps. */
+export const fmtTime = (iso?: string | null) =>
+  iso ? new Intl.DateTimeFormat("en-US", { timeZone: TZ(), hour: "numeric", minute: "2-digit", hour12: true }).format(new Date(iso)).replace(/[\u202f\u00a0]/g, " ") : "—";
 export const fmtDate = (iso?: string | null) => fmt({ day: "numeric", month: "short", year: "numeric" }, iso);
-export const fmtShort = (iso?: string | null) => fmt({ day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", hour12: false }, iso);
+export const fmtDateTime = (iso?: string | null) => (iso ? `${fmtDate(iso)}, ${fmtTime(iso)}` : "—");
+export const fmtShort = (iso?: string | null) => (iso ? `${fmt({ day: "numeric", month: "short" }, iso)}, ${fmtTime(iso)}` : "—");
 /** Value for <input type="datetime-local"> in app timezone. */
 export function toLocalInput(iso?: string | null): string {
   if (!iso) return "";

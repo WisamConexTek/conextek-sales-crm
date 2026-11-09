@@ -196,6 +196,7 @@ async function main() {
   console.log("Tasks follow the approval and send flow");
   const T = await import("../src/lib/service/tasks");
   const SCH = await import("../src/lib/service/schedule");
+  const addD = (ymd: string) => { const d = new Date(`${ymd}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + 1); return d.toISOString().slice(0, 10); };
     const tl = await mkLead("Task Flow Co", "tf@flow.test");
   const today = new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Hebron" });
   const prepT = (await T.createTask(owner, { lead_id: tl.id, assignee_id: hunter.id, title: "Prepare first email", action_type: "prepare_first_email_draft", channel: "email", campaign_id: camp, due_at: today }) as unknown as number);
@@ -279,6 +280,25 @@ async function main() {
   const prev = await S.sendApprovalPreview(owner, 5);
   ok(prev !== null && prev.count === (await S.countPendingSendApprovals()) && prev.items.length <= 5 && (prev.items.length === 0 || (prev.items[0].company && prev.items[0].campaign)), "dashboard preview: count and first few versions with lead, company, campaign");
   ok((await S.sendApprovalPreview(hunter)) === null, "people who cannot approve sends get no send-approval card");
+
+  console.log("Display and final states");
+  const FMT = await import("../src/lib/format");
+  const sample = new Date("2026-11-09T14:31:00Z").toISOString(); // 16:31 in Asia/Hebron
+  ok(FMT.fmtTime(sample) === "4:31 PM" && FMT.fmtDateTime(sample).endsWith("4:31 PM") && FMT.fmtShort(sample) === "9 Nov, 4:31 PM", "UI times read like 4:31 PM in the app timezone");
+  ok(!/\b1[3-9]:\d\d|\b2[0-3]:\d\d/.test(FMT.fmtDateTime(sample)), "no 24-hour time remains");
+  ok(sample === new Date(sample).toISOString(), "the API keeps ISO timestamps (display-only change)");
+  const heldRow = (await SCH.schedule(owner, { from: today, to: addD(today) })).rows.find((r) => r.id === heldT);
+  const heldList = (await T.listTasks(owner, { lead: rt.id })).find((x) => x.id === heldT)!;
+  ok(!!heldRow && heldRow.rescheduled_from === heldList.rescheduled_from && heldRow.hold_reason === "daily send limit reached, moved to next day", "/schedule returns rescheduled_from and the reason, like GET /tasks");
+  const finalRow = (await T.listTasks(owner, { lead: tl.id })).find((x) => x.id === sendT)!;
+  ok(finalRow.prep_status === "sent" && finalRow.prep_label === "Sent" && finalRow.blockers === null && !!finalRow.sent_at, "a sent task shows Sent with its send time, and no approval text");
+  ok((await T.getTask(owner, sendT)).prep_status === "sent" && (await L.getLead(owner, tl.id)).tasks.find((x) => x.id === sendT)!.prep_status === "sent", "the task page and the lead page agree");
+  const schDone = (await SCH.schedule(owner, { from: today, to: addD(today) })).rows.find((r) => r.id === sendT);
+  ok(!schDone || (schDone.prep_status === "sent" && schDone.state === "completed"), "/schedule agrees");
+  ok(finalRow.state === "completed", "state is completed");
+  ok((await T.getTask(owner, oddT)).prep_status === "sent" || (await T.getTask(owner, oddT)).prep_status === "completed", "a manually completed task also gets a final state");
+  await run("UPDATE tasks SET prep_status='user_approval_needed' WHERE id=?", [sendT]);
+  ok((await T.getTask(owner, sendT)).prep_status === "sent", "even old stored approval text on a completed task is never shown");
 
   console.log(`\n${pass} passed, ${fail} failed`);
   for (const f of [DB, `${DB}-wal`, `${DB}-shm`]) rmSync(f, { force: true });

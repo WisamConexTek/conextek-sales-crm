@@ -1,4 +1,4 @@
-# ConexTek CRM — agent briefing (version 2026-11-09.5)
+# ConexTek CRM — agent briefing (version 2026-11-09.6)
 Base URL: the CRM's own address + /api/v1. Auth: header "Authorization: Bearer <your key>". Every response is {ok, data} or {ok:false, error}.
 Re-read this guide (GET /api/v1/guide) at the start of each run; if "version" changed, behaviour changed. Full reference for humans: /api-docs.
 
@@ -36,6 +36,7 @@ Tasks: POST /tasks {title, lead_id, assignee_id, campaign_id, channel, action_ty
   One status everywhere: GET /tasks, GET /tasks/{id}, the lead page and GET /schedule all return the same live fields: state (overdue|blocked|ready|planned|completed), prep_status, blockers (live for tasks linked to a message version), prep_label, reason (plain words: why blocked / held / overdue). Never trust an older cached copy.
   Date-only tasks: send due_at or scheduled_at as "YYYY-MM-DD". They are stored and returned as a pure date: due_on / scheduled_on (due_at / scheduled_at are null, date_only:true, on:"YYYY-MM-DD"). There is no time of day; the real time appears as sent_at once sent.
   Held by the daily send cap: Owner/Chief POST /tasks/{id}/reschedule {"scheduled_at":"<next send slot>","reason":"daily send limit reached, moved to next day"}. The task keeps its old time (rescheduled_from), shows "Held: <reason>", is no longer Overdue, and it is audit-logged. Employees and agents without manager rights cannot do this; do not edit the schedule yourself to dodge the cap.
+  Finished tasks: once a task is completed or cancelled, GET /tasks, /tasks/{id}, /schedule and the lead page return prep_status "sent" (with sent_at), "completed" or "cancelled", blockers null and prep_label "Sent"/"Completed"/"Cancelled". Old approval text is never shown on a finished task. Moved tasks carry rescheduled_from (ISO, or rescheduled_from_on for a date-only task) and hold_reason in /schedule as well as /tasks. Timestamps in the API stay ISO; only the web screens show 12-hour AM/PM (Asia/Hebron).
   Housekeeping (Owner/Chief): POST /tasks/reconcile brings tasks in line with approvals and sends that already exist (closes draft-prep tasks whose draft was approved or sent; lists send tasks still open although the send was recorded). Idempotent.
 Your work list: GET /schedule?view=today|tomorrow (state: overdue|blocked|ready|planned|completed). Do only 'ready' work, and only after the eligibility check below.
 

@@ -14,6 +14,7 @@ import { recordActivity } from "@/lib/service/activities";
 import { prepareImport, commitImport } from "@/lib/service/csv";
 import { correctLeadDates, type DateFixRow } from "@/lib/service/history";
 import Papa from "papaparse";
+import { fmtDateTime } from "@/lib/format";
 import { seedDemo, removeDemo } from "@/lib/service/demo";
 import { ALL_PERMISSIONS, PRESETS } from "@/lib/constants";
 
@@ -190,7 +191,7 @@ export async function setMigrationAccessAction(fd: FD) {
   const h = s(fd, "hours");
   await guard(fd, async () => {
     const until = await Users.setMigrationAccess(a, n(fd, "id"), h === "revoke" ? null : Number(h));
-    return until ? "Migration access granted until " + new Date(until).toLocaleString("en-GB") + "." : "Migration access revoked.";
+    return until ? "Migration access granted until " + fmtDateTime(until) + "." : "Migration access revoked.";
   });
 }
 export async function updateUserAction(fd: FD) {
