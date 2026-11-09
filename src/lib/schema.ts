@@ -460,4 +460,19 @@ CREATE TABLE message_decisions (
 );
 CREATE INDEX idx_md_version ON message_decisions(message_version_id, kind);
 `,
+  `
+-- Migration 9 (additive): Link task completion to an activity that proves the work happened.
+ALTER TABLE tasks ADD COLUMN activity_id INTEGER REFERENCES activities(id);
+`,
+  `
+-- Migration 9 (additive): a task knows which message version it will send, and when it was really sent.
+ALTER TABLE tasks ADD COLUMN message_version_id INTEGER REFERENCES message_versions(id);
+ALTER TABLE tasks ADD COLUMN sent_at TEXT;
+-- Backfill the link only where a version already names the task: point at the latest version of that thread.
+UPDATE tasks SET message_version_id = (
+  SELECT v2.id FROM message_versions v1 JOIN message_versions v2 ON v2.lead_id=v1.lead_id AND COALESCE(v2.contact_id,0)=COALESCE(v1.contact_id,0) AND v2.channel=v1.channel AND v2.campaign_id=v1.campaign_id
+  WHERE v1.task_id=tasks.id ORDER BY v2.version DESC, v2.id DESC LIMIT 1)
+WHERE EXISTS (SELECT 1 FROM message_versions v WHERE v.task_id=tasks.id);
+CREATE INDEX idx_tasks_version ON tasks(message_version_id);
+`,
 ];

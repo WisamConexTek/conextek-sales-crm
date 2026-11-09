@@ -193,6 +193,67 @@ async function main() {
   const nv2 = await S.createVersion(emp, { lead_id: nv.lead_id, contact_id: nv.contact_id, channel: nv.channel, campaign_id: nv.campaign_id, subject: "Revised", body: "Revised without pricing" });
   ok(nv2.created && (await S.pendingSendApprovals(owner)).some((r) => r.id === nv2.id), "the agent's replacement version re-enters the queue");
 
+  console.log("Tasks follow the approval and send flow");
+  const T = await import("../src/lib/service/tasks");
+  const SCH = await import("../src/lib/service/schedule");
+  const FMT = await import("../src/lib/format");
+  const tl = await mkLead("Task Flow Co", "tf@flow.test");
+  const today = new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Hebron" });
+  const prepT = (await T.createTask(owner, { lead_id: tl.id, assignee_id: hunter.id, title: "Prepare first email", action_type: "prepare_first_email_draft", channel: "email", campaign_id: camp, due_at: today }) as unknown as number);
+  const sendT = (await T.createTask(owner, { lead_id: tl.id, assignee_id: hunter.id, title: "Send first email", action_type: "first_email", channel: "email", campaign_id: camp, due_at: today, prep_status: "user_approval_needed", blockers: "Waiting for approval" }) as unknown as number);
+  const tv1 = (await S.createVersion(hunter, { lead_id: tl.id, contact_id: tl.cid, channel: "email", campaign_id: camp, task_id: sendT, subject: "Hi", body: "First draft" })).id;
+  const trow = async (id: number) => (await one("SELECT * FROM tasks WHERE id=?", [id]))!;
+  ok((await trow(sendT)).message_version_id === tv1, "the task stores the message version it will send");
+  ok((await trow(sendT)).prep_status === "internal_review" && /editorial/i.test(String((await trow(sendT)).blockers)), "no approvals yet: blocked with the right blocker");
+  await S.authorize(chief, { message_version_id: tv1, kind: "editorial", permitted_action: "first_email" });
+  ok((await trow(sendT)).prep_status === "user_approval_needed" && /send approval/.test(String((await trow(sendT)).blockers)), "Chief reviewed: waiting for the Owner's send approval");
+  ok((await trow(prepT)).status === "todo", "the preparation task stays open until the draft is approved");
+  await S.approveSends(owner, [{ message_version_id: tv1, permitted_action: "first_email" }]);
+  ok((await trow(sendT)).prep_status === "ready_for_execution" && (await trow(sendT)).blockers === null, "approving the exact version turns the task Ready and clears the blocker immediately");
+  const sch1 = await SCH.schedule(owner, { view: "today" });
+  const sr = sch1.rows.find((r) => r.id === sendT)!;
+  ok(sr.state === "ready" && sr.prep_label === "Approved, ready to send" && sr.message_version_id === tv1, "Today & Tomorrow shows it Ready, 'Approved, ready to send', with the version id");
+  ok(sch1.counts.ready >= 1 && sch1.counts.ready === sch1.rows.filter((r) => r.state === "ready").length, "the counters come from the live state");
+  ok((await trow(prepT)).status === "completed" && /approved/.test(String((await trow(prepT)).completion_note)), "the draft-preparation task closed by itself when its draft was approved");
+  ok(FMT.isDateOnlyTime(sr.at as string), "a date-only due date is recognised, so 23:59 is not shown as a send time");
+  // edit -> back to blocked, task follows the newest version
+  const ed2 = await S.editVersion(owner, tv1, { body: "Edited by owner" });
+  ok((await trow(sendT)).message_version_id === ed2.new_version_id && (await trow(sendT)).prep_status === "internal_review", "an edit points the task at the new version and blocks it again");
+  ok((await SCH.schedule(owner, { view: "today" })).rows.find((r) => r.id === sendT)!.state === "blocked", "the schedule shows it blocked again");
+  await S.authorize(chief, { message_version_id: ed2.new_version_id, kind: "editorial", permitted_action: "first_email" });
+  const ap2 = await S.authorize(owner, { message_version_id: ed2.new_version_id, kind: "send", permitted_action: "first_email" });
+  ok((await trow(sendT)).prep_status === "ready_for_execution", "re-approved: Ready again");
+  await S.revoke(owner, ap2.id);
+  ok((await trow(sendT)).prep_status === "user_approval_needed" && (await SCH.schedule(owner, { view: "today" })).rows.find((r) => r.id === sendT)!.state === "blocked", "revoking the send approval blocks the task again");
+  await S.authorize(owner, { message_version_id: ed2.new_version_id, kind: "send", permitted_action: "first_email" });
+  const camp3 = await one("SELECT status FROM campaigns WHERE id=?", [camp]);
+  await C.updateCampaign(chief, camp, { status: "paused" });
+  ok((await SCH.schedule(owner, { view: "today" })).rows.find((r) => r.id === sendT)!.state === "blocked", "pausing the campaign blocks it on the live view even with no event for the task");
+  await C.updateCampaign(chief, camp, { status: String(camp3!.status) });
+  // send -> completed with the activity, although the assignee (hunter) is not the sender (emp)
+  const ev = await S.confirmSend(emp, { event_id: "evt-task-flow-1", message_version_id: ed2.new_version_id, sent_at: new Date(Date.now() - 60000).toISOString(), evidence: "message-id <abc@mail>" });
+  const done = await trow(sendT);
+  ok(ev.status === "RECORDED" && done.status === "completed" && done.activity_id === ev.activity_id && done.sent_at === ev.sent_at && done.completed_by === emp.id, "recording the send completes the task with the activity and the send time, whoever the assignee is");
+  const sch2 = (await SCH.schedule(owner, { view: "today" })).rows.find((r) => r.id === sendT)!;
+  ok(sch2.state === "completed" && sch2.sent_at === ev.sent_at, "the schedule shows Completed with the real send time");
+  ok(Number((await one("SELECT COUNT(*) AS n FROM audit_log WHERE action='task_auto_complete' AND entity_id=?", [String(sendT)]))!.n) === 1, "the automatic completion is audit-logged");
+  const evAgain = await S.confirmSend(emp, { event_id: "evt-task-flow-1", message_version_id: ed2.new_version_id, sent_at: ev.sent_at as string, evidence: "message-id <abc@mail>" });
+  ok(evAgain.duplicate === true && Number((await one("SELECT COUNT(*) AS n FROM activities WHERE task_id=? AND type='task' AND title LIKE 'Task completed%'", [sendT]))!.n) === 1, "repeating the report does not complete twice");
+  // sanctioned manual completion
+  const oddT = (await T.createTask(owner, { lead_id: tl.id, assignee_id: hunter.id, title: "Odd one", action_type: "other", channel: "email", campaign_id: camp }) as unknown as number);
+  await throws(() => T.completeTask(emp, oddT, { note: "not mine" }), "an unrelated employee cannot complete someone else's task", /assigned|not found/i);
+  await T.completeTask(chief, oddT, { note: "send recorded outside the flow", activity_id: ev.activity_id as number });
+  const odd = await trow(oddT);
+  ok(odd.status === "completed" && odd.completed_by === chief.id && odd.activity_id === ev.activity_id && odd.sent_at === ev.sent_at, "Owner/Chief can close a task, linking the proving activity");
+  ok(Number((await one("SELECT COUNT(*) AS n FROM audit_log WHERE action='complete_task' AND entity_id=? AND detail LIKE '%by_manager%'", [String(oddT)]))!.n) === 1, "the manager completion is audit-logged as such");
+  // rejection blocks with the reason
+  const rt = await mkLead("Reject Flow", "rf@flow.test");
+  const rTask = (await T.createTask(owner, { lead_id: rt.id, assignee_id: hunter.id, title: "Send", action_type: "first_email", channel: "email", campaign_id: camp }) as unknown as number);
+  const rv1 = (await S.createVersion(hunter, { lead_id: rt.id, contact_id: rt.cid, channel: "email", campaign_id: camp, subject: "S", body: "B" })).id;
+  ok((await trow(rTask)).message_version_id === rv1, "a version with no task id adopts the one open outreach task of that lead");
+  await S.rejectVersion(owner, rv1, "Wrong tone for this dealer");
+  ok(/rejected/i.test(String((await trow(rTask)).blockers)) && /Wrong tone/.test(String((await trow(rTask)).blockers)) && (await trow(rTask)).prep_status === "draft_needed", "a rejection blocks the task with the reason");
+
   console.log(`\n${pass} passed, ${fail} failed`);
   for (const f of [DB, `${DB}-wal`, `${DB}-shm`]) rmSync(f, { force: true });
   process.exit(fail ? 1 : 0);

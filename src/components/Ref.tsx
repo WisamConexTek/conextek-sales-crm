@@ -3,7 +3,7 @@ import Link from "next/link";
 import { useState } from "react";
 
 /** A record reference the team can quote: "Task #12" (same number the API uses) + a copy-link button. */
-export function Ref({ kind, id, href }: { kind: "Task" | "Approval"; id: number; href: string }) {
+export function Ref({ kind, id, href }: { kind: "Task" | "Approval" | "Activity"; id: number; href: string }) {
   const [copied, setCopied] = useState(false);
   const copy = () => {
     try {

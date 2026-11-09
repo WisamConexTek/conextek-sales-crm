@@ -54,6 +54,8 @@ export default async function TaskPage({ params }: { params: Promise<{ id: strin
           <div><dt className="text-xs font-medium uppercase tracking-wide text-slate-500">Due</dt><dd>{t.due_at ? fmtDateTime(t.due_at) : "—"}</dd></div>
           <div><dt className="text-xs font-medium uppercase tracking-wide text-slate-500">Approval from</dt><dd>{t.approval_from ? (t.approval_from === "wisam" ? "Wisam" : "Chief") : "Not needed"}</dd></div>
           {t.completed_at && <div><dt className="text-xs font-medium uppercase tracking-wide text-slate-500">Completed</dt><dd>{fmtDateTime(t.completed_at)}{t.completed_by_name ? ` by ${t.completed_by_name}` : ""}</dd></div>}
+          {t.message_version_id && <div><dt className="text-xs font-medium uppercase tracking-wide text-slate-500">Message version</dt><dd>#{t.message_version_id}{t.sent_at ? ` · sent ${fmtDateTime(t.sent_at)}` : ""}</dd></div>}
+          {t.activity_id && <div><dt className="text-xs font-medium uppercase tracking-wide text-slate-500">Proving activity</dt><dd><Ref kind="Activity" id={t.activity_id} href={`/leads/${t.lead_id}`} /></dd></div>}
         </dl>
         {t.instructions && <div className="mt-4 rounded-md bg-slate-50 p-3 text-sm whitespace-pre-wrap"><div className="mb-1 text-xs font-medium uppercase tracking-wide text-slate-500">Instructions</div>{t.instructions}</div>}
         {t.change_request && t.status === "changes_requested" && <div className="mt-3 rounded-md border border-red-200 bg-red-50 p-3 text-sm whitespace-pre-wrap"><div className="mb-1 text-xs font-medium uppercase tracking-wide text-red-700">Changes requested</div>{t.change_request}</div>}

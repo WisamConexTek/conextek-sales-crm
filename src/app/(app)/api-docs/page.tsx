@@ -229,6 +229,15 @@ GET  /api/v1/messages/versions/{id}             now includes decisions[]`}</Code
           <li><b>Delegating send approval to a Chief (optional, Owner only).</b> On the Send approvals page the Owner picks a Chief and turns delegation <b>ON</b> or <b>OFF</b>; it is off by default and takes effect immediately. While ON, that one Chief can open the queue and approve sends; nobody else can. Every approval made under delegation is flagged <code>delegated</code>, shown in the “Recent send approvals” table, and written to the audit log as <code>authorize_send_delegated</code> (who, which version, when); turning delegation on or off is logged too. Approvals already made stay valid when delegation is switched off; the Owner can revoke any of them (<code>DELETE /authorizations/{"{id}"}</code>).
             <Code>{`GET /api/v1/settings/send-delegation            → {enabled, delegate_user_id, delegate_name}
 PUT /api/v1/settings/send-delegation            Owner only: {"user_id": 2}  to turn ON for that Chief, {"user_id": null} to turn OFF`}</Code></li>
+          <li><b>Tasks follow the approval and send flow (automatic).</b> Every outreach task carries <code>message_version_id</code> (also <code>sent_at</code> and <code>activity_id</code> once sent), shown on the schedule, task and lead pages. A new version of a message re-points its task at the latest version.
+            <ul className="mt-1 list-disc space-y-1 pl-5">
+              <li><b>Approved → Ready.</b> Chief editorial approval + Owner send approval of the exact latest version + a passing eligibility check turns the task <b>Ready</b> (“Approved, ready to send”) and clears its blocker.</li>
+              <li><b>Revoked, edited, rejected, campaign paused → Blocked</b> again with the right blocker (<code>internal_review</code>, <code>user_approval_needed</code>, <code>draft_needed</code>, <code>validation_needed</code>). Today &amp; Tomorrow computes this live, so the Blocked/Ready/Completed counters are never stale text.</li>
+              <li><b>Draft preparation tasks</b> (action type containing “draft”) close by themselves once their draft is approved.</li>
+              <li><b>Send recorded → Completed.</b> <code>POST /sends</code> (or reconcile) completes the linked send task with the activity and exact send time, whoever it is assigned to. Audit action <code>task_auto_complete</code>.</li>
+              <li><b>Date-only tasks</b> show “date only”, never 23:59 as a time; the real send time shows once sent.</li>
+              <li><b>Manual completion (outside the flow):</b> <code>POST /tasks/{"{id}"}/complete {"{"}"activity_id": 661, "note": "why"{"}"}</code>. The assignee, or the Owner/Chief for someone else’s task (audit-logged as <code>by_manager</code>). The activity must belong to the same lead; a recorded send also sets <code>sent_at</code>.</li>
+            </ul></li>
           <li><b>Race-safe:</b> an authorization is consumed by one atomic claim; with several simultaneous workers exactly one send is recorded.</li>
           <li>None of this needs <code>history.import</code>; it works with ordinary permissions.</li>
         </ul>

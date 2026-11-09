@@ -150,7 +150,12 @@ export async function submitTaskAction(fd: FD) {
 }
 export async function completeTaskAction(fd: FD) {
   const a = await requireUser();
-  await guard(fd, async () => { await Tasks.completeTask(a, n(fd, "id"), s(fd, "note")); return "Task marked complete."; });
+  await guard(fd, async () => {
+    const actRaw = fd.get("activity_id");
+    const actId = actRaw && /^\d+$/.test(String(actRaw)) ? Number(actRaw) : undefined;
+    await Tasks.completeTask(a, n(fd, "id"), { note: s(fd, "note"), activity_id: actId });
+    return "Task marked complete.";
+  });
 }
 export async function decideApprovalAction(fd: FD) {
   const a = await requireUser();

@@ -22,3 +22,8 @@ export const fmtEvent = (iso?: string | null, precision?: string | null) =>
 export function toDateInput(iso?: string | null): string {
   return iso ? toLocalInput(iso).slice(0, 10) : "";
 }
+
+/** Date-only deadlines are stored as 23:59 local on that day; that is not a scheduled time of day. */
+export function isDateOnlyTime(iso?: string | null): boolean {
+  return !!iso && toLocalInput(iso).endsWith("T23:59");
+}

@@ -124,7 +124,7 @@ export async function getTask(actor: Actor, id: number): Promise<Row> {
 
 /** One task with its full note history, approvals and a single chronological timeline (who did what, when). */
 export type TaskEvent = { at: string; event: string; actor: string | null; text: string | null; approval_id?: number };
-export type TaskDetail = Row & { notes: Row[]; approvals: Row[]; timeline: TaskEvent[] };
+export type TaskDetail = Row & { notes: Row[]; approvals: Row[]; timeline: TaskEvent[]; activity?: Row | null };
 export async function getTaskDetail(actor: Actor, id: number): Promise<TaskDetail> {
   const task = await getTask(actor, id);
   const notes = await all(
@@ -138,6 +138,14 @@ export async function getTaskDetail(actor: Actor, id: number): Promise<TaskDetai
      FROM approvals a JOIN users s ON s.id=a.submitted_by LEFT JOIN users d ON d.id=a.decided_by WHERE a.task_id=? ORDER BY a.id`,
     [id],
   );
+  let activity: Row | null = null;
+  if (task.activity_id) {
+    activity = await one(
+      `SELECT a.id, a.type, a.title, a.body, a.occurred_at, a.created_at, a.channel, a.message_kind, a.outcome, u.name AS actor_name
+       FROM activities a LEFT JOIN users u ON u.id=a.actor_id WHERE a.id=?`,
+      [task.activity_id],
+    );
+  }
   const timeline: TaskEvent[] = [{ at: task.created_at, event: "task_created", actor: task.created_by_name, text: task.assignee_id === task.created_by ? "Task created" : `Assigned to ${task.assignee_name}` }];
   for (const n of notes) if (n.kind !== "completion") timeline.push({ at: n.created_at, event: n.kind === "completion" ? "completion_note" : "progress_note", actor: n.actor_name, text: n.body });
   for (const a of approvals) {
@@ -146,7 +154,7 @@ export async function getTaskDetail(actor: Actor, id: number): Promise<TaskDetai
   }
   if (task.completed_at) timeline.push({ at: task.completed_at, event: "completed", actor: task.completed_by_name, text: task.completion_note });
   timeline.sort((x, y) => (x.at < y.at ? -1 : x.at > y.at ? 1 : 0));
-  return Object.assign(task, { notes, approvals, timeline });
+  return Object.assign(task, { notes, approvals, timeline, activity });
 }
 
 /** One approval, for the same people who can see it in the queue. */
@@ -238,25 +246,51 @@ export async function updateTask(actor: Actor, id: number, input: Record<string,
   await audit(actor, "update_task", "task", id, changes);
 }
 
+export type CompleteTaskInput = {
+  note?: string | null;
+  activity_id?: number | null;
+};
+
 /** Employee says: the work is done (outside the CRM). Tasks that need approval must be approved first. */
-export async function completeTask(actor: Actor, id: number, note?: string | null) {
+export async function completeTask(actor: Actor, id: number, input?: string | null | CompleteTaskInput) {
+  const opts: CompleteTaskInput = typeof input === "string" || input === null || input === undefined ? { note: input ?? null } : input;
   const t = await getTask(actor, id);
-  if (t.assignee_id !== actor.id && !can(actor, "tasks.assign")) throw new HttpError(403, "This task is not assigned to you.");
+  // The assignee, or an Owner/Chief closing it on their behalf (audit-logged as such).
+  const byManager = t.assignee_id !== actor.id;
+  if (byManager && !isManager(actor)) throw new HttpError(403, "This task is not assigned to you.");
   if (["completed", "cancelled"].includes(t.status)) throw new HttpError(400, `Task is already ${t.status}.`);
-  if (t.approval_from && t.status !== "approved")
+  if (!byManager && t.approval_from && t.status !== "approved")
     throw new HttpError(400, t.status === "waiting_approval" ? `Waiting for ${t.approval_from === "wisam" ? "Wisam" : "Chief"} to approve.` : "This task needs approval first — submit it for approval.");
+
+  let activityRow: Row | null = null;
+  if (opts.activity_id !== undefined && opts.activity_id !== null) {
+    const actIdNum = Number(opts.activity_id);
+    if (!Number.isInteger(actIdNum) || actIdNum < 1) {
+      throw new HttpError(400, "activity_id: must be a positive integer.");
+    }
+    activityRow = await one("SELECT * FROM activities WHERE id=?", [actIdNum]);
+    if (!activityRow) throw new HttpError(400, "activity_id: activity not found.");
+    if (!t.lead_id || activityRow.lead_id !== t.lead_id) {
+      throw new HttpError(400, "activity_id: that activity does not belong to the same lead as the task.");
+    }
+  }
+
   const ts = now();
-  const cn = note?.trim() || null;
+  const cn = opts.note?.trim() || null;
+  const actId = activityRow ? Number(activityRow.id) : null;
   // The completion note is stored on its own: earlier progress notes are never overwritten.
   const stmts: { sql: string; args: InValue[] }[] = [
-    { sql: "UPDATE tasks SET status='completed', completed_at=?, completed_by=?, completion_note=?, updated_at=? WHERE id=?", args: [ts, actor.id, cn, ts, id] },
+    { sql: "UPDATE tasks SET status='completed', completed_at=?, completed_by=?, completion_note=?, activity_id=?, sent_at=COALESCE(?,sent_at), updated_at=? WHERE id=?", args: [ts, actor.id, cn, actId, activityRow && activityRow.type === "message" && activityRow.outcome === "sent" && activityRow.occurred_precision === "time" ? (activityRow.occurred_at as string) : null, ts, id] },
   ];
   if (cn) stmts.push({ sql: "INSERT INTO task_notes (task_id,kind,body,actor_id,created_at) VALUES (?,?,?,?,?)", args: [id, "completion", cn, actor.id, ts] });
+  if (actId) {
+    stmts.push({ sql: "UPDATE activities SET task_id=? WHERE id=?", args: [id, actId] });
+  }
   await tx(stmts);
   if (t.lead_id)
     await run(`INSERT INTO activities (lead_id,task_id,type,title,body,actor_id,occurred_at,created_at,is_demo) VALUES (?,?,?,?,?,?,?,?,?)`,
-      [t.lead_id, id, "task", `Task completed: ${t.title}`, note?.trim() || null, actor.id, ts, ts, t.is_demo]);
-  await audit(actor, "complete_task", "task", id);
+      [t.lead_id, id, "task", `Task completed: ${t.title}`, cn, actor.id, ts, ts, t.is_demo]);
+  await audit(actor, "complete_task", "task", id, { activity_id: actId, note: cn, ...(byManager ? { by_manager: true, assignee_id: t.assignee_id } : {}) });
 }
 
 /* ================= approvals ================= */

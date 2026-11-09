@@ -1,4 +1,4 @@
-# ConexTek CRM — agent briefing (version 2026-11-09.2)
+# ConexTek CRM — agent briefing (version 2026-11-09.4)
 Base URL: the CRM's own address + /api/v1. Auth: header "Authorization: Bearer <your key>". Every response is {ok, data} or {ok:false, error}.
 Re-read this guide (GET /api/v1/guide) at the start of each run; if "version" changed, behaviour changed. Full reference for humans: /api-docs.
 
@@ -26,6 +26,14 @@ Create a lead inside a campaign: POST /leads {..., campaign_id}. Move: POST /lea
 Tasks: POST /tasks {title, lead_id, assignee_id, campaign_id, channel, action_type, scheduled_at, due_at, prep_status, blockers}
   prep_status: validation_needed | draft_needed | internal_review | user_approval_needed | ready_for_execution (preparation only; NOT approval, NOT a sales stage).
   PATCH /tasks/{id}: assignees may change prep_status and blockers; managers change schedule, channel, campaign, action.
+  Close a task by hand: POST /tasks/{id}/complete {"activity_id": 661, "note": "why"}. The assignee may do it; so may the Owner or a Chief for someone else's task (audit-logged "by_manager"). activity_id must belong to the same lead; if it is a recorded send, the task also gets sent_at. Use this only outside the automatic flow below. Tasks that need approval must be approved first (managers may bypass).
+  Tasks and message versions: every task has message_version_id (null until a draft exists), shown on GET /tasks, /schedule and the lead page. POST /messages/versions links the version to its task (send task_id, or it adopts the one open outreach task of that lead/channel/campaign) and the task always points at the LATEST version of the message.
+  Automatic status (you do not set these, and must not work around them):
+   - Chief editorial + Owner send authorization on the exact latest version and a passing eligibility check => task prep_status=ready_for_execution, blockers cleared, shown as "Approved, ready to send".
+   - Revoked approval, an edit (new version), a rejection, a paused campaign etc. => back to blocked with the correct blocker text (internal_review / user_approval_needed / draft_needed / validation_needed). /schedule computes this live, so counters are always real.
+   - When that draft is approved, an open draft-preparation task (action_type containing "draft", e.g. prepare_first_email_draft) of the same lead closes by itself.
+   - POST /sends recorded => the linked send task becomes completed, with activity_id, sent_at and completed_by = the person who reported the send, whoever the assignee is (audit "task_auto_complete"). POST /sends/{event_id}/reconcile does the same once the record is saved.
+  Date-only tasks (due_at "YYYY-MM-DD") have no time of day: the 23:59 stored value is not a send time; the real time appears as sent_at once sent.
 Your work list: GET /schedule?view=today|tomorrow (state: overdue|blocked|ready|planned|completed). Do only 'ready' work, and only after the eligibility check below.
 
 ## Sending workflow (the only allowed order)

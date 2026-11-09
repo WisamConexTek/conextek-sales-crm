@@ -32,11 +32,13 @@ export async function createVersion(actor: Actor, input: unknown) {
   const h = hash(subject, d.body);
   if (prev && prev.content_hash === h) return { id: prev.id as number, version: prev.version as number, created: false };
   const version = ((prev?.version as number) ?? 0) + 1;
+  if (d.task_id == null && prev) { const pt = await one("SELECT task_id FROM message_versions WHERE id=?", [prev.id as number]); if (pt?.task_id) d.task_id = pt.task_id as number; }
   const r = await run("INSERT INTO message_versions (lead_id,contact_id,channel,campaign_id,task_id,version,subject,body,content_hash,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
     [d.lead_id, d.contact_id ?? null, d.channel, d.campaign_id, d.task_id ?? null, version, subject, d.body, h, actor.id, now()]);
   // An edit voids every still-active authorization of the earlier versions of this thread.
   const voided = await run("UPDATE send_authorizations SET status='revoked' WHERE status='active' AND message_version_id IN (SELECT id FROM message_versions WHERE lead_id=? AND COALESCE(contact_id,0)=? AND channel=? AND campaign_id=? AND id<>?)", [d.lead_id, d.contact_id ?? 0, d.channel, d.campaign_id, r.id]);
   await audit(actor, "create_message_version", "message_version", r.id, { lead_id: d.lead_id, version, revoked_authorizations: voided.changes, is_test: !!lead.is_demo });
+  await syncTasks(actor, r.id);
   return { id: r.id, version, created: true };
 }
 
@@ -96,6 +98,7 @@ export async function authorize(actor: Actor, input: unknown) {
   const r = await run("INSERT INTO send_authorizations (message_version_id,lead_id,contact_id,channel,campaign_id,kind,permitted_action,approver_id,note,created_at,delegated) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
     [v.id as number, v.lead_id as number, (v.contact_id as number) ?? null, v.channel as string, v.campaign_id as number, d.kind, d.permitted_action, actor.id, d.note ?? null, now(), delegated]);
   await audit(actor, delegated ? "authorize_send_delegated" : `authorize_${d.kind}`, "message_version", v.id as number, { authorization_id: r.id, action: d.permitted_action, ...(delegated ? { delegated: true, approver: actor.name } : {}) });
+  await syncTasks(actor, v.id as number);
   return { id: r.id, created: true };
 }
 
@@ -155,6 +158,7 @@ export async function rejectVersion(actor: Actor, versionId: number, reason: unk
     { sql: "UPDATE send_authorizations SET status='revoked' WHERE message_version_id=? AND status='active'", args: [versionId] },
   ]);
   await audit(actor, "reject_message_version", "message_version", versionId, { lead_id: v.lead_id, reason: why, delegated: !!delegated });
+  await syncTasks(actor, versionId);
   return { message_version_id: versionId, status: "rejected" };
 }
 
@@ -219,6 +223,7 @@ export async function revoke(actor: Actor, authId: number) {
   const r = await run("UPDATE send_authorizations SET status='revoked' WHERE id=? AND status='active'", [authId]);
   if (!r.changes) throw new HttpError(409, "Only an active authorization can be revoked.");
   await audit(actor, "revoke_authorization", "message_version", a.message_version_id as number, { authorization_id: authId });
+  await syncTasks(actor, a.message_version_id as number);
 }
 
 /* ---------- eligibility ---------- */
@@ -226,9 +231,16 @@ export async function checkEligibility(actor: Actor, versionId: number) {
   const v = await one("SELECT * FROM message_versions WHERE id=?", [versionId]);
   if (!v) throw new HttpError(404, "Message version not found.");
   await assertLeadAccess(actor, v.lead_id as number);
+  const core = await eligibilityCore(v);
+  const reasons = [...(!can(actor, "message.record_sent") ? ["you do not have message.record_sent, so this send could not be recorded"] : []), ...core.reasons];
+  return { eligible: reasons.length === 0, reasons, warnings: core.warnings, authorization_id: core.authorization_id, message_version_id: versionId };
+}
+
+/** The actor-independent rules. Used by the eligibility check, and by the task status sync (which has no actor). */
+async function eligibilityCore(v: Row) {
+  const versionId = v.id as number;
   const reasons: string[] = [];
   const warnings: string[] = [];
-  if (!can(actor, "message.record_sent")) reasons.push("you do not have message.record_sent, so this send could not be recorded");
   if ((await latestVersion(v)) !== v.id) reasons.push("a newer version of this message exists; authorization never carries over to edited text");
   if (await one("SELECT 1 AS x FROM message_decisions WHERE message_version_id=? AND kind='rejected'", [versionId])) reasons.push("the Owner rejected this draft (see decisions on the version); prepare a new version");
   const auth = await one("SELECT * FROM send_authorizations WHERE message_version_id=? AND kind='send' AND status='active' ORDER BY id DESC LIMIT 1", [versionId]);
@@ -257,7 +269,76 @@ export async function checkEligibility(actor: Actor, versionId: number) {
   if (Number(pending!.n) > 0) reasons.push("a previous send to this lead is SENT_CONFIRMED_CRM_PENDING; reconcile it before anything else");
   const recent = await one("SELECT COUNT(*) AS n FROM activities WHERE lead_id=? AND type='message' AND occurred_at>?", [v.lead_id as number, new Date(Date.now() - 86400000).toISOString()]);
   if (Number(recent!.n) > 0) warnings.push("a message to this lead was recorded in the last 24 hours");
-  return { eligible: reasons.length === 0, reasons, warnings, authorization_id: (auth?.id as number) ?? null, message_version_id: versionId };
+  return { reasons, warnings, authorization_id: (auth?.id as number) ?? null };
+}
+
+
+/* ---------- task <-> message version: live readiness and automatic status ---------- */
+/** A draft-preparation task closes when its draft is approved; every other open outreach task is a "send" task. */
+export const isPrepTask = (t: Row) => /draft/i.test(String(t.action_type ?? ""));
+const NON_SEND = /prepar|draft|research|validat|review/i;
+
+export type Readiness = { state: "ready" | "blocked" | "sent"; prep_status: string | null; blockers: string | null; label: string | null; version_id: number };
+
+/** The real state of a message version, computed from approvals and the eligibility rules. Never stored text. */
+export async function readiness(versionId: number): Promise<Readiness> {
+  let v = await one("SELECT * FROM message_versions WHERE id=?", [versionId]);
+  if (!v) throw new HttpError(404, "Message version not found.");
+  v = (await one("SELECT * FROM message_versions WHERE id=?", [await latestVersion(v)]))!;
+  const id = v.id as number;
+  const blocked = (prep: string, why: string): Readiness => ({ state: "blocked", prep_status: prep, blockers: why, label: null, version_id: id });
+  if (await one("SELECT 1 AS x FROM send_authorizations WHERE message_version_id=? AND kind='send' AND status='used'", [id])) return { state: "sent", prep_status: null, blockers: null, label: "Sent", version_id: id };
+  const rej = await one("SELECT reason FROM message_decisions WHERE message_version_id=? AND kind='rejected'", [id]);
+  if (rej) return blocked("draft_needed", `Draft rejected by the Owner: ${rej.reason}. Prepare a new version.`);
+  if (!(await one("SELECT 1 AS x FROM send_authorizations WHERE message_version_id=? AND kind='editorial' AND status='active'", [id]))) return blocked("internal_review", `Waiting for the Chief's editorial review of version #${id}.`);
+  const core = await eligibilityCore(v);
+  if (!core.authorization_id) return blocked("user_approval_needed", `Waiting for the Owner's send approval of version #${id}.`);
+  if (core.reasons.length) return blocked("validation_needed", `Approved, but not sendable: ${core.reasons.join("; ")}.`);
+  return { state: "ready", prep_status: "ready_for_execution", blockers: null, label: "Approved, ready to send", version_id: id };
+}
+
+/** Finds (and links) the open send task(s) of this message's thread, pointing them at the latest version. */
+async function linkSendTasks(v: Row): Promise<Row[]> {
+  const thread = (await all("SELECT id FROM message_versions WHERE lead_id=? AND COALESCE(contact_id,0)=? AND channel=? AND campaign_id=?", [v.lead_id as number, (v.contact_id as number) ?? 0, v.channel as string, v.campaign_id as number])).map((r) => r.id as number);
+  const open = await all("SELECT * FROM tasks WHERE lead_id=? AND status NOT IN ('completed','cancelled') AND is_demo=(SELECT is_demo FROM leads WHERE id=?)", [v.lead_id as number, v.lead_id as number]);
+  let linked = open.filter((t) => !isPrepTask(t) && ((t.message_version_id && thread.includes(t.message_version_id as number)) || t.id === v.task_id));
+  if (!linked.length) {
+    // No explicit link: adopt the one open outreach task for this lead, channel and campaign (never guess between several).
+    const cand = open.filter((t) => !NON_SEND.test(String(t.action_type ?? t.title ?? "")) && !t.message_version_id && (!t.channel || t.channel === v.channel) && (!t.campaign_id || t.campaign_id === v.campaign_id) && (t.action_type || t.channel));
+    if (cand.length === 1) linked = cand;
+  }
+  for (const t of linked) if (t.message_version_id !== v.id) await run("UPDATE tasks SET message_version_id=? WHERE id=?", [v.id as number, t.id as number]);
+  return linked;
+}
+
+/** Keeps stored task fields in line with the real approval state, and closes the draft-preparation task once its draft is approved. */
+export async function syncTasks(actor: Actor, versionId: number) {
+  try {
+    const base = await one("SELECT * FROM message_versions WHERE id=?", [versionId]);
+    if (!base) return;
+    const v = (await one("SELECT * FROM message_versions WHERE id=?", [await latestVersion(base)]))!;
+    const linked = await linkSendTasks(v);
+    const r = await readiness(v.id as number);
+    if (r.state !== "sent") for (const t of linked) {
+      const blockers = r.blockers;
+      if ((t.prep_status ?? null) === r.prep_status && (t.blockers ?? null) === blockers) continue;
+      await run("UPDATE tasks SET prep_status=?, blockers=?, updated_at=? WHERE id=?", [r.prep_status, blockers, now(), t.id as number]);
+      await audit(actor, "task_auto_status", "task", t.id as number, { message_version_id: v.id, from: { prep_status: t.prep_status, blockers: t.blockers }, to: { prep_status: r.prep_status, blockers } });
+    }
+    // draft approved (editorial + send) -> the preparation task closes by itself
+    const approved = r.state === "ready" || (r.state === "blocked" && r.prep_status === "validation_needed");
+    if (approved) {
+      const preps = await all("SELECT * FROM tasks WHERE lead_id=? AND status NOT IN ('completed','cancelled') AND (action_type LIKE '%draft%' COLLATE NOCASE) AND (channel IS NULL OR channel=?) AND (campaign_id IS NULL OR campaign_id=?)", [v.lead_id as number, v.channel as string, v.campaign_id as number]);
+      for (const t of preps) {
+        const ts = now();
+        await run("UPDATE tasks SET status='completed', completed_at=?, completed_by=?, completion_note=?, message_version_id=?, blockers=NULL, updated_at=? WHERE id=?", [ts, actor.id, `Auto-closed: draft version #${v.id} was approved`, v.id as number, ts, t.id as number]);
+        await run("INSERT INTO activities (lead_id,task_id,type,title,body,actor_id,occurred_at,created_at,is_demo) VALUES (?,?,'task',?,?,?,?,?,?)", [t.lead_id as number, t.id as number, `Task completed: ${t.title}`, `Auto-closed: draft version #${v.id} was approved`, actor.id, ts, ts, t.is_demo as number]);
+        await audit(actor, "task_auto_complete", "task", t.id as number, { reason: "draft approved", message_version_id: v.id });
+      }
+    }
+  } catch (e) {
+    console.error("task sync failed", e);
+  }
 }
 
 /* ---------- confirm + record ---------- */
@@ -340,6 +421,14 @@ async function recordEvent(actor: Actor, eventId: string) {
     if (PRE_CONTACT_STAGES.includes(lead.stage as string) && (await one("SELECT key FROM lists WHERE kind='stage' AND key='contacted' AND active=1"))) {
       stmts.push({ sql: "UPDATE leads SET stage='contacted' WHERE id=?", args: [lead.id as number] });
       stmts.push({ sql: "INSERT INTO activities (lead_id,type,title,body,stage_from,stage_to,actor_id,occurred_at,created_at,is_demo) VALUES (?,'status','Stage changed','Message sent (confirmed send event)',?,'contacted',?,?,?,?)", args: [lead.id as number, lead.stage as string, e.reported_by as number, t, t, lead.is_demo as number] });
+    }
+    // The linked send task completes by itself, whoever it is assigned to.
+    const doneTasks = (await all("SELECT id,title,action_type,lead_id,is_demo FROM tasks WHERE status NOT IN ('completed','cancelled') AND (message_version_id=? OR id=?)", [v.id as number, (v.task_id as number) ?? 0])).filter((x) => !isPrepTask(x));
+    for (const tk of doneTasks) {
+      stmts.push({ sql: "UPDATE tasks SET status='completed', completed_at=?, completed_by=?, completion_note=?, activity_id=?, sent_at=?, blockers=NULL, message_version_id=?, updated_at=? WHERE id=?", args: [t, e.reported_by as number, `Auto-completed: send recorded (event ${eventId}, activity ${act.id})`, act.id as number, e.sent_at as string, v.id as number, t, tk.id as number] });
+      stmts.push({ sql: "UPDATE activities SET task_id=? WHERE id=? AND task_id IS NULL", args: [tk.id as number, act.id as number] });
+      stmts.push({ sql: "INSERT INTO activities (lead_id,task_id,type,title,body,actor_id,occurred_at,created_at,is_demo) VALUES (?,?,'task',?,?,?,?,?,?)", args: [tk.lead_id as number, tk.id as number, `Task completed: ${tk.title}`, `Auto-completed when the send was recorded (activity ${act.id})`, e.reported_by as number, t, t, tk.is_demo as number] });
+      stmts.push({ sql: "INSERT INTO audit_log (actor_id,actor_name,via,action,entity,entity_id,detail,created_at) SELECT id,name,'system','task_auto_complete','task',?,?,? FROM users WHERE id=?", args: [String(tk.id), JSON.stringify({ event_id: eventId, activity_id: act.id, message_version_id: v.id }), t, e.reported_by as number] });
     }
     stmts.push({ sql: "UPDATE send_events SET status='RECORDED', activity_id=?, last_error=NULL, updated_at=? WHERE event_id=? AND status<>'RECORDED'", args: [act.id as number, t, eventId] });
     await tx(stmts);
