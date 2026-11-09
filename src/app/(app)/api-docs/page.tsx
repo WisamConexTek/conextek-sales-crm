@@ -221,6 +221,11 @@ GET  /api/v1/sends?status=SENT_CONFIRMED_CRM_PENDING`}</Code>
             <Code>{`GET  /api/v1/authorizations/pending             Owner or delegate: versions waiting, with body, recipient, editorial status, suggested_action, other_blockers
 POST /api/v1/authorizations/bulk                {"items":[{"message_version_id":7,"permitted_action":"first_email"},…]}  max 100 → {approved, results[]}
 POST /api/v1/authorizations                     single approval (kind "send" needs Owner or the delegate)`}</Code></li>
+          <li><b>Edit or reject a draft (Owner or delegate).</b> On <b>Send approvals</b>, <b>Edit / reject…</b> opens the text. <b>Save as new version</b> never overwrites: the old version stays, the edited text becomes a new latest version (older approvals are voided) and must be approved. <b>Reject draft</b> requires a reason; the version leaves the queue and can never be sent. Both are audit-logged and visible to agents.
+            <Code>{`POST /api/v1/messages/versions/{id}/edit        {"subject":"…","body":"…","note":"why (optional)"} → {old_version_id,new_version_id}
+POST /api/v1/messages/versions/{id}/reject      {"reason":"required"}
+GET  /api/v1/messages/decisions                 ?lead_id=&limit=  → rejections (reason) and edits (old/new text), newest first
+GET  /api/v1/messages/versions/{id}             now includes decisions[]`}</Code></li>
           <li><b>Delegating send approval to a Chief (optional, Owner only).</b> On the Send approvals page the Owner picks a Chief and turns delegation <b>ON</b> or <b>OFF</b>; it is off by default and takes effect immediately. While ON, that one Chief can open the queue and approve sends; nobody else can. Every approval made under delegation is flagged <code>delegated</code>, shown in the “Recent send approvals” table, and written to the audit log as <code>authorize_send_delegated</code> (who, which version, when); turning delegation on or off is logged too. Approvals already made stay valid when delegation is switched off; the Owner can revoke any of them (<code>DELETE /authorizations/{"{id}"}</code>).
             <Code>{`GET /api/v1/settings/send-delegation            → {enabled, delegate_user_id, delegate_name}
 PUT /api/v1/settings/send-delegation            Owner only: {"user_id": 2}  to turn ON for that Chief, {"user_id": null} to turn OFF`}</Code></li>

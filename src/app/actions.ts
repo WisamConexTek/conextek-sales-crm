@@ -327,6 +327,20 @@ export async function approveSendsAction(fd: FD) {
     return `Send approved for ${r.approved} message${r.approved === 1 ? "" : "s"}.${bad.length ? ` ${bad.length} failed: ${bad.map((b) => `#${b.message_version_id} ${b.error}`).join(" | ")}` : ""}`;
   }, "/send-approvals");
 }
+export async function rejectDraftAction(fd: FD) {
+  const a = await requireUser();
+  await guard(fd, async () => {
+    await Sends.rejectVersion(a, Number(s(fd, "id")), s(fd, "reason"));
+    return "Draft rejected. The reason is saved for the agents.";
+  }, "/send-approvals");
+}
+export async function editDraftAction(fd: FD) {
+  const a = await requireUser();
+  await guard(fd, async () => {
+    const r = await Sends.editVersion(a, Number(s(fd, "id")), { subject: s(fd, "subject"), body: s(fd, "body"), note: s(fd, "note") });
+    return `Saved as version #${r.new_version_id}. It still needs your send approval below.`;
+  }, "/send-approvals");
+}
 export async function setSendDelegationAction(fd: FD) {
   const a = await requireUser();
   await guard(fd, async () => {

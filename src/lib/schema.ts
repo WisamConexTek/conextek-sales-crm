@@ -445,4 +445,19 @@ CREATE TABLE app_settings (
 -- 1 when the authorization was made by a delegate (not the Owner). Existing rows stay 0.
 ALTER TABLE send_authorizations ADD COLUMN delegated INTEGER NOT NULL DEFAULT 0;
 `,
+  `
+-- Migration 8 (additive): Owner decisions on drafts, so agents learn what happened and why.
+-- Message versions stay immutable: an edit creates a new version; a rejection is recorded here.
+CREATE TABLE message_decisions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  message_version_id INTEGER NOT NULL REFERENCES message_versions(id),
+  kind TEXT NOT NULL CHECK (kind IN ('rejected','edited')),
+  reason TEXT,
+  new_version_id INTEGER REFERENCES message_versions(id),
+  decided_by INTEGER NOT NULL REFERENCES users(id),
+  delegated INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX idx_md_version ON message_decisions(message_version_id, kind);
+`,
 ];

@@ -165,6 +165,34 @@ async function main() {
   ok((await S.checkEligibility(emp, qv[2])).eligible, "approvals already made under delegation stay valid after it is turned off");
   ok((await S.recentSendAuthorizations(owner)).some((r) => r.delegated === 1), "the audit list shows delegated approvals");
 
+  console.log("Owner edit and reject");
+  const qv3 = (await S.pendingSendApprovals(owner)).map((r) => r.id as number);
+  const target = qv3[0];
+  const tv = await S.getVersion(owner, target);
+  await throws(() => S.rejectVersion(emp, target, "no"), "an employee cannot reject", /Owner/);
+  await throws(() => S.rejectVersion(owner, target, ""), "a reason is required", /reason/);
+  await throws(() => S.editVersion(owner, target, { body: tv.body }), "an unchanged edit is refused", /Nothing changed/);
+  const ed = await S.editVersion(owner, target, { subject: "New subject", body: String(tv.body) + "\nP.S. edited", note: "shorter, friendlier" });
+  const nv = await S.getVersion(owner, ed.new_version_id);
+  ok(nv.version === Number(tv.version) + 1 && String(nv.body).endsWith("P.S. edited") && nv.is_latest, "edit creates a new latest version with the new text");
+  ok((await S.getVersion(owner, target)).body === tv.body, "the old version text is untouched");
+  ok((await S.pendingSendApprovals(owner)).some((r) => r.id === ed.new_version_id) && !(await S.pendingSendApprovals(owner)).some((r) => r.id === target), "new version is in the queue, old one is not");
+  ok((await S.getVersion(owner, target)).decisions.some((d) => d.kind === "edited" && d.reason === "shorter, friendlier"), "the edit and its note are visible to agents on the old version");
+  await throws(() => S.rejectVersion(owner, target, "too late"), "an old version cannot be rejected, only the latest", /newer version/);
+  await S.authorize(owner, { message_version_id: ed.new_version_id, kind: "send", permitted_action: "first_email" });
+  const rj = await S.rejectVersion(owner, ed.new_version_id, "Do not mention pricing in a first email");
+  ok(rj.status === "rejected", "reject works");
+  ok(!(await S.pendingSendApprovals(owner)).some((r) => r.id === ed.new_version_id), "a rejected version leaves the queue");
+  ok(Number((await one("SELECT COUNT(*) AS n FROM send_authorizations WHERE message_version_id=? AND status='active'", [ed.new_version_id]))!.n) === 0, "rejecting voids any active approval");
+  const elr = await S.checkEligibility(emp, ed.new_version_id);
+  ok(!elr.eligible && elr.reasons.some((r: string) => /rejected/.test(r)), "a rejected version can never be sent");
+  await throws(() => S.rejectVersion(owner, ed.new_version_id, "again"), "cannot reject twice", /Already rejected/);
+  const dec = await S.listDecisions(owner, { limit: 5 });
+  ok(dec[0].kind === "rejected" && dec[0].reason === "Do not mention pricing in a first email" && dec.some((d) => d.kind === "edited" && d.new_body), "agents can list decisions with reasons and old/new text");
+  ok(Number((await one("SELECT COUNT(*) AS n FROM audit_log WHERE action IN ('edit_message_version','reject_message_version')"))!.n) === 2, "edit and reject are audit-logged");
+  const nv2 = await S.createVersion(emp, { lead_id: nv.lead_id, contact_id: nv.contact_id, channel: nv.channel, campaign_id: nv.campaign_id, subject: "Revised", body: "Revised without pricing" });
+  ok(nv2.created && (await S.pendingSendApprovals(owner)).some((r) => r.id === nv2.id), "the agent's replacement version re-enters the queue");
+
   console.log(`\n${pass} passed, ${fail} failed`);
   for (const f of [DB, `${DB}-wal`, `${DB}-shm`]) rmSync(f, { force: true });
   process.exit(fail ? 1 : 0);

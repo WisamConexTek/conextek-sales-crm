@@ -46,7 +46,8 @@ export async function getVersion(actor: Actor, id: number) {
   await assertLeadAccess(actor, v.lead_id as number);
   const latest = await latestVersion(v);
   const auths = await all("SELECT a.id,a.kind,a.permitted_action,a.status,a.approver_id,u.name AS approver_name,a.note,a.created_at,a.used_at FROM send_authorizations a JOIN users u ON u.id=a.approver_id WHERE a.message_version_id=? ORDER BY a.id", [id]);
-  return { ...v, is_latest: latest === v.id, authorizations: auths };
+  const decisions = await all("SELECT d.id,d.kind,d.reason,d.new_version_id,u.name AS decided_by,d.created_at FROM message_decisions d JOIN users u ON u.id=d.decided_by WHERE d.message_version_id=? ORDER BY d.id", [id]);
+  return { ...v, is_latest: latest === v.id, authorizations: auths, decisions } as Row & { is_latest: boolean; authorizations: Row[]; decisions: Row[] };
 }
 async function latestVersion(v: Row) {
   const r = await one("SELECT id FROM message_versions WHERE lead_id=? AND COALESCE(contact_id,0)=? AND channel=? AND campaign_id=? ORDER BY version DESC LIMIT 1", [v.lead_id, v.contact_id ?? 0, v.channel, v.campaign_id]);
@@ -100,7 +101,7 @@ export async function authorize(actor: Actor, input: unknown) {
 
 /* ---------- send-approval queue (Owner / delegate) ---------- */
 const LATEST = "v.id = (SELECT v2.id FROM message_versions v2 WHERE v2.lead_id=v.lead_id AND COALESCE(v2.contact_id,0)=COALESCE(v.contact_id,0) AND v2.channel=v.channel AND v2.campaign_id=v.campaign_id ORDER BY v2.version DESC LIMIT 1)";
-const WAITING = `${LATEST} AND l.is_demo=0 AND NOT EXISTS (SELECT 1 FROM send_authorizations a WHERE a.message_version_id=v.id AND a.kind='send' AND a.status IN ('active','used'))`;
+const WAITING = `${LATEST} AND l.is_demo=0 AND NOT EXISTS (SELECT 1 FROM send_authorizations a WHERE a.message_version_id=v.id AND a.kind='send' AND a.status IN ('active','used')) AND NOT EXISTS (SELECT 1 FROM message_decisions d WHERE d.message_version_id=v.id AND d.kind='rejected')`;
 
 export async function countPendingSendApprovals(): Promise<number> {
   return Number((await one(`SELECT COUNT(*) AS n FROM message_versions v JOIN leads l ON l.id=v.lead_id WHERE ${WAITING}`))!.n);
@@ -137,6 +138,52 @@ export async function pendingSendApprovals(actor: Actor) {
     } as Row);
   }
   return out;
+}
+
+/** Owner/delegate rejects a draft with a reason. The version stays on record; agents read the reason and prepare a new version. */
+export async function rejectVersion(actor: Actor, versionId: number, reason: unknown) {
+  if (!(await canAuthorizeSend(actor))) throw new HttpError(403, "Only the Owner (or the delegated Chief) can reject a draft.");
+  const why = parse(z.string().trim().min(3, "reason: say why, so the agents understand").max(2000), reason);
+  const v = await one("SELECT * FROM message_versions WHERE id=?", [versionId]);
+  if (!v) throw new HttpError(404, "Message version not found.");
+  if ((await latestVersion(v)) !== v.id) throw new HttpError(409, "A newer version exists; reject that one instead.");
+  if (await one("SELECT 1 AS x FROM send_authorizations WHERE message_version_id=? AND kind='send' AND status='used'", [versionId])) throw new HttpError(409, "This version was already sent.");
+  if (await one("SELECT 1 AS x FROM message_decisions WHERE message_version_id=? AND kind='rejected'", [versionId])) throw new HttpError(409, "Already rejected.");
+  const delegated = actor.role !== "owner" ? 1 : 0;
+  await tx([
+    { sql: "INSERT INTO message_decisions (message_version_id,kind,reason,decided_by,delegated,created_at) VALUES (?,?,?,?,?,?)", args: [versionId, "rejected", why, actor.id, delegated, now()] },
+    { sql: "UPDATE send_authorizations SET status='revoked' WHERE message_version_id=? AND status='active'", args: [versionId] },
+  ]);
+  await audit(actor, "reject_message_version", "message_version", versionId, { lead_id: v.lead_id, reason: why, delegated: !!delegated });
+  return { message_version_id: versionId, status: "rejected" };
+}
+
+/** Owner/delegate edits the text directly. This creates a NEW immutable version (older approvals are voided). The new version still needs approval. */
+export async function editVersion(actor: Actor, versionId: number, input: unknown) {
+  if (!(await canAuthorizeSend(actor))) throw new HttpError(403, "Only the Owner (or the delegated Chief) can edit a draft here.");
+  const d = parse(z.object({ subject: optText(300).optional(), body: z.string().trim().min(1, "required").max(20000), note: optText(2000).optional() }), input);
+  const v = await one("SELECT * FROM message_versions WHERE id=?", [versionId]);
+  if (!v) throw new HttpError(404, "Message version not found.");
+  if ((await latestVersion(v)) !== v.id) throw new HttpError(409, "A newer version exists; edit that one.");
+  if (await one("SELECT 1 AS x FROM send_authorizations WHERE message_version_id=? AND kind='send' AND status='used'", [versionId])) throw new HttpError(409, "This version was already sent and cannot be edited.");
+  const r = await createVersion(actor, { lead_id: v.lead_id, contact_id: v.contact_id, channel: v.channel, campaign_id: v.campaign_id, task_id: v.task_id, subject: d.subject ?? v.subject, body: d.body });
+  if (!r.created) throw new HttpError(400, "Nothing changed: the text is identical to this version.");
+  await run("INSERT INTO message_decisions (message_version_id,kind,reason,new_version_id,decided_by,delegated,created_at) VALUES (?,?,?,?,?,?,?)", [versionId, "edited", d.note ?? null, r.id, actor.id, actor.role !== "owner" ? 1 : 0, now()]);
+  await audit(actor, "edit_message_version", "message_version", versionId, { lead_id: v.lead_id, new_version_id: r.id, note: d.note ?? null });
+  return { old_version_id: versionId, new_version_id: r.id, version: r.version };
+}
+
+/** What the Owner decided on drafts (rejections with reasons, edits with old and new text), newest first. For agents to learn from. */
+export async function listDecisions(actor: Actor, q: { lead_id?: number; limit?: number } = {}) {
+  const scope = isManager(actor) ? "1=1" : "l.owner_id=?";
+  const args: (string | number)[] = isManager(actor) ? [] : [actor.id];
+  if (q.lead_id) { args.push(q.lead_id); }
+  const rows = await all(
+    `SELECT d.id,d.kind,d.reason,d.created_at,u.name AS decided_by,d.delegated,d.message_version_id,d.new_version_id,v.lead_id,l.company,v.version,v.subject,v.body,nv.subject AS new_subject,nv.body AS new_body
+     FROM message_decisions d JOIN message_versions v ON v.id=d.message_version_id JOIN leads l ON l.id=v.lead_id JOIN users u ON u.id=d.decided_by
+     LEFT JOIN message_versions nv ON nv.id=d.new_version_id
+     WHERE ${scope}${q.lead_id ? " AND v.lead_id=?" : ""} ORDER BY d.id DESC LIMIT ${Math.min(Math.max(q.limit ?? 50, 1), 200)}`, args);
+  return rows;
 }
 
 /** Approve several versions; each one stands alone (one failing does not stop the rest). */
@@ -183,6 +230,7 @@ export async function checkEligibility(actor: Actor, versionId: number) {
   const warnings: string[] = [];
   if (!can(actor, "message.record_sent")) reasons.push("you do not have message.record_sent, so this send could not be recorded");
   if ((await latestVersion(v)) !== v.id) reasons.push("a newer version of this message exists; authorization never carries over to edited text");
+  if (await one("SELECT 1 AS x FROM message_decisions WHERE message_version_id=? AND kind='rejected'", [versionId])) reasons.push("the Owner rejected this draft (see decisions on the version); prepare a new version");
   const auth = await one("SELECT * FROM send_authorizations WHERE message_version_id=? AND kind='send' AND status='active' ORDER BY id DESC LIMIT 1", [versionId]);
   if (!auth) reasons.push("no active Owner send authorization for this exact version, recipient, channel and campaign");
   const lead = await one("SELECT * FROM leads WHERE id=?", [v.lead_id as number]);
