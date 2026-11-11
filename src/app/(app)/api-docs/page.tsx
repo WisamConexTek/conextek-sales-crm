@@ -32,7 +32,7 @@ export default async function ApiDocs() {
   const endpoints: [string, string, string][] = [
     ["GET", "/guide", "The agent briefing (markdown). Agents re-read it at the start of each run."],
     ["GET", "/openapi.json", "Machine-readable description of every endpoint (OpenAPI 3.1). No key needed."],
-    ["GET", "/work/next?limit=", "What to do now: the work list with lead, contacts, draft, approvals, eligibility and one next_step per item."],
+    ["GET", "/work/next?limit=&assignee=&action=", "What to do now, by urgency (overdue, today, tomorrow, undated): lead, contacts, draft, approvals, eligibility and one next_step per item. Owner/Chief: assignee=all for the whole team; action=send for send-ready work only."],
     ["GET", "/changes?since=", "What happened since the last run: decisions on drafts, approvals, replies, bounces, task changes."],
     ["GET", "/requests?run_id=&outcome=&lead_id=", "The API request log: your own calls (Owner/Chief: everyone's). Same data as the Agent activity page."],
     ["POST", "/api/mcp  (not under /api/v1)", "MCP server (Model Context Protocol): the same abilities as tools, with the same key."],

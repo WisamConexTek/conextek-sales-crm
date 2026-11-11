@@ -134,6 +134,59 @@ async function main() {
   item = w.items.find((i: any) => i.task.id === undated); // eslint-disable-line @typescript-eslint/no-explicit-any
   ok(item && item.next_step.action === "work" && item.task.state === "planned" && w.undated_open_tasks === 1, "a task with no date is still in the work list (it is work to do), after the dated ones");
 
+  console.log("Work list: urgency order, holds that end, team view");
+  /* eslint-disable @typescript-eslint/no-explicit-any */
+  const T = await import("../src/lib/service/tasks");
+  const { todayYmd, addDays } = await import("../src/lib/db");
+  const mk = async (body: Record<string, unknown>) => (await call("POST", "v1/tasks", { headers: RUN, file: "v1/tasks", body })).json.data.id as number;
+  for (let i = 0; i < 12; i++) await mk({ title: `Undated filler ${i}` });
+  const tTomorrow = await mk({ title: "Due tomorrow", due_at: addDays(todayYmd(), 1) });
+  const tToday = await mk({ title: "Due today", due_at: todayYmd() });
+  const tLate = await mk({ title: "Late one", due_at: new Date(Date.now() - 2 * 86400000).toISOString() });
+  w = await next();
+  ok(w.items.length === 10 && w.items[0].task.id === tLate && w.items[0].task.urgency === "overdue" && w.items[1].task.id === tToday && w.items[1].task.urgency === "today" && w.items[2].task.id === tTomorrow && w.items[2].task.urgency === "tomorrow" && w.items.slice(3).every((i: any) => i.task.urgency === "undated"),
+    "the first page is overdue, then due today, then due tomorrow, then undated, however many undated tasks there are");
+  ok(w.by_urgency.overdue === 1 && w.by_urgency.today === 1 && w.by_urgency.tomorrow === 1 && w.by_urgency.undated === 13 && w.has_more === true && w.limit === 10, "the answer counts each urgency group and says there is more");
+  ok((await call("GET", "v1/work/next?limit=50", { headers: RUN, file: "v1/work/next" })).json.data.items.length === 16, "limit goes up to 50");
+
+  // a send task that was held by the daily cap and moved to tomorrow, with a note that forbids sending
+  const lead3 = (await call("POST", "v1/leads", { headers: RUN, file: "v1/leads", body: { company: "Vega Trucks", campaign_id: camp, contacts: [{ name: "Vera", email: "vera@vega.test" }] } })).json.data.id as number;
+  const cid3 = (await one("SELECT id FROM contacts WHERE lead_id=?", [lead3]))!.id as number;
+  const heldTask = await mk({ title: "Send first email to Vega", instructions: "HOLD. This task grants no send permission.", lead_id: lead3, campaign_id: camp, channel: "email", action_type: "send_first_email", scheduled_at: new Date(Date.now() - 3600000).toISOString() });
+  const v3 = (await call("POST", "v1/message-versions", { headers: RUN, file: "v1/message-versions", body: { lead_id: lead3, contact_id: cid3, channel: "email", campaign_id: camp, task_id: heldTask, subject: "Hello Vega", body: "Approved text." } })).json.data.id as number;
+  await S.authorize(chief, { message_version_id: v3, kind: "editorial", permitted_action: "first_email" });
+  await S.authorize(owner, { message_version_id: v3, kind: "send", permitted_action: "first_email" });
+  await T.rescheduleTask(chief, heldTask, { scheduled_at: new Date(Date.now() + 86400000).toISOString(), reason: "daily send limit reached, moved to next day" });
+  const all50 = async (q = "") => (await call("GET", `v1/work/next?limit=50${q}`, { headers: RUN, file: "v1/work/next" })).json.data;
+  item = (await all50()).items.find((i: any) => i.task.id === heldTask);
+  ok(item.task.held === true && /daily send limit/.test(item.task.hold_reason) && /^Held:/.test(item.task.reason), "while the hold runs, the task says it is held and why");
+  // the day it was moved to arrives
+  const nowIso = new Date(Date.now() - 60000).toISOString();
+  await run("UPDATE tasks SET scheduled_at=?, due_at=? WHERE id=?", [nowIso, nowIso, heldTask]);
+  item = (await all50()).items.find((i: any) => i.task.id === heldTask);
+  ok(item.next_step.action === "send" && item.eligibility.eligible === true && item.task.held === false && item.task.hold_reason === null && !/Held/.test(String(item.task.reason)), "once that day arrives the hold ends by itself: no hold_reason, no Held text, next step send");
+  ok(/daily send limit/.test(item.task.moved_reason) && !!item.task.moved_from && /out of date/.test(item.next_step.note), "the old reason stays as history, and an older do-not-send note in the instructions is flagged as out of date");
+  const viaTasks = (await call("GET", `v1/tasks/${heldTask}`, { headers: RUN, file: "v1/tasks/[id]", params: { id: String(heldTask) } })).json.data;
+  ok(viaTasks.hold_reason === null && viaTasks.held === false && /daily send limit/.test(viaTasks.moved_reason), "GET /tasks/{id} agrees");
+  const onlySend = await all50("&action=send");
+  ok(onlySend.items.length === 1 && onlySend.items[0].task.id === heldTask && onlySend.action === "send" && onlySend.has_more === false, "action=send returns only send-ready work");
+  ok((await call("GET", "v1/work/next?action=fly", { headers: RUN, file: "v1/work/next" })).json.code === "invalid_input", "an unknown action is refused");
+
+  const chiefKey = await U.createKey(owner, chief.id, "chief key");
+  const noRec = (await call("GET", "v1/work/next?assignee=all&limit=50", { key: chiefKey, file: "v1/work/next" })).json.data.items.find((i: any) => i.task.id === heldTask);
+  ok(noRec.next_step.action === "wait" && /message\.record_sent/.test(noRec.next_step.instruction), "someone who may not record sends is told so instead of being told to send");
+  const chiefPerms = JSON.parse((await one("SELECT permissions FROM users WHERE id=?", [chief.id]))!.permissions as string) as string[];
+  await U.setPermissions(owner, chief.id, [...chiefPerms, "message.record_sent"], "custom");
+  const own = (await call("GET", "v1/work/next?limit=50", { key: chiefKey, file: "v1/work/next" })).json.data;
+  ok(!own.items.some((i: any) => i.task.id === heldTask), "by default the Chief still sees only the Chief's own work");
+  const team = (await call("GET", "v1/work/next?assignee=all&action=send&limit=50", { key: chiefKey, file: "v1/work/next" })).json.data;
+  const ti = team.items.find((i: any) => i.task.id === heldTask);
+  ok(team.assignee === "all" && ti && ti.next_step.action === "send" && ti.task.assignee.id === novaId && ti.task.assignee.name === "Agent Nova" && ti.message_version.id === v3, "assignee=all shows the Chief every assignee's send-ready work, with who it belongs to");
+  ok((await call("GET", "v1/work/next?assignee=all&limit=50", { key: chiefKey, file: "v1/work/next" })).json.data.total_open === 18, "assignee=all without a filter lists the whole team's open work");
+  const denied = await call("GET", "v1/work/next?assignee=all", { headers: RUN, file: "v1/work/next" });
+  ok(denied.status === 403 && denied.json.code === "forbidden", "an agent who is not a manager cannot read the team list");
+  /* eslint-enable @typescript-eslint/no-explicit-any */
+
   console.log("MCP server");
   const mcp = async (body: unknown, key: string | null = novaKey) => {
     const mod = (await import("../src/app/api/mcp/route")) as { POST: (r: Request) => Promise<Response>; GET: () => Response };
@@ -202,7 +255,7 @@ async function main() {
   console.log("Leads list and dashboard");
   const ll = await L.listLeads(owner, { campaign: camp });
   const ex = await L.leadListExtras(ll.rows.map((l) => l.id as number));
-  ok(ll.total === 2 && ll.page_size === 50 && ll.has_more === false && ex.campaigns.get(leadId)![0].name === "Agent Test" && ex.nextTask.get(lead2)!.title === "Research Pluto" && !ex.nextTask.has(leadId), "the leads list shows each lead's campaign and its live next task");
+  ok(ll.total === 3 && ll.page_size === 50 && ll.has_more === false && ex.campaigns.get(leadId)![0].name === "Agent Test" && ex.nextTask.get(lead2)!.title === "Research Pluto" && !ex.nextTask.has(leadId), "the leads list shows each lead's campaign and its live next task");
   for (const [who2, label] of [[owner, "Owner"], [await actorById(novaId, "session"), "agent"]] as const) {
     const sc = D.dashScope(who2), p = D.resolvePeriod({});
     const [b, a, at, res, pl, f] = await Promise.all([D.loadBoard(who2, sc), D.loadActions(who2, sc), D.loadAttention(who2, sc), D.loadResults(who2, sc, p), D.loadPipeline(who2, sc, p), D.loadFeed(who2, sc)]);

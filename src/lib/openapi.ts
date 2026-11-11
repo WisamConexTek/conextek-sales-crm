@@ -10,7 +10,7 @@ type Row = [method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE", path: string, t
 const E: Row[] = [
   ["GET", "/guide", "Start here", "The agent briefing (markdown). Re-read at the start of each run; `version` changes when behaviour changes."],
   ["GET", "/me", "Start here", "Who this key belongs to and what it may do."],
-  ["GET", "/work/next", "Start here", "What to do now: the work list with lead, contacts, draft, approvals, eligibility and one next_step per item.", ["limit", "assignee"]],
+  ["GET", "/work/next", "Start here", "What to do now, by urgency (overdue, today, tomorrow, undated): the work list with lead, contacts, draft, approvals, eligibility and one next_step per item.", ["limit", "assignee", "action"]],
   ["GET", "/changes", "Start here", "What happened since your last run: decisions on drafts, approvals, replies, bounces, task changes.", ["since", "limit"]],
   ["GET", "/lists", "Start here", "Valid values: stages, markets, segments, channels, task types, sources, services, users."],
   ["GET", "/requests", "Start here", "The API request log (your own calls; Owner/Chief: everyone's).", ["actor", "outcome", "kind", "run_id", "lead_id", "task_id", "q", "from", "to", "page", "page_size"]],
