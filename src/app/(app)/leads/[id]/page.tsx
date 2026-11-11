@@ -4,6 +4,9 @@ import { requireUser, can, isManager } from "@/lib/auth";
 import { getLead } from "@/lib/service/leads";
 import { leadCampaigns, listCampaigns } from "@/lib/service/campaigns";
 import { leadOperations } from "@/lib/service/schedule";
+import { listVersions, canAuthorizeSend } from "@/lib/service/sends";
+import { leadApiActivity } from "@/lib/service/agents";
+import { all } from "@/lib/db";
 import { enrolLeadAction } from "@/app/actions";
 import { getLists } from "@/lib/service/lists";
 import { assignableUsers } from "@/lib/service/users";
@@ -32,6 +35,16 @@ export default async function LeadPage({ params, searchParams }: { params: Promi
   const { lead, contacts, history, tasks } = data;
   const [lists, users, camps, ops, allCamps] = await Promise.all([getLists(true), assignableUsers(), leadCampaigns(leadId), leadOperations(me, leadId), listCampaigns()]);
   const activeCamp = camps.filter((c) => c.status === "active");
+  // Drafts written for this lead (every version, with its live approval status), and what came in through the API about it.
+  const [versions, bodies, canSend, apiSteps] = await Promise.all([
+    listVersions(me, { lead_id: leadId, limit: 50 }).catch(() => []),
+    all("SELECT id,body FROM message_versions WHERE lead_id=?", [leadId]),
+    canAuthorizeSend(me),
+    isManager(me) ? leadApiActivity(leadId, 12) : Promise.resolve([]),
+  ]);
+  const bodyOf = new Map(bodies.map((b) => [b.id as number, b.body as string]));
+  const V_TONE = { waiting_editorial: "amber", waiting_send: "amber", approved: "green", sent: "blue", rejected: "red", superseded: "gray" } as const;
+  const V_LABEL = { waiting_editorial: "Waiting for Chief review", waiting_send: "Waiting for send approval", approved: "Approved to send", sent: "Sent", rejected: "Rejected", superseded: "Replaced by a newer version" } as const;
   const lab = (kind: string) => Object.fromEntries(lists[kind].map((i) => [i.key, i.label]));
   const stageLab = lab("stage");
   const flag = Object.fromEntries(lists.stage.map((i) => [i.key, i.flag]));
@@ -236,6 +249,45 @@ export default async function LeadPage({ params, searchParams }: { params: Promi
         )}
       </Card>
 
+      {/* ---- Message drafts and approvals ---- */}
+      {versions.length > 0 && (
+        <Card title={`Message drafts and approvals (${versions.length})`} right={canSend && versions.some((v) => v.status === "waiting_send") ? <Link href="/send-approvals" className="btn btn-primary btn-sm no-underline">Review &amp; approve →</Link> : undefined}>
+          <ul className="divide-y divide-slate-100">
+            {versions.map((v) => (
+              <li key={v.id} className={`py-2.5 text-sm ${v.status === "superseded" ? "opacity-70" : ""}`}>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="min-w-0"><span className="font-medium" dir="auto">{v.subject || "(no subject)"}</span> <span className="text-xs text-slate-500">version #{v.id} · v{v.version} · {v.channel} · {v.campaign}</span></div>
+                  <Badge tone={V_TONE[v.status as keyof typeof V_TONE] ?? "gray"}>{V_LABEL[v.status as keyof typeof V_LABEL] ?? v.status}</Badge>
+                </div>
+                <div className="mt-0.5 text-xs text-slate-500">
+                  {v.recipient ? `To ${v.recipient.name}${v.recipient.email ? ` <${v.recipient.email}>` : ""}` : "No recipient chosen"} · from {v.sender?.email ?? "default sender"} · written by {v.created_by} · {fmtDateTime(v.created_at)}
+                  {v.task_id ? <> · <Link href={`/tasks/${v.task_id}`}>task #{v.task_id}</Link></> : null}
+                </div>
+                {v.is_latest && v.status !== "sent" && v.status !== "rejected" && v.eligibility.reasons.length > 0 && <div className="mt-1 text-xs text-amber-800">Not sendable yet: {v.eligibility.reasons.join("; ")}</div>}
+                <details className="mt-1 text-xs"><summary className="text-slate-500">Read the text</summary><p className="mt-1 whitespace-pre-wrap rounded bg-slate-50 p-2 text-sm text-slate-700">{bodyOf.get(v.id) ?? ""}</p></details>
+              </li>
+            ))}
+          </ul>
+        </Card>
+      )}
+
+      {/* ---- What agents did on this lead through the API ---- */}
+      {apiSteps.length > 0 && (
+        <Card title="Agent steps on this lead (API)" right={<Link href={`/agents?lead=${leadId}`} className="text-xs">All steps →</Link>}>
+          <ul className="divide-y divide-slate-100">
+            {apiSteps.map((s) => (
+              <li key={s.id} className="py-1.5 text-sm">
+                <div className="flex items-baseline justify-between gap-3">
+                  <div className="min-w-0 truncate"><span className={`font-medium ${s.outcome === "refused" || s.outcome === "error" ? "text-amber-800" : "text-slate-900"}`}>{s.step}</span>{s.outcome === "refused" && <> <Badge tone="amber">refused</Badge></>}{s.outcome === "error" && <> <Badge tone="red">error</Badge></>}</div>
+                  <div className="shrink-0 text-xs text-slate-500">{s.actor_name} · {fmtDateTime(s.at)}{s.run_id ? <> · <Link href={`/agents?run=${encodeURIComponent(s.run_id)}`}>run</Link></> : null}</div>
+                </div>
+                {s.error && <div className="text-xs text-amber-800">{s.error}</div>}
+              </li>
+            ))}
+          </ul>
+        </Card>
+      )}
+
       {/* ---- History ---- */}
       <Card title={`Work history (${history.length})`} right={<Link href={`${back}?order=${asc ? "desc" : "asc"}`} className="text-xs">{asc ? "Oldest first ↑" : "Newest first ↓"}</Link>}>
         {can(me, "activity.record") && (
@@ -262,7 +314,7 @@ export default async function LeadPage({ params, searchParams }: { params: Promi
                   ? <details className="mt-1 text-sm"><summary className="line-clamp-2 cursor-pointer whitespace-pre-wrap text-slate-700">{h.body}</summary><p className="mt-1 whitespace-pre-wrap text-slate-700">{h.body}</p></details>
                   : <p className="mt-1 whitespace-pre-wrap text-sm text-slate-700">{h.body}</p>)}
                 <div className="mt-1 flex flex-wrap gap-x-3 text-xs text-slate-500">
-                  <span className={h.actor_unknown ? "italic text-amber-700" : ""}>{h.actor_name} · <span className={h.occurred_precision === "unknown" ? "text-amber-700" : ""}>{fmtEvent(h.occurred_at, h.occurred_precision)}</span></span>
+                  <span className={h.actor_unknown ? "italic text-amber-700" : ""}>{h.actor_name}{h.actor_is_agent ? <> <Badge tone="purple">AI agent</Badge></> : null} · <span className={h.occurred_precision === "unknown" ? "text-amber-700" : ""}>{fmtEvent(h.occurred_at, h.occurred_precision)}</span></span>
                   {h.imported_by_name && <span title={`Registered ${fmtDateTime(h.created_at)}`}>Imported by {h.imported_by_name} on {fmtDate(h.created_at)}</span>}
                   {h.contact_name && <span>Contact: {h.contact_name}</span>}
                   {h.channel && <span>Channel: {lab("channel")[h.channel] ?? h.channel}</span>}

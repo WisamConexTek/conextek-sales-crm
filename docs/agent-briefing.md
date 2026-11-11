@@ -1,6 +1,16 @@
-# ConexTek CRM — agent briefing (version 2026-11-10.2)
-Base URL: the CRM's own address + /api/v1. Auth: header "Authorization: Bearer <your key>". Every response is {ok, data} or {ok:false, error}.
-Re-read this guide (GET /api/v1/guide) at the start of each run; if "version" changed, behaviour changed. Full reference for humans: /api-docs.
+# ConexTek CRM — agent briefing (version 2026-11-11.1)
+Base URL: the CRM's own address + /api/v1. Auth: header "Authorization: Bearer <your key>" (or "X-API-Key: <your key>"). Every response is {ok:true, data, request_id} or {ok:false, error, code, request_id}.
+Re-read this guide (GET /api/v1/guide) at the start of each run; if "version" changed, behaviour changed. Full reference for humans: /api-docs. Machine-readable: GET /api/v1/openapi.json (OpenAPI 3.1, no key needed).
+
+## Every run: three habits (added 2026-11-11.1)
+1. Send the header "X-Run-Id: <one id for this whole run>" (any string up to 80 characters, e.g. nova-2026-11-11-0900) on EVERY call. The Owner follows your run step by step on the Agent activity page. Every call is logged there: reads, changes and refusals, with the reason.
+2. Start with GET /work/next[?limit=10]. It returns your work, most urgent first. Each item carries everything you need: task, lead, contacts, campaign, message_version (text, sender, authorizations, decisions), eligibility, and next_step {action, instruction}.
+   action: send = contact is allowed, with exactly that version, then POST /sends. draft = write the draft (POST /message-versions). work = do the task, record it, complete it. fix = changes were requested; fix and resubmit. wait = do nothing; do NOT contact anyone.
+   Only "send" ever allows contacting anyone. You no longer need to chain /schedule, /tasks/{id}, /leads/{id}, /message-versions and /sends/eligibility yourself (they still work).
+3. Then GET /changes?since=<the next_since you got last time> (default: last 24 hours). It lists, oldest first, what happened while you were away: draft_rejected / draft_edited (with the reason and the new version id), editorial_approved, send_approved, approval_approved / approval_changes_requested / approval_rejected, reply_received, bounce, opt_out, task_assigned and task_<status>. Keep next_since for the next run.
+Safe retries: on any POST / PUT / PATCH / DELETE you may send "Idempotency-Key: <unique per action>". If the same key arrives again on the same call (for example after a timeout), the first answer is returned with replayed:true and nothing is done twice. The same key on a different call is refused (409, code idempotency_key_reused). POST /sends, /replies and /bounces are also de-duplicated by their own ids as before.
+MCP: the same abilities are available as tools at POST /api/mcp (Model Context Protocol, Streamable HTTP, same key). Tools: get_guide, whoami, next_work, changes_since, check_duplicate, create_lead, get_lead, list_leads, add_contact, record_activity, change_stage, list_tasks, get_task, create_task, update_task, submit_task_for_approval, complete_task, create_message_version, get_message_version, list_message_versions, list_decisions, check_send_eligibility, record_send, reconcile_send, record_reply, record_bounce, get_capacity, get_lists. Same permissions, rules and logging as REST. A refused tool call comes back as a tool result with isError:true and the same {error, code}.
+Names: /message-versions is the one path for drafts: POST /message-versions (create), GET /message-versions (list), GET /message-versions/{id} (read). The older /messages/versions paths still work. Paged lists return page, page_size and has_more (GET /leads also keeps total; it accepts campaign_id= and attention=unanswered|quiet). GET /schedule returns truncated:true if more than 500 rows matched. Your own call log: GET /requests[?run_id=&outcome=refused].
 
 ## Ground rules (never break)
 1. The CRM never sends, schedules, scrapes or triggers AI. You send through the browser workflow; the CRM records it.
@@ -77,4 +87,5 @@ POST /import/history (dry run unless commit:true, max 100 records per request, 4
 Normal operations never need these.
 
 ## Errors
+Every error has a stable "code" next to the human "error" text: invalid_input (400), unauthorized (401), forbidden (403), not_found (404), conflict (409), duplicate (409, with duplicates[]), idempotency_key_reused (409), too_large (413), server_error (5xx). Branch on code, show error. Quote request_id when reporting a problem.
 400 invalid input (message names the field). 403 permission. 404 not found or not yours. 409 blocked by a safety rule (read the message; do not retry blindly). 413 batch too large. 5xx retry later with the same ids.

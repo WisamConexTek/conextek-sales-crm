@@ -5,8 +5,9 @@ import { HttpError, type Actor } from "../auth";
 /** Write an entry to the read-only change history. */
 export async function audit(actor: Actor, action: string, entity: string, entityId: number | string | null, detail?: unknown) {
   await run(
-    "INSERT INTO audit_log (actor_id,actor_name,via,action,entity,entity_id,detail,created_at) VALUES (?,?,?,?,?,?,?,?)",
-    [actor.id || null, actor.name, actor.via, action, entity, entityId == null ? null : String(entityId), detail === undefined ? null : JSON.stringify(detail), now()],
+    "INSERT INTO audit_log (actor_id,actor_name,via,action,entity,entity_id,detail,created_at,request_id,run_id,key_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+    [actor.id || null, actor.name, actor.via, action, entity, entityId == null ? null : String(entityId), detail === undefined ? null : JSON.stringify(detail), now(),
+      actor.requestId ?? null, actor.runId ?? null, actor.keyId ?? null],
   );
 }
 

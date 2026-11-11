@@ -30,6 +30,12 @@ export default async function ApiDocs() {
   const base = `${proto}://${host}/api/v1`;
   const HD = `-H "Authorization: Bearer $CRM_API_KEY" -H "Content-Type: application/json"`;
   const endpoints: [string, string, string][] = [
+    ["GET", "/guide", "The agent briefing (markdown). Agents re-read it at the start of each run."],
+    ["GET", "/openapi.json", "Machine-readable description of every endpoint (OpenAPI 3.1). No key needed."],
+    ["GET", "/work/next?limit=", "What to do now: the work list with lead, contacts, draft, approvals, eligibility and one next_step per item."],
+    ["GET", "/changes?since=", "What happened since the last run: decisions on drafts, approvals, replies, bounces, task changes."],
+    ["GET", "/requests?run_id=&outcome=&lead_id=", "The API request log: your own calls (Owner/Chief: everyone's). Same data as the Agent activity page."],
+    ["POST", "/api/mcp  (not under /api/v1)", "MCP server (Model Context Protocol): the same abilities as tools, with the same key."],
     ["GET", "/me", "Who this key belongs to and what it may do."],
     ["GET", "/lists", "Valid values: stages, markets, segments, channels, task types, sources, services, users…"],
     ["GET", "/leads?q=&stage=&market=&segment=&owner=&channel=&page=", "Leads you can see (your own unless you have view-all)."],
@@ -72,7 +78,8 @@ export default async function ApiDocs() {
         </ul>
       </Card>
       <Card title="Authentication & responses">
-        <P>Send your key on every request. Responses are JSON: <code>{`{"ok":true,"data":…}`}</code> or <code>{`{"ok":false,"error":"…"}`}</code> with an HTTP status (400 invalid, 401 bad key, 403 not permitted, 404 not found / not yours, 409 duplicate).</P>
+        <P><b>For AI agents:</b> send the header <code>X-Run-Id: one-id-per-run</code> on every call (the Owner then sees the run step by step under <b>Agent activity</b>), start with <code>GET /work/next</code> and <code>GET /changes</code>, and add <code>Idempotency-Key</code> to a change you might retry. MCP clients can connect to <code>POST /api/mcp</code> with the same key.</P>
+        <P>Send your key on every request. Responses are JSON: <code>{`{"ok":true,"data":…}`}</code> or <code>{`{"ok":false,"error":"…","code":"…"}`}</code> (both carry a <code>request_id</code>; <code>code</code> is a stable reason such as <code>forbidden</code>, <code>conflict</code>, <code>duplicate</code>) with an HTTP status (400 invalid, 401 bad key, 403 not permitted, 404 not found / not yours, 409 duplicate).</P>
         <Code>{`export CRM_API_KEY="ctk_xxxxxxxx_…"\ncurl ${HD} ${base}/me`}</Code>
         {me.role !== "owner" && <p className="mt-2 text-xs text-slate-500">Your web account can: {ALL_PERMISSIONS.filter((p) => can(me, p)).join(", ") || "view only"}.</p>}
       </Card>

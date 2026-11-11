@@ -17,19 +17,22 @@ export default async function Schedule({ searchParams }: { searchParams: SP }) {
   const today = todayYmd(), tomorrow = addDays(today, 1);
   const date = sget(sp, "date");
   const view = sget(sp, "view") === "tomorrow" ? "tomorrow" : date ? undefined : "today";
-  const f = { view: view as "today" | "tomorrow" | undefined, date, employee: snum(sp, "employee"), project: snum(sp, "project"), campaign: snum(sp, "campaign"), channel: sget(sp, "channel"), state: sget(sp, "state") };
+  // ?open=1 (from the dashboard): every open task up to the end of tomorrow, however late, instead of one day.
+  const open = sget(sp, "open") === "1" && !date && !sget(sp, "view");
+  const f = { view: view as "today" | "tomorrow" | undefined, date, employee: snum(sp, "employee"), project: snum(sp, "project"), campaign: snum(sp, "campaign"), channel: sget(sp, "channel"), state: sget(sp, "state"), ...(open ? { from: "2000-01-01", to: tomorrow, openOnly: true } : {}) };
   const [r, users, camps, channels, projects] = await Promise.all([schedule(me, f), assignableUsers(), listCampaigns(), listChannels(), listProjects()]);
   const team = can(me, "tasks.view_all") || isManager(me);
   const keep = { employee: f.employee, project: f.project, campaign: f.campaign, channel: f.channel, state: f.state };
-  const label = r.from === today ? "Today" : r.from === tomorrow ? "Tomorrow" : r.from;
+  const label = open ? "All open work up to tomorrow" : r.from === today ? "Today" : r.from === tomorrow ? "Tomorrow" : r.from;
   return (
     <div className="space-y-5">
-      <PageHeader title="Today & Tomorrow" sub={`${label} · ${r.from} · times shown in ${r.timezone}`}>
-        <Link href={`/schedule${q({ ...keep, view: "today" })}`} className={`btn ${r.from === today && !date ? "btn-primary" : ""}`}>Today</Link>
+      <PageHeader title="Today & Tomorrow" sub={open ? `${label}, late work included · times shown in ${r.timezone}` : `${label} · ${r.from} · times shown in ${r.timezone}`}>
+        <Link href={`/schedule${q({ ...keep, view: "today" })}`} className={`btn ${r.from === today && !date && !open ? "btn-primary" : ""}`}>Today</Link>
         <Link href={`/schedule${q({ ...keep, view: "tomorrow" })}`} className={`btn ${r.from === tomorrow && !date ? "btn-primary" : ""}`}>Tomorrow</Link>
+        <Link href={`/schedule${q({ ...keep, open: 1 })}`} className={`btn ${open ? "btn-primary" : ""}`}>All open</Link>
       </PageHeader>
       <form className="card flex flex-wrap items-end gap-3 p-3">
-        <div><label className="label">Date</label><input type="date" name="date" defaultValue={r.from} className="input" /></div>
+        <div><label className="label">Date</label><input type="date" name="date" defaultValue={open ? "" : r.from} className="input" /></div>
         {team && <div><label className="label">Employee</label><select name="employee" defaultValue={f.employee ?? ""} className="input"><option value="">Everyone</option>{users.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}</select></div>}
         <div><label className="label">Project</label><select name="project" defaultValue={f.project ?? ""} className="input"><option value="">All</option>{projects.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}</select></div>
         <div><label className="label">Campaign</label><select name="campaign" defaultValue={f.campaign ?? ""} className="input"><option value="">All</option>{camps.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}</select></div>
@@ -38,7 +41,7 @@ export default async function Schedule({ searchParams }: { searchParams: SP }) {
         <button className="btn btn-primary">Apply</button><Link href="/schedule" className="btn">Reset</Link>
       </form>
       <div className="flex flex-wrap gap-2 text-sm">
-        {STATES.map((s) => <Link key={s} href={`/schedule${q({ ...keep, date: r.from, state: f.state === s ? undefined : s })}`} className="no-underline"><Badge tone={TONE[s]}>{s[0].toUpperCase() + s.slice(1)}: {r.counts[s]}</Badge></Link>)}
+        {STATES.map((s) => <Link key={s} href={`/schedule${q({ ...keep, ...(open ? { open: 1 } : { date: r.from }), state: f.state === s ? undefined : s })}`} className="no-underline"><Badge tone={TONE[s]}>{s[0].toUpperCase() + s.slice(1)}: {r.counts[s]}</Badge></Link>)}
       </div>
       <Card>
         {r.rows.length === 0 ? <Empty>Nothing scheduled for this day with these filters. Tasks appear here when they have a scheduled time or a due date on that day.</Empty> : (

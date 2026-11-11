@@ -31,10 +31,10 @@ export default async function Campaigns({ searchParams }: { searchParams: SP }) 
       </form>
       <div className="grid gap-4 lg:grid-cols-3">
         {rep.campaigns.map((c) => (
-          <Card key={c.id} title={c.name} right={<Badge tone={STATUS[c.status as keyof typeof STATUS]}>{c.status}</Badge>}>
+          <Card key={c.id} title={c.name} right={<span className="flex items-center gap-2"><Link href={`/leads?campaign=${c.id}`} className="text-xs">Leads →</Link><Link href={`/schedule?open=1&campaign=${c.id}`} className="text-xs">Open work →</Link><Badge tone={STATUS[c.status as keyof typeof STATUS]}>{c.status}</Badge></span>}>
             <p className="mb-2 text-xs text-slate-500">{c.project} · owner {c.owner_name ?? "unassigned"}{c.target_markets ? ` · ${c.target_markets}` : ""}{c.objective ? ` · ${c.objective}` : ""}</p>
             <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
-              <dt className="text-slate-500">Unique leads</dt><dd className="font-medium">{c.unique_leads}{c.unique_leads_historical_only ? <span className="text-xs text-slate-400"> ({c.unique_leads_historical_only} historical)</span> : null}</dd>
+              <dt className="text-slate-500">Unique leads</dt><dd className="font-medium"><Link href={`/leads?campaign=${c.id}`}>{c.unique_leads}</Link>{c.unique_leads_historical_only ? <span className="text-xs text-slate-400"> ({c.unique_leads_historical_only} historical)</span> : null}</dd>
               <dt className="text-slate-500">Preparation backlog</dt><dd className="font-medium">{c.preparation_backlog}</dd>
               <dt className="text-slate-500">Approved, scheduled</dt><dd className="font-medium">{c.approved_scheduled}</dd>
               <dt className="text-slate-500">Planned / completed tasks</dt><dd>{c.planned_tasks} / {c.completed_tasks}</dd>

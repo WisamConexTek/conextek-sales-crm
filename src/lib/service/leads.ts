@@ -375,10 +375,48 @@ export async function getContact(actor: Actor, contactId: number) {
   return withContactStatus([c])[0];
 }
 
+/* ---------- "needs attention" filters ---------- */
+/**
+ * ONE definition each, shared by the dashboard counters, the dashboard lists and the Leads page filter,
+ * so a number on the dashboard always opens exactly the leads it counted.
+ */
+export const ATTENTION = ["unanswered", "quiet"] as const;
+export type Attention = (typeof ATTENTION)[number];
+type SqlPart = { sql: string; args: InValue[] };
+
+/** A real lead whose latest reply (last `days` days) is newer than our latest message, still open and not opted out. */
+export function unansweredReplyFilter(alias = "l", days = 30): SqlPart & { replyAt: string } {
+  const replyAt = `(SELECT MAX(r.occurred_at) FROM activities r WHERE r.lead_id=${alias}.id AND r.type='reply' AND r.is_demo=0 AND r.occurred_precision<>'unknown')`;
+  return {
+    replyAt,
+    sql: `${alias}.is_demo=0 AND ${alias}.historical_only=0 AND ${replyAt}>=?
+      AND NOT EXISTS (SELECT 1 FROM activities m WHERE m.lead_id=${alias}.id AND m.type='message' AND m.occurred_at>${replyAt})
+      AND NOT EXISTS (SELECT 1 FROM lists s WHERE s.kind='stage' AND s.key=${alias}.stage AND s.flag IN ('won','lost','closed','meeting'))
+      AND NOT EXISTS (SELECT 1 FROM contacts c WHERE c.lead_id=${alias}.id AND c.email_status='opted_out')`,
+    args: [new Date(Date.now() - days * 86400000).toISOString()],
+  };
+}
+
+/** A real, open lead with no open task and no activity for `days` days, that can still be contacted. */
+export function quietLeadFilter(alias = "l", days = 7): SqlPart {
+  return {
+    sql: `${alias}.is_demo=0 AND ${alias}.historical_only=0 AND COALESCE(${alias}.last_activity_at,${alias}.created_at)<?
+      AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.lead_id=${alias}.id AND t.status IN ('todo','in_progress','changes_requested','approved','waiting_approval'))
+      AND NOT EXISTS (SELECT 1 FROM lists s WHERE s.kind='stage' AND s.key=${alias}.stage AND s.flag IN ('won','lost','closed'))
+      AND NOT EXISTS (SELECT 1 FROM contacts c WHERE c.lead_id=${alias}.id AND c.email_status IN ('opted_out','bounced')
+        AND NOT EXISTS (SELECT 1 FROM contacts c2 WHERE c2.lead_id=${alias}.id AND c2.email_status NOT IN ('opted_out','bounced')))`,
+    args: [new Date(Date.now() - days * 86400000).toISOString()],
+  };
+}
+
 /* ---------- reads ---------- */
 export type LeadFilters = {
   q?: string; owner?: number; market?: string; segment?: string; stage?: string; channel?: string; testOnly?: boolean;
   includeDemo?: boolean; includeHistorical?: boolean; page?: number; pageSize?: number; sort?: string;
+  /** Leads that are an active member of this campaign. */
+  campaign?: number;
+  /** Only leads that need attention (same rules as the dashboard). */
+  attention?: Attention;
 };
 
 export async function listLeads(actor: Actor, f: LeadFilters) {
@@ -399,6 +437,12 @@ export async function listLeads(actor: Actor, f: LeadFilters) {
   if (f.segment) (where.push("l.segment=?"), args.push(f.segment));
   if (f.stage) (where.push("l.stage=?"), args.push(f.stage));
   if (f.channel) (where.push("EXISTS (SELECT 1 FROM activities a WHERE a.lead_id=l.id AND a.channel=?)"), args.push(f.channel));
+  if (f.campaign) (where.push("EXISTS (SELECT 1 FROM lead_campaigns lc WHERE lc.lead_id=l.id AND lc.campaign_id=? AND lc.status='active')"), args.push(f.campaign));
+  if (f.attention) {
+    const a = f.attention === "unanswered" ? unansweredReplyFilter() : quietLeadFilter();
+    where.push(`(${a.sql})`);
+    args.push(...a.args);
+  }
   const W = where.join(" AND ");
   const size = f.pageSize ?? 50;
   const page = Math.max(1, f.page ?? 1);
@@ -412,7 +456,30 @@ export async function listLeads(actor: Actor, f: LeadFilters) {
     [...args, size, (page - 1) * size],
   )]);
   const total = Number(totalRow!.n);
-  return { rows, total, page, pageSize: size };
+  // page_size / has_more are the names every paged list uses; pageSize is kept for older clients.
+  return { rows, total, page, pageSize: size, page_size: size, has_more: page * size < total };
+}
+
+/** For a page of the leads list: each lead's active campaign(s) and its next open task with the LIVE status (same code as everywhere else). */
+export async function leadListExtras(leadIds: number[]) {
+  const campaigns = new Map<number, { id: number; name: string }[]>();
+  const nextTask = new Map<number, Row>();
+  if (!leadIds.length) return { campaigns, nextTask };
+  const marks = leadIds.map(() => "?").join(",");
+  const [camps, tasks] = await Promise.all([
+    all(`SELECT lc.lead_id,c.id,c.name FROM lead_campaigns lc JOIN campaigns c ON c.id=lc.campaign_id WHERE lc.status='active' AND lc.lead_id IN (${marks}) ORDER BY lc.joined_at`, leadIds),
+    all(
+      `SELECT t.id,t.title,t.status,t.lead_id,t.prep_status,t.blockers,t.scheduled_at,t.due_at,t.message_version_id,t.sent_at,t.activity_id,t.due_on,t.scheduled_on,t.hold_reason,t.rescheduled_from,
+              u.name AS assignee_name, COALESCE(t.scheduled_at,t.due_at) AS sort_at
+       FROM tasks t JOIN users u ON u.id=t.assignee_id WHERE t.lead_id IN (${marks}) AND t.status NOT IN ('completed','cancelled')
+       ORDER BY (COALESCE(t.scheduled_at,t.due_at) IS NULL), COALESCE(t.scheduled_at,t.due_at), t.id`, leadIds),
+  ]);
+  for (const c of camps) (campaigns.get(c.lead_id as number) ?? campaigns.set(c.lead_id as number, []).get(c.lead_id as number)!).push({ id: c.id as number, name: c.name as string });
+  const firsts: Row[] = [];
+  const seen = new Set<number>();
+  for (const t of tasks) if (!seen.has(t.lead_id as number)) (seen.add(t.lead_id as number), firsts.push(t));
+  for (const t of await liveTasks(firsts)) nextTask.set(t.lead_id as number, t);
+  return { campaigns, nextTask };
 }
 
 export async function getLead(actor: Actor, id: number) {
@@ -426,7 +493,7 @@ export async function getLead(actor: Actor, id: number) {
     ),
     all("SELECT * FROM contacts WHERE lead_id=? ORDER BY is_primary DESC, id", [id]),
     all(
-      `SELECT a.*, COALESCE(u.name,'Unknown original employee') AS actor_name, (a.actor_id IS NULL) AS actor_unknown, c.name AS contact_name, ib.name AS imported_by_name
+      `SELECT a.*, COALESCE(u.name,'Unknown original employee') AS actor_name, (a.actor_id IS NULL) AS actor_unknown, COALESCE(u.is_agent,0) AS actor_is_agent, c.name AS contact_name, ib.name AS imported_by_name
        FROM activities a LEFT JOIN users u ON u.id=a.actor_id LEFT JOIN contacts c ON c.id=a.contact_id LEFT JOIN users ib ON ib.id=a.imported_by
        WHERE a.lead_id=? ORDER BY a.occurred_at DESC, a.id DESC`,
       [id],

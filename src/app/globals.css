@@ -11,6 +11,10 @@
   --color-brand-700: #7d3b7b;
   --color-brand-900: #4a1f49;
   --color-accent: #fec202;
+  /* Chart series colours (fixed order, checked for colour-blind separation on white). Text never uses these. */
+  --color-viz-1: #2a78d6;
+  --color-viz-2: #eb6834;
+  --color-viz-3: #1baf7a;
 }
 
 @layer base {

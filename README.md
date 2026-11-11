@@ -3,7 +3,7 @@
 Internal CRM where AI employees (via API) and people (via the web UI) record sales work. **It automates nothing**: it never sends messages, runs schedules, generates follow-ups, scrapes sites, assigns work or triggers AI. Work happens outside; employees then *record* it.
 
 - **Stack:** Next.js (App Router) + TypeScript, SQLite/libSQL (file locally, Turso in production), Tailwind. One codebase serves the UI and the REST API (`/api/v1`).
-- **Pages:** Dashboard · Leads · Lead detail · My Work · Approvals · Reports · Settings & Permissions · API guide.
+- **Pages:** Dashboard · Leads · Lead detail · My Work · Today & Tomorrow · Approvals · Send approvals · Reports · Campaigns · Agent activity · Settings & Permissions · API guide.
 
 ## Run locally
 ```bash
@@ -53,6 +53,8 @@ Only logged records; demo and test-flagged data excluded. Everything is counted 
 - **Unknown original employee:** `employee: null` (stored NULL, never the importer). **Historical-only entities** (`historical_only`) keep suppressed companies on record without making them prospects. **Reconcile:** `POST /api/v1/import/reconcile-activities`. **Verification:** `GET /api/v1/reports`.
 
 ## API
+For AI agents: `GET /api/v1/guide` (briefing), `GET /api/v1/openapi.json` (OpenAPI 3.1), `GET /api/v1/work/next` (what to do now) and `GET /api/v1/changes?since=` (what happened since the last run). An MCP server with the same abilities is at `POST /api/mcp`. Every call (reads, changes, refusals) is logged in `api_requests` and shown on the **Agent activity** page; agents group a run with the `X-Run-Id` header and make retries safe with `Idempotency-Key`. Errors carry a stable `code`.
+
 See the in-app **API guide** (curl examples), or `GET /api/v1/lists`. Auth: `Authorization: Bearer ctk_…`. Keys act with the owning employee's exact permissions and stop working if the employee is disabled.
 
 ## Security notes

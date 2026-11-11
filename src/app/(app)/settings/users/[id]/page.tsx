@@ -36,11 +36,12 @@ export default async function UserPage({ params, searchParams }: { params: Promi
 
       {owner && (
         <Card title="Account">
-          <form action={updateUserAction} className="grid max-w-3xl gap-3 md:grid-cols-4">
+          <form action={updateUserAction} className="grid max-w-4xl gap-3 md:grid-cols-5">
             <input type="hidden" name="_back" value={back} /><input type="hidden" name="id" value={u.id} />
             <Field label="Name"><input name="name" defaultValue={u.name} className="input" /></Field>
             <Field label="Role"><select name="role" defaultValue={u.role} className="input" disabled={isOwnerAcct}>{isOwnerAcct ? <option value="owner">Owner</option> : <><option value="employee">Employee</option><option value="chief">Chief</option></>}</select></Field>
             <Field label="Status"><select name="active" defaultValue={u.active ? "1" : "0"} className="input" disabled={isOwnerAcct}><option value="1">Active</option><option value="0">Disabled (cannot sign in; API keys stop working)</option></select></Field>
+            <Field label="Account type" hint="AI agent: its work is labelled and listed on the Agent activity page."><select name="is_agent" defaultValue={u.is_agent ? "1" : "0"} className="input" disabled={isOwnerAcct}><option value="0">Person</option><option value="1">AI agent</option></select></Field>
             <div className="flex items-end"><button className="btn btn-primary">Save</button></div>
           </form>
         </Card>

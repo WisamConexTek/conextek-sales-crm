@@ -49,7 +49,7 @@ async function Team({ owner, me }: { owner: boolean; me: Awaited<ReturnType<type
                 const k = keys.filter((x) => x.user_id === u.id && x.active && !x.revoked_at).length;
                 return (
                   <tr key={u.id} className={u.active ? "" : "opacity-60"}>
-                    <td className="td"><Link href={`/settings/users/${u.id}`} className="font-medium">{u.name}</Link></td>
+                    <td className="td"><Link href={`/settings/users/${u.id}`} className="font-medium">{u.name}</Link>{u.is_agent ? <> <Badge tone="purple">AI agent</Badge></> : null}</td>
                     <td className="td text-slate-600">{u.username}</td>
                     <td className="td capitalize">{u.role}</td>
                     <td className="td">{PRESETS[u.preset]?.label ?? u.preset ?? "Custom"}</td>

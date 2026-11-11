@@ -14,10 +14,18 @@ export type Actor = {
   perms: Set<Permission>;
   via: "session" | "api" | "system";
   mustChangePassword: boolean;
+  /** The account is an AI agent (set by the Owner). Shown as a badge next to its work. */
+  isAgent?: boolean;
+  /** API calls only: which key was used, and the request / run this call belongs to (written to the change history). */
+  keyId?: number;
+  keyLabel?: string;
+  requestId?: string;
+  runId?: string;
 };
 
 export class HttpError extends Error {
-  constructor(public status: number, message: string) {
+  /** `code` is a short, stable machine-readable reason; when left out the API derives one from the status. */
+  constructor(public status: number, message: string, public code?: string) {
     super(message);
   }
 }
@@ -46,7 +54,7 @@ function toActor(u: Row, via: Actor["via"]): Actor {
   if (u.history_import_until && String(u.history_import_until) <= now()) perms = perms.filter((p) => p !== "history.import");
   return {
     id: u.id, username: u.username, name: u.name, role: u.role,
-    perms: new Set(perms), via, mustChangePassword: !!u.must_change_password,
+    perms: new Set(perms), via, mustChangePassword: !!u.must_change_password, isAgent: !!u.is_agent,
   };
 }
 
@@ -131,18 +139,27 @@ export function newApiKey() {
   return { key, prefix: `ctk_${prefix}`, hash: sha(key) };
 }
 
-export async function getApiActor(req: Request): Promise<Actor> {
-  const h = req.headers.get("authorization") || "";
-  const m = /^Bearer\s+(\S+)$/i.exec(h);
-  if (!m) throw new HttpError(401, "Missing API key. Send header: Authorization: Bearer <key>");
+export async function getActorFromKey(rawKey: string): Promise<Actor | null> {
+  const key = rawKey.trim();
+  if (!key) return null;
   const k = await one(
-    `SELECT k.id AS key_id, u.* FROM api_keys k JOIN users u ON u.id = k.user_id
+    `SELECT k.id AS key_id, k.label AS key_label, u.* FROM api_keys k JOIN users u ON u.id = k.user_id
      WHERE k.key_hash = ? AND k.active = 1 AND k.revoked_at IS NULL AND u.active = 1`,
-    [sha(m[1])],
+    [sha(key)],
   );
-  if (!k) throw new HttpError(401, "Invalid, revoked or disabled API key.");
+  if (!k) return null;
   await run("UPDATE api_keys SET last_used_at=? WHERE id=?", [now(), k.key_id]);
-  return toActor(k, "api");
+  return { ...toActor(k, "api"), keyId: k.key_id as number, keyLabel: k.key_label as string };
+}
+
+export async function getApiActor(req: Request): Promise<Actor> {
+  const h = req.headers.get("authorization") || req.headers.get("x-api-key") || "";
+  const m = /^Bearer\s+(\S+)$/i.exec(h);
+  const key = m ? m[1] : h.startsWith("ctk_") ? h : null;
+  if (!key) throw new HttpError(401, "Missing API key. Send header: Authorization: Bearer <key>");
+  const actor = await getActorFromKey(key);
+  if (!actor) throw new HttpError(401, "Invalid, revoked or disabled API key.");
+  return actor;
 }
 
 /** Scripts/tests only: build an actor straight from a user id. */

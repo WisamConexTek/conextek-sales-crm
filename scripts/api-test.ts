@@ -122,7 +122,9 @@ async function main() {
   await throws(() => CAP.setCapacitySettings(chief, { daily_cap: 5 }), "only the Owner changes the cap", /Owner/);
   await CAP.setCapacitySettings(owner, { daily_cap: 2, priority: [camp2, camp] });
   const cap0 = await CAP.capacityFor();
-  ok(cap0.daily_cap === 2 && cap0.timezone === "Asia/Hebron" && cap0.campaigns[0].campaign_id === camp2 && cap0.campaigns[0].priority === 1, "capacity lists campaigns in priority order");
+  // The cap set here belongs to the default sender (id 1). Other mailboxes (e.g. one on a warm-up schedule) add their own room to the all-sender totals, so check the sender itself.
+  const s1 = (c: Awaited<ReturnType<typeof CAP.capacityFor>>) => c.senders.find((x) => x.sender_id === 1)!;
+  ok(s1(cap0).daily_cap === 2 && cap0.timezone === "Asia/Hebron" && cap0.campaigns[0].campaign_id === camp2 && cap0.campaigns[0].priority === 1, "capacity lists campaigns in priority order");
   ok(cap0.used === 1 && cap0.remaining !== null, "used counts the message recorded as sent today");
   const c2 = await mk("Cap Lead", "cap@c.test");
   const cv = await S.createVersion(emp, { lead_id: c2.id, contact_id: c2.cid, channel: "email", campaign_id: camp, subject: "Cap", body: "Cap" });
@@ -138,7 +140,7 @@ async function main() {
   ok(!full.eligible && full.codes.includes("daily_cap_reached") && full.reasons.some((r) => /daily send cap reached/.test(r)), "at the cap: eligibility returns daily_cap_reached");
   const live = (await T.listTasks(owner, { lead: c2.id })).find((x) => x.id === tk)!;
   ok(live.state === "blocked" && /daily send cap/.test(String(live.blockers)), "the task shows the real reason (daily send cap)");
-  ok((await CAP.capacityFor()).cap_reached === true && (await CAP.capacityFor()).remaining === 0, "GET /capacity reports cap_reached and 0 remaining");
+  ok(s1(await CAP.capacityFor()).cap_reached === true && s1(await CAP.capacityFor()).remaining === 0, "GET /capacity reports cap_reached and 0 remaining");
   await CAP.setCapacitySettings(owner, { daily_cap: 0 });
   ok((await S.checkEligibility(emp, cv.id)).eligible && (await CAP.capacityFor()).unlimited, "cap 0 = no cap");
   await throws(() => CAP.capacityFor("not-a-date"), "bad date is refused", /date/);

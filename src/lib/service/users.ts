@@ -9,7 +9,7 @@ import bcrypt from "bcryptjs";
 
 /** Rights a Chief can never hand to someone else. Only the Owner can. */
 export const CHIEF_LOCKED: Permission[] = ["approvals.decide", "tasks.assign", "tasks.view_all", "keys.manage", "history.import"];
-const safeCols = "id,username,name,role,preset,permissions,must_change_password,active,last_login_at,created_at,history_import_until";
+const safeCols = "id,username,name,role,preset,permissions,must_change_password,active,last_login_at,created_at,history_import_until,is_agent";
 
 export async function listUsers(includeInactive = true): Promise<Row[]> {
   const rows = await all(`SELECT ${safeCols} FROM users ${includeInactive ? "" : "WHERE active=1"} ORDER BY active DESC, role, name`);
@@ -54,7 +54,7 @@ export async function createUser(actor: Actor, input: unknown) {
   return { id: r.id, password: pw };
 }
 
-export async function updateUserProfile(actor: Actor, id: number, input: { name?: string; role?: string; active?: boolean }) {
+export async function updateUserProfile(actor: Actor, id: number, input: { name?: string; role?: string; active?: boolean; is_agent?: boolean }) {
   if (actor.role !== "owner") throw new HttpError(403, "Only the owner can edit accounts.");
   const u = await getUser(id);
   if (!u) throw new HttpError(404, "User not found.");
@@ -65,8 +65,10 @@ export async function updateUserProfile(actor: Actor, id: number, input: { name?
   const name = input.name?.trim() || u.name;
   const role = u.role === "owner" ? "owner" : input.role === "chief" || input.role === "employee" ? input.role : u.role;
   const active = input.active === undefined ? u.active : input.active ? 1 : 0;
-  await run("UPDATE users SET name=?, role=?, active=?, updated_at=? WHERE id=?", [name, role, active, now(), id]);
-  await audit(actor, "update_user", "user", id, { before: { name: u.name, role: u.role, active: u.active }, after: { name, role, active } });
+  // An AI agent account: its work is labelled "AI agent" and it is listed on the Agent activity page. The Owner is never an agent.
+  const isAgent = u.role === "owner" ? 0 : input.is_agent === undefined ? (u.is_agent ? 1 : 0) : input.is_agent ? 1 : 0;
+  await run("UPDATE users SET name=?, role=?, active=?, is_agent=?, updated_at=? WHERE id=?", [name, role, active, isAgent, now(), id]);
+  await audit(actor, "update_user", "user", id, { before: { name: u.name, role: u.role, active: u.active, is_agent: u.is_agent ? 1 : 0 }, after: { name, role, active, is_agent: isAgent } });
 }
 
 /** Owner: any non-owner. Chief: employees only, and only permissions Chief holds himself (never approval/assign rights). */

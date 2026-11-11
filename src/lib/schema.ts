@@ -585,4 +585,52 @@ CREATE INDEX IF NOT EXISTS idx_act_sender ON activities(sender_id, occurred_at);
 INSERT OR IGNORE INTO app_settings (key,value,updated_at)
 SELECT 'campaign_priority', json_group_array(id), strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM (SELECT id FROM campaigns ORDER BY CASE WHEN lower(name) LIKE '%canton%' OR lower(name) LIKE '%china%' THEN 0 WHEN lower(name) LIKE 'us %' THEN 1 WHEN lower(name) LIKE '%gulf%' THEN 2 ELSE 3 END, id) WHERE EXISTS (SELECT 1 FROM campaigns);
 `,
+  `
+-- Migration 13 (additive): agent accounts, the API request log (every call an agent makes, including reads and refusals), idempotency keys.
+ALTER TABLE users ADD COLUMN is_agent INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE audit_log ADD COLUMN request_id TEXT;
+ALTER TABLE audit_log ADD COLUMN run_id TEXT;
+ALTER TABLE audit_log ADD COLUMN key_id INTEGER;
+CREATE TABLE IF NOT EXISTS api_requests (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  request_id TEXT NOT NULL,
+  at TEXT NOT NULL,
+  actor_id INTEGER,
+  actor_name TEXT,
+  key_id INTEGER,
+  key_label TEXT,
+  run_id TEXT,
+  via TEXT NOT NULL DEFAULT 'api',
+  method TEXT NOT NULL,
+  path TEXT NOT NULL,
+  query TEXT,
+  kind TEXT NOT NULL,
+  status INTEGER NOT NULL,
+  outcome TEXT NOT NULL,
+  error_code TEXT,
+  error TEXT,
+  duration_ms INTEGER,
+  lead_id INTEGER,
+  task_id INTEGER,
+  message_version_id INTEGER,
+  request_body TEXT,
+  result TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_apireq_at ON api_requests(at);
+CREATE INDEX IF NOT EXISTS idx_apireq_actor ON api_requests(actor_id, id);
+CREATE INDEX IF NOT EXISTS idx_apireq_run ON api_requests(run_id, id);
+CREATE INDEX IF NOT EXISTS idx_apireq_lead ON api_requests(lead_id, id);
+CREATE INDEX IF NOT EXISTS idx_apireq_outcome ON api_requests(outcome, id);
+CREATE INDEX IF NOT EXISTS idx_audit_request ON audit_log(request_id);
+CREATE TABLE IF NOT EXISTS api_idempotency (
+  actor_id INTEGER NOT NULL,
+  key TEXT NOT NULL,
+  method TEXT NOT NULL,
+  path TEXT NOT NULL,
+  response TEXT NOT NULL,
+  request_id TEXT,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (actor_id, key)
+);
+`,
 ];

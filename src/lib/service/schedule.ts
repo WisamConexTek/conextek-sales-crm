@@ -14,7 +14,9 @@ const isYmd = (v?: string | null): v is string => !!v && /^\d{4}-\d{2}-\d{2}$/.t
  *   completed (done/cancelled) > blocked (blockers recorded, or validation still needed) > overdue (time passed) > ready (prep_status = ready_for_execution) > planned.
  * `is_overdue` is also set on blocked rows. `ready` is a PREPARATION state only: it never means approved to contact.
  */
-export type ScheduleFilters = { view?: "today" | "tomorrow"; date?: string; from?: string; to?: string; employee?: number; project?: number; campaign?: number; channel?: string; state?: string; includeTest?: boolean };
+export type ScheduleFilters = { view?: "today" | "tomorrow"; date?: string; from?: string; to?: string; employee?: number; project?: number; campaign?: number; channel?: string; state?: string; includeTest?: boolean;
+  /** Leave out finished (completed / cancelled) tasks: used for "all open work up to a day". */
+  openOnly?: boolean };
 
 export async function schedule(actor: Actor, f: ScheduleFilters = {}) {
   const today = todayYmd();
@@ -32,6 +34,7 @@ export async function schedule(actor: Actor, f: ScheduleFilters = {}) {
   if (f.project) (where.push("c.project_id=?"), args.push(f.project));
   if (f.channel) (where.push("t.channel=?"), args.push(f.channel));
   if (!f.includeTest) where.push("t.is_demo=0");
+  if (f.openOnly) where.push("t.status NOT IN ('completed','cancelled')");
   const rows = await all(
     `SELECT t.id,t.title,t.status,t.task_type,t.action_type,t.channel,t.prep_status,t.blockers,t.scheduled_at,t.scheduled_input,t.due_at,t.lead_id,t.assignee_id,t.campaign_id,t.is_demo,t.message_version_id,t.sent_at,t.activity_id,t.completed_at,t.due_on,t.scheduled_on,t.hold_reason,t.rescheduled_from,
             COALESCE(t.scheduled_at,t.due_at) AS at, CASE WHEN t.scheduled_at IS NOT NULL THEN 'scheduled_at' ELSE 'due_at' END AS at_source,
@@ -44,7 +47,7 @@ export async function schedule(actor: Actor, f: ScheduleFilters = {}) {
   const out = (await liveTasks(rows)).map((r) => ({ ...r, at: r.date_only ? null : r.at }) as typeof r);
   const filtered = f.state ? out.filter((r) => r.state === f.state) : out;
   const counts = Object.fromEntries(STATES.map((s) => [s, out.filter((r) => r.state === s).length]));
-  return { timezone: TZ(), from, to, counts, total: filtered.length, rows: filtered };
+  return { timezone: TZ(), from, to, counts, total: filtered.length, truncated: rows.length === 500, rows: filtered };
 }
 
 /* ---------- Campaign reporting ---------- */

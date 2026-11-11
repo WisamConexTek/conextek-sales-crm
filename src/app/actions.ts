@@ -200,7 +200,7 @@ export async function setMigrationAccessAction(fd: FD) {
 export async function updateUserAction(fd: FD) {
   const a = await requireUser();
   await guard(fd, async () => {
-    await Users.updateUserProfile(a, n(fd, "id"), { name: s(fd, "name"), role: s(fd, "role"), active: s(fd, "active") === "1" });
+    await Users.updateUserProfile(a, n(fd, "id"), { name: s(fd, "name"), role: s(fd, "role"), active: s(fd, "active") === "1", is_agent: s(fd, "is_agent") === "1" });
     return "Account updated.";
   });
 }

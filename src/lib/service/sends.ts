@@ -119,6 +119,12 @@ export async function countPendingSendApprovals(): Promise<number> {
   return Number((await one(`SELECT COUNT(*) AS n FROM message_versions v JOIN leads l ON l.id=v.lead_id WHERE ${WAITING}`))!.n);
 }
 
+/** The same waiting queue, counted per campaign (dashboard campaign table). */
+export async function pendingSendApprovalsByCampaign(): Promise<Map<number, number>> {
+  const rows = await all(`SELECT v.campaign_id AS cid, COUNT(*) AS n FROM message_versions v JOIN leads l ON l.id=v.lead_id WHERE ${WAITING} GROUP BY v.campaign_id`);
+  return new Map(rows.map((r) => [r.cid as number, Number(r.n)]));
+}
+
 /** Dashboard card: how many versions wait for the Owner's send approval, and the first few. Null for people who cannot approve sends. */
 export async function sendApprovalPreview(actor: Actor, limit = 5) {
   if (!(await canAuthorizeSend(actor))) return null;
