@@ -380,8 +380,8 @@ export async function getContact(actor: Actor, contactId: number) {
  * ONE definition each, shared by the dashboard counters, the dashboard lists and the Leads page filter,
  * so a number on the dashboard always opens exactly the leads it counted.
  */
-export const ATTENTION = ["unanswered", "quiet"] as const;
-export type Attention = (typeof ATTENTION)[number];
+export { ATTENTION, type Attention } from "../constants";
+import { ATTENTION, type Attention } from "../constants";
 type SqlPart = { sql: string; args: InValue[] };
 
 /** A real lead whose latest reply (last `days` days) is newer than our latest message, still open and not opted out. */
@@ -410,19 +410,55 @@ export function quietLeadFilter(alias = "l", days = 7): SqlPart {
 }
 
 /* ---------- reads ---------- */
+export const OUTREACH = ["not_contacted", "no_reply", "replied", "bounced", "opted_out"] as const;
+export type Outreach = (typeof OUTREACH)[number];
+export const TASK_FILTER = ["open", "overdue", "none"] as const;
+export const ACTIVE_FILTER = ["7", "30", "90", "stale30", "stale90"] as const;
+export const CONTACT_FILTER = ["has_email", "no_email"] as const;
 export type LeadFilters = {
-  q?: string; owner?: number; market?: string; segment?: string; stage?: string; channel?: string; testOnly?: boolean;
+  q?: string; owner?: number | "none"; market?: string; segment?: string; stage?: string; channel?: string; testOnly?: boolean;
   includeDemo?: boolean; includeHistorical?: boolean; page?: number; pageSize?: number; sort?: string;
-  /** Leads that are an active member of this campaign. */
-  campaign?: number;
+  /** Leads that are an active member of this campaign ("none" = in no campaign). */
+  campaign?: number | "none";
   /** Only leads that need attention (same rules as the dashboard). */
   attention?: Attention;
+  industry?: string; source?: string; service?: string; language?: string; country?: string;
+  /** Where outreach stands: never emailed, emailed with no reply, replied, a bounce, an opt-out. */
+  outreach?: Outreach;
+  /** Open work on the lead: has an open task, has a late one, or has none. */
+  task?: (typeof TASK_FILTER)[number];
+  /** Lead date (or the day it entered the CRM), YYYY-MM-DD. */
+  addedFrom?: string; addedTo?: string;
+  /** Activity in the last 7 / 30 / 90 days, or none for 30+ / 90+ days. */
+  active?: (typeof ACTIVE_FILTER)[number];
+  contact?: (typeof CONTACT_FILTER)[number];
 };
 
-export async function listLeads(actor: Actor, f: LeadFilters) {
+const oneOf = <T extends readonly string[]>(list: T, v: string | null | undefined): T[number] | undefined => (v && (list as readonly string[]).includes(v) ? (v as T[number]) : undefined);
+const ymdOk = (v: string | null | undefined) => (v && /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : undefined);
+
+/** The lead filters as they arrive in a URL (the Leads page, the CSV export and the API all read them the same way). */
+export function leadFiltersFrom(get: (key: string) => string | null | undefined): LeadFilters {
+  const str = (k: string) => get(k)?.trim() || undefined;
+  const id = (k: string): number | "none" | undefined => { const v = get(k); return v === "none" ? "none" : v && /^\d+$/.test(v) ? Number(v) : undefined; };
+  return {
+    q: str("q"), owner: id("owner"), market: str("market"), segment: str("segment"), stage: str("stage"), channel: str("channel"), sort: str("sort"),
+    campaign: id("campaign") ?? id("campaign_id"), attention: oneOf(ATTENTION, get("attention")),
+    industry: str("industry"), source: str("source"), service: str("service"), language: str("language"), country: str("country"),
+    outreach: oneOf(OUTREACH, get("outreach")), task: oneOf(TASK_FILTER, get("task")), active: oneOf(ACTIVE_FILTER, get("active")), contact: oneOf(CONTACT_FILTER, get("contact")),
+    addedFrom: ymdOk(get("added_from")), addedTo: ymdOk(get("added_to")),
+  };
+}
+
+const OPEN_TASK = "t.status NOT IN ('completed','cancelled')";
+const SENT = (extra = "") => `EXISTS (SELECT 1 FROM activities a WHERE a.lead_id=l.id AND a.type='message'${extra})`;
+const REPLIED = "EXISTS (SELECT 1 FROM activities a WHERE a.lead_id=l.id AND a.type='reply')";
+
+function leadWhere(actor: Actor, f: LeadFilters, skip: { stage?: boolean } = {}) {
   const s = leadScope(actor);
   const where = [s.sql];
   const args: InValue[] = [...s.args];
+  const eq = (col: string, v: string | number | undefined) => { if (v !== undefined && v !== "") { where.push(`${col}=?`); args.push(v); } };
   if (!f.includeDemo) where.push("l.is_demo=0");
   if (f.testOnly) where.push("l.is_demo=1");
   // Historical-only entities are listed by default (they are real records); pass includeHistorical:false to hide them (e.g. task pickers).
@@ -432,27 +468,52 @@ export async function listLeads(actor: Actor, f: LeadFilters) {
     where.push(`(lower(l.company) LIKE ? OR l.domain LIKE ? OR lower(l.country) LIKE ? OR EXISTS (SELECT 1 FROM contacts c WHERE c.lead_id=l.id AND (lower(c.name) LIKE ? OR lower(c.email) LIKE ?)))`);
     args.push(like, like, like, like, like);
   }
-  if (f.owner) (where.push("l.owner_id=?"), args.push(f.owner));
-  if (f.market) (where.push("l.market=?"), args.push(f.market));
-  if (f.segment) (where.push("l.segment=?"), args.push(f.segment));
-  if (f.stage) (where.push("l.stage=?"), args.push(f.stage));
+  if (f.owner === "none") where.push("l.owner_id IS NULL"); else eq("l.owner_id", f.owner);
+  eq("l.market", f.market); eq("l.segment", f.segment); eq("l.industry", f.industry); eq("l.source", f.source); eq("l.service", f.service); eq("l.language", f.language);
+  if (!skip.stage) eq("l.stage", f.stage);
+  if (f.country?.trim()) (where.push("lower(l.country) LIKE ?"), args.push(`%${f.country.trim().toLowerCase()}%`));
   if (f.channel) (where.push("EXISTS (SELECT 1 FROM activities a WHERE a.lead_id=l.id AND a.channel=?)"), args.push(f.channel));
-  if (f.campaign) (where.push("EXISTS (SELECT 1 FROM lead_campaigns lc WHERE lc.lead_id=l.id AND lc.campaign_id=? AND lc.status='active')"), args.push(f.campaign));
+  if (f.campaign === "none") where.push("NOT EXISTS (SELECT 1 FROM lead_campaigns lc WHERE lc.lead_id=l.id AND lc.status='active')");
+  else if (f.campaign) (where.push("EXISTS (SELECT 1 FROM lead_campaigns lc WHERE lc.lead_id=l.id AND lc.campaign_id=? AND lc.status='active')"), args.push(f.campaign));
   if (f.attention) {
     const a = f.attention === "unanswered" ? unansweredReplyFilter() : quietLeadFilter();
     where.push(`(${a.sql})`);
     args.push(...a.args);
   }
-  const W = where.join(" AND ");
+  if (f.outreach === "not_contacted") where.push(`NOT ${SENT()}`);
+  if (f.outreach === "no_reply") where.push(`${SENT()} AND NOT ${REPLIED}`);
+  if (f.outreach === "replied") where.push(REPLIED);
+  if (f.outreach === "bounced") where.push("(EXISTS (SELECT 1 FROM activities a WHERE a.lead_id=l.id AND a.outcome='bounced') OR EXISTS (SELECT 1 FROM contacts c WHERE c.lead_id=l.id AND c.email_status='bounced'))");
+  if (f.outreach === "opted_out") where.push("EXISTS (SELECT 1 FROM contacts c WHERE c.lead_id=l.id AND c.email_status='opted_out')");
+  if (f.task === "open") where.push(`EXISTS (SELECT 1 FROM tasks t WHERE t.lead_id=l.id AND ${OPEN_TASK})`);
+  if (f.task === "none") where.push(`NOT EXISTS (SELECT 1 FROM tasks t WHERE t.lead_id=l.id AND ${OPEN_TASK})`);
+  if (f.task === "overdue") (where.push(`EXISTS (SELECT 1 FROM tasks t WHERE t.lead_id=l.id AND ${OPEN_TASK} AND COALESCE(t.scheduled_at,t.due_at)<?)`), args.push(now()));
+  if (f.addedFrom) (where.push("substr(COALESCE(l.lead_date,l.created_at),1,10)>=?"), args.push(f.addedFrom));
+  if (f.addedTo) (where.push("substr(COALESCE(l.lead_date,l.created_at),1,10)<=?"), args.push(f.addedTo));
+  if (f.active) {
+    const stale = f.active.startsWith("stale");
+    const cut = new Date(Date.now() - Number(f.active.replace("stale", "")) * 86400000).toISOString();
+    where.push(`COALESCE(l.last_activity_at,l.created_at)${stale ? "<" : ">="}?`);
+    args.push(cut);
+  }
+  if (f.contact === "has_email") where.push("EXISTS (SELECT 1 FROM contacts c WHERE c.lead_id=l.id AND c.email IS NOT NULL AND c.email<>'')");
+  if (f.contact === "no_email") where.push("NOT EXISTS (SELECT 1 FROM contacts c WHERE c.lead_id=l.id AND c.email IS NOT NULL AND c.email<>'')");
+  return { W: where.join(" AND "), args };
+}
+
+export async function listLeads(actor: Actor, f: LeadFilters) {
+  const { W, args } = leadWhere(actor, f);
   const size = f.pageSize ?? 50;
   const page = Math.max(1, f.page ?? 1);
   const order =
     f.sort === "company" ? "lower(l.company) ASC"
     : f.sort === "due" ? "l.next_due_at IS NULL, l.next_due_at ASC"
+    : f.sort === "added" ? "COALESCE(l.lead_date,l.created_at) DESC"
+    : f.sort === "oldest" ? "COALESCE(l.last_activity_at, l.created_at) ASC"
     : "COALESCE(l.last_activity_at, l.created_at) DESC";
   const [totalRow, rows] = await Promise.all([one(`SELECT COUNT(*) AS n FROM leads l WHERE ${W}`, args), all(
     `SELECT l.*, u.name AS owner_name FROM leads l LEFT JOIN users u ON u.id=l.owner_id
-     WHERE ${W} ORDER BY ${order} LIMIT ? OFFSET ?`,
+     WHERE ${W} ORDER BY ${order}, l.id DESC LIMIT ? OFFSET ?`,
     [...args, size, (page - 1) * size],
   )]);
   const total = Number(totalRow!.n);
@@ -460,26 +521,61 @@ export async function listLeads(actor: Actor, f: LeadFilters) {
   return { rows, total, page, pageSize: size, page_size: size, has_more: page * size < total };
 }
 
-/** For a page of the leads list: each lead's active campaign(s) and its next open task with the LIVE status (same code as everywhere else). */
+/** How many leads each stage holds under the current filters (the stage filter itself is left out, so the strip works as a switch). */
+export async function leadStageCounts(actor: Actor, f: LeadFilters) {
+  const { W, args } = leadWhere(actor, f, { stage: true });
+  const rows = await all(`SELECT l.stage, COUNT(*) AS n FROM leads l WHERE ${W} GROUP BY l.stage`, args);
+  return new Map(rows.map((r) => [r.stage as string, Number(r.n)]));
+}
+
+export type LeadOutreach = { sent: number; replies: number; lastSentAt: string | null; lastReplyAt: string | null; bounced: boolean; lastType: string | null; lastKind: string | null; lastTitle: string | null };
+export type LeadContactSummary = { name: string; role: string | null; email: string | null; status: string; count: number; optedOut: boolean; bounced: boolean };
+
+/**
+ * For a page of the leads list: each lead's active campaign(s), its next open task with the LIVE status (same code as everywhere else),
+ * its main contact, and where outreach stands (messages sent, replies, bounces, the latest thing that happened).
+ */
 export async function leadListExtras(leadIds: number[]) {
   const campaigns = new Map<number, { id: number; name: string }[]>();
   const nextTask = new Map<number, Row>();
-  if (!leadIds.length) return { campaigns, nextTask };
+  const contact = new Map<number, LeadContactSummary>();
+  const outreach = new Map<number, LeadOutreach>();
+  if (!leadIds.length) return { campaigns, nextTask, contact, outreach };
   const marks = leadIds.map(() => "?").join(",");
-  const [camps, tasks] = await Promise.all([
+  const [camps, tasks, contacts, sums, lasts] = await Promise.all([
     all(`SELECT lc.lead_id,c.id,c.name FROM lead_campaigns lc JOIN campaigns c ON c.id=lc.campaign_id WHERE lc.status='active' AND lc.lead_id IN (${marks}) ORDER BY lc.joined_at`, leadIds),
     all(
       `SELECT t.id,t.title,t.status,t.lead_id,t.prep_status,t.blockers,t.scheduled_at,t.due_at,t.message_version_id,t.sent_at,t.activity_id,t.due_on,t.scheduled_on,t.hold_reason,t.rescheduled_from,
               u.name AS assignee_name, COALESCE(t.scheduled_at,t.due_at) AS sort_at
        FROM tasks t JOIN users u ON u.id=t.assignee_id WHERE t.lead_id IN (${marks}) AND t.status NOT IN ('completed','cancelled')
        ORDER BY (COALESCE(t.scheduled_at,t.due_at) IS NULL), COALESCE(t.scheduled_at,t.due_at), t.id`, leadIds),
+    all(`SELECT lead_id,name,role,email,email_status FROM contacts WHERE lead_id IN (${marks}) ORDER BY is_primary DESC, id`, leadIds),
+    all(
+      `SELECT lead_id,
+         SUM(CASE WHEN type='message' THEN 1 ELSE 0 END) AS sent, SUM(CASE WHEN type='reply' THEN 1 ELSE 0 END) AS replies,
+         MAX(CASE WHEN type='message' AND occurred_precision<>'unknown' THEN occurred_at END) AS last_sent, MAX(CASE WHEN type='reply' AND occurred_precision<>'unknown' THEN occurred_at END) AS last_reply,
+         MAX(CASE WHEN outcome='bounced' THEN 1 ELSE 0 END) AS bounced
+       FROM activities WHERE lead_id IN (${marks}) GROUP BY lead_id`, leadIds),
+    // the latest dated thing on each lead (SQLite returns the other columns from the MAX row)
+    all(`SELECT lead_id,type,message_kind,title,MAX(occurred_at) AS at FROM activities WHERE lead_id IN (${marks}) AND occurred_precision<>'unknown' GROUP BY lead_id`, leadIds),
   ]);
   for (const c of camps) (campaigns.get(c.lead_id as number) ?? campaigns.set(c.lead_id as number, []).get(c.lead_id as number)!).push({ id: c.id as number, name: c.name as string });
   const firsts: Row[] = [];
   const seen = new Set<number>();
   for (const t of tasks) if (!seen.has(t.lead_id as number)) (seen.add(t.lead_id as number), firsts.push(t));
   for (const t of await liveTasks(firsts)) nextTask.set(t.lead_id as number, t);
-  return { campaigns, nextTask };
+  for (const c of contacts) {
+    const cur = contact.get(c.lead_id as number);
+    if (!cur) contact.set(c.lead_id as number, { name: c.name as string, role: (c.role as string | null) ?? null, email: (c.email as string | null) || null, status: c.email_status as string, count: 1, optedOut: c.email_status === "opted_out", bounced: c.email_status === "bounced" });
+    else { cur.count++; cur.optedOut ||= c.email_status === "opted_out"; cur.bounced ||= c.email_status === "bounced"; }
+  }
+  const last = new Map(lasts.map((r) => [r.lead_id as number, r]));
+  for (const r of sums) {
+    const l = last.get(r.lead_id as number);
+    outreach.set(r.lead_id as number, { sent: Number(r.sent), replies: Number(r.replies), lastSentAt: (r.last_sent as string | null) ?? null, lastReplyAt: (r.last_reply as string | null) ?? null, bounced: !!Number(r.bounced),
+      lastType: (l?.type as string | null) ?? null, lastKind: (l?.message_kind as string | null) ?? null, lastTitle: (l?.title as string | null) ?? null });
+  }
+  return { campaigns, nextTask, contact, outreach };
 }
 
 export async function getLead(actor: Actor, id: number) {

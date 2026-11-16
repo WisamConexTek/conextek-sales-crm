@@ -4,9 +4,9 @@ import { TASK_STATUS_LABEL, OUTCOME_LABEL, EMAIL_STATUS_LABEL } from "@/lib/cons
 
 export function PageHeader({ title, sub, children }: { title: string; sub?: ReactNode; children?: ReactNode }) {
   return (
-    <div className="mb-5 flex flex-wrap items-end justify-between gap-3">
+    <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
       <div>
-        <h1 className="text-xl font-semibold text-slate-900">{title}</h1>
+        <h1 className="text-2xl font-semibold tracking-tight text-slate-900">{title}</h1>
         {sub && <p className="mt-0.5 text-sm text-slate-500">{sub}</p>}
       </div>
       <div className="flex flex-wrap items-center gap-2">{children}</div>
@@ -18,9 +18,9 @@ export function Card({ title, right, children, className = "" }: { title?: React
   return (
     <section className={`card ${className}`}>
       {(title || right) && (
-        <header className="flex items-center justify-between border-b border-slate-100 px-4 py-2.5">
-          <h2 className="text-sm font-semibold text-slate-800">{title}</h2>
-          {right}
+        <header className="flex items-center justify-between gap-3 px-4 pt-3.5">
+          <h2 className="flex items-center gap-2 text-sm font-semibold text-slate-900"><span className="h-3.5 w-1 rounded-full bg-brand-600" aria-hidden="true" />{title}</h2>
+          {right && <div className="text-xs">{right}</div>}
         </header>
       )}
       <div className="p-4">{children}</div>
@@ -31,13 +31,13 @@ export function Card({ title, right, children, className = "" }: { title?: React
 export function Stat({ label, value, sub, href, tone }: { label: string; value: ReactNode; sub?: ReactNode; href?: string; tone?: "red" | "amber" | "green" }) {
   const color = tone === "red" ? "text-red-600" : tone === "amber" ? "text-amber-600" : tone === "green" ? "text-emerald-600" : "text-slate-900";
   const body = (
-    <div className="card h-full p-4 transition hover:border-slate-300">
-      <div className="text-xs font-medium uppercase tracking-wide text-slate-500">{label}</div>
-      <div className={`mt-1 text-2xl font-semibold ${color}`}>{value}</div>
-      {sub && <div className="mt-1 text-xs text-slate-500">{sub}</div>}
+    <div className={`card h-full px-4 py-3.5 transition ${href ? "hover:border-brand-500/50 hover:shadow-md" : ""}`}>
+      <div className="text-xs font-medium text-slate-600">{label}</div>
+      <div className={`mt-2 text-[28px] font-semibold leading-none tracking-tight tabular-nums ${color}`}>{value}</div>
+      {sub && <div className="mt-2 text-xs text-slate-500">{sub}</div>}
     </div>
   );
-  return href ? <Link href={href} className="block no-underline">{body}</Link> : body;
+  return href ? <Link href={href} className="block no-underline hover:no-underline">{body}</Link> : body;
 }
 
 const TONES: Record<string, string> = {

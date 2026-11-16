@@ -208,3 +208,7 @@ export const DEFAULT_LISTS: Record<ListKind, { key: string; label: string; flag?
     { key: "ar", label: "Arabic" },
   ],
 };
+
+/** Lead filters for "needs a person". Kept here (a module with no imports) because it is read while other modules are still loading. */
+export const ATTENTION = ["unanswered", "quiet"] as const;
+export type Attention = (typeof ATTENTION)[number];

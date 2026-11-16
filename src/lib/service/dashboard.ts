@@ -125,6 +125,11 @@ export function loadBoard(actor: Actor, sc: Scope) {
 }
 export type Board = Awaited<ReturnType<typeof loadBoard>>;
 
+/** Which accounts are AI agents (shown with their own mark wherever people are listed). */
+export function loadAgentIds() {
+  return cached("dash:agents", 30000, async () => new Set((await all("SELECT id FROM users WHERE is_agent=1")).map((r) => r.id as number)));
+}
+
 /* ---------- 2. decisions and leads that wait on someone ---------- */
 export function loadActions(actor: Actor, sc: Scope) {
   return cached(`dash:actions:${sc.key}`, TTL, async () => {
@@ -269,12 +274,12 @@ export function loadFeed(actor: Actor, sc: Scope) {
     const s = leadScope(actor);
     const by = sc.employee ? " AND a.actor_id=?" : "";
     const feedP = all(
-      `SELECT a.id,a.lead_id,a.type,a.message_kind,a.title,a.occurred_at,l.company,COALESCE(u.name,'Unknown original employee') AS actor_name
+      `SELECT a.id,a.lead_id,a.type,a.message_kind,a.outcome,a.classification,a.title,a.occurred_at,l.company,COALESCE(u.name,'Unknown original employee') AS actor_name
        FROM activities a JOIN leads l ON l.id=a.lead_id LEFT JOIN users u ON u.id=a.actor_id
-       WHERE a.is_demo=0 AND a.occurred_precision<>'unknown' AND ${s.sql}${by} ORDER BY a.occurred_at DESC, a.id DESC LIMIT 10`,
+       WHERE a.is_demo=0 AND a.occurred_precision<>'unknown' AND ${s.sql}${by} ORDER BY a.occurred_at DESC, a.id DESC LIMIT 8`,
       [...s.args, ...(sc.employee ? [sc.employee] : [])]);
     if (!sc.manager) return { feed: await feedP, api: null };
-    const [feed, api] = await Promise.all([feedP, recentApiActivity(10)]);
+    const [feed, api] = await Promise.all([feedP, recentApiActivity(6)]);
     return { feed, api };
   });
 }

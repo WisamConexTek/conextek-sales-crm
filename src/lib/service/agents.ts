@@ -156,11 +156,11 @@ export async function recentApiActivity(limit = 10) {
   const day = new Date(Date.now() - 86400000).toISOString();
   const [steps, per] = await Promise.all([
     all(`SELECT r.id,r.at,r.actor_id,r.actor_name,r.method,r.path,r.outcome,r.error,r.lead_id,r.task_id,r.run_id,l.company FROM api_requests r LEFT JOIN leads l ON l.id=r.lead_id ORDER BY r.id DESC LIMIT ?`, [limit]),
-    all(`SELECT r.actor_id,MAX(r.actor_name) AS who,COUNT(*) AS n,SUM(CASE WHEN r.kind='write' AND r.outcome='ok' THEN 1 ELSE 0 END) AS changes,SUM(CASE WHEN r.outcome='refused' THEN 1 ELSE 0 END) AS refused
+    all(`SELECT r.actor_id,MAX(r.actor_name) AS who,COUNT(*) AS n,SUM(CASE WHEN r.kind='write' AND r.outcome='ok' THEN 1 ELSE 0 END) AS changes,SUM(CASE WHEN r.outcome='refused' THEN 1 ELSE 0 END) AS refused,MAX(r.at) AS last_at,COUNT(DISTINCT r.run_id) AS runs
          FROM api_requests r WHERE r.at>=? AND r.actor_id IS NOT NULL GROUP BY r.actor_id ORDER BY n DESC LIMIT 6`, [day]),
   ]);
   return {
     steps: steps.map(decorate),
-    last24h: per.map((r) => ({ id: r.actor_id as number, who: r.who as string, n: Number(r.n), changes: Number(r.changes), refused: Number(r.refused) })),
+    last24h: per.map((r) => ({ id: r.actor_id as number, who: r.who as string, n: Number(r.n), changes: Number(r.changes), refused: Number(r.refused), lastAt: r.last_at as string, runs: Number(r.runs) })),
   };
 }

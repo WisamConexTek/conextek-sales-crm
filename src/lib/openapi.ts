@@ -19,7 +19,7 @@ const E: Row[] = [
   ["GET", "/duplicates/reviews", "Leads", "Duplicate reviews waiting for a Chief.", ["status"]],
   ["POST", "/duplicates/reviews", "Leads", "Ask a Chief to decide an ambiguous match.", [], ["existing_lead_id*", "proposed*"]],
   ["PATCH", "/duplicates/reviews/{id}", "Leads", "Chief decides a duplicate review.", [], ["decision*", "note"]],
-  ["GET", "/leads", "Leads", "Leads you can see.", ["q", "stage", "market", "segment", "owner", "channel", "campaign_id", "attention", "page", "page_size", "include_test", "include_historical"]],
+  ["GET", "/leads", "Leads", "Leads you can see.", ["q", "stage", "market", "segment", "owner", "channel", "campaign_id", "attention", "industry", "source", "service", "language", "country", "outreach", "task", "active", "contact", "added_from", "added_to", "sort", "page", "page_size", "include_test", "include_historical"]],
   ["POST", "/leads", "Leads", "Create a lead, optionally in a campaign and with contacts.", [], ["company*", "website", "country", "industry", "market", "segment", "language", "source", "source_url", "service", "notes", "stage", "owner_id", "campaign_id", "lead_date", "original_researcher", "contacts[]", "is_test", "allow_duplicate"]],
   ["GET", "/leads/duplicates", "Leads", "Simple duplicate lookup by company / website / email.", ["company", "website", "email"]],
   ["GET", "/leads/{id}", "Leads", "One lead with contacts, tasks and full history."],
