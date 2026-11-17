@@ -2,7 +2,8 @@ import { z } from "zod";
 import { all, one, run, now, localMidnight, addDays, todayYmd, TZ } from "../db";
 import { HttpError, type Actor } from "../auth";
 import { audit, parse } from "./common";
-import { loadSenders, capOn, statusOn, type Sender, type Step } from "./senders";
+import { loadSenders, capOn, statusOn, bounceLimit, type Sender, type Step } from "./senders";
+import { seqSettings } from "./sequences";
 
 /** Daily outreach capacity, PER SENDER (Asia/Hebron day): each sender has its own cap or warm-up schedule; campaigns share a priority order used when reserving it. */
 const CAP_KEY = "daily_send_cap"; // legacy shared cap; now the cap of the default sender (id 1)
@@ -17,13 +18,13 @@ export async function capacitySettings() {
   try { priority = p?.value ? (JSON.parse(String(p.value)) as number[]) : []; } catch { priority = []; }
   void c;
   const s1 = await one("SELECT daily_cap FROM senders WHERE id=1");
-  return { daily_cap: s1 ? (s1.daily_cap == null ? 0 : Number(s1.daily_cap)) : DEFAULT_DAILY_CAP, priority, note: "daily_cap here is the default sender's cap (0 = no cap). Each sender has its own cap/warm-up: see GET /senders." };
+  return { daily_cap: s1 ? (s1.daily_cap == null ? 0 : Number(s1.daily_cap)) : DEFAULT_DAILY_CAP, priority, bounce_limit: await bounceLimit(), note: "daily_cap here is the default sender's cap (0 = no cap). Each sender has its own cap/warm-up: see GET /senders." };
 }
 
 export async function setCapacitySettings(actor: Actor, input: unknown) {
   if (actor.role !== "owner") throw new HttpError(403, "Only the Owner can change the daily send cap.");
-  const d = parse(z.object({ daily_cap: z.coerce.number().int().min(0).max(5000).optional(), priority: z.array(z.coerce.number().int()).max(100).optional() }), input);
-  if (d.daily_cap === undefined && d.priority === undefined) throw new HttpError(400, "Send daily_cap (0 = no cap) and/or priority (campaign ids, highest first).");
+  const d = parse(z.object({ daily_cap: z.coerce.number().int().min(0).max(5000).optional(), priority: z.array(z.coerce.number().int()).max(100).optional(), bounce_limit: z.coerce.number().gt(0).lt(1).optional() }), input);
+  if (d.daily_cap === undefined && d.priority === undefined && d.bounce_limit === undefined) throw new HttpError(400, "Send daily_cap (0 = no cap), priority (campaign ids, highest first) and/or bounce_limit (for example 0.02 for 2%).");
   const before = await capacitySettings();
   if (d.priority) {
     if (new Set(d.priority).size !== d.priority.length) throw new HttpError(400, "priority: a campaign appears twice.");
@@ -32,7 +33,8 @@ export async function setCapacitySettings(actor: Actor, input: unknown) {
   const put = (k: string, v: string) => run("INSERT INTO app_settings (key,value,updated_by,updated_at) VALUES (?,?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_by=excluded.updated_by, updated_at=excluded.updated_at", [k, v, actor.id, now()]);
   if (d.daily_cap !== undefined) await run("UPDATE senders SET daily_cap=?, updated_at=? WHERE id=1", [d.daily_cap === 0 ? null : d.daily_cap, now()]);
   if (d.priority) await put(PRIO_KEY, JSON.stringify(d.priority));
-  await audit(actor, "update_capacity", "setting", 0, { from: before, to: { daily_cap: d.daily_cap ?? before.daily_cap, priority: d.priority ?? before.priority } });
+  if (d.bounce_limit !== undefined) await put("bounce_limit", String(d.bounce_limit));
+  await audit(actor, "update_capacity", "setting", 0, { from: before, to: { daily_cap: d.daily_cap ?? before.daily_cap, priority: d.priority ?? before.priority, bounce_limit: d.bounce_limit ?? before.bounce_limit } });
   return capacitySettings();
 }
 
@@ -62,48 +64,105 @@ export async function sentTodayTotal() {
   return (await sentOn(todayYmd())).total;
 }
 
-export type SenderCap = {
-  sender: Sender; steps: Step[]; cap: number | null; step_from: string | null; warmup: boolean; not_started: boolean;
-  used: number; reserved: number; status: string; usedPer: Map<number | null, number>;
-  campaigns: Map<number, { reserved: number; pushed: number }>; pushed: { task_id: number; message_version_id: number; lead_id: number; campaign_id: number; scheduled: string | null }[];
-};
+/** The order a sender's daily slots are given out in. */
+export const CAP_GROUPS = ["window", "overdue", "first_floor", "late", "first"] as const;
+export type CapGroup = (typeof CAP_GROUPS)[number];
+export const CAP_GROUP_LABEL: Record<CapGroup, string> = { window: "Follow-ups inside their window", overdue: "Overdue follow-ups", first_floor: "First emails (protected minimum)", late: "Late backfill items", first: "Remaining first emails" };
+export type CapKind = "window" | "overdue" | "late" | "first";
+export type Allocation<T> = { taken: { item: T; group: CapGroup }[]; pushed: T[]; counts: Record<CapGroup, number>; empty_floor: number; free: number };
 
 /**
- * Per-sender capacity for one day. Approved (Owner send authorization active) tasks scheduled that day (for today: also any overdue ones)
- * reserve a sender's remaining capacity in campaign-priority order; what does not fit is "pushed to the next day".
+ * Gives out `room` slots: follow-ups inside their window (soonest window end first), overdue follow-ups (oldest first),
+ * the protected first-email minimum, late items up to the daily late limit, then the remaining first emails.
+ * Follow-ups can never use the slots the first-email floor protects. planFloor counts floor slots that have no email yet (the work plan).
+ */
+export function allocate<T extends { kind: CapKind; sort: string; campaign_id: number | null }>(room: number, floor: number, lateLimit: number, items: T[], rank: (campaignId: number) => number, planFloor = false): Allocation<T> {
+  const by = (k: CapKind) => items.filter((i) => i.kind === k).sort((a, b) => (a.sort < b.sort ? -1 : a.sort > b.sort ? 1 : 0));
+  const firsts = items.filter((i) => i.kind === "first").sort((a, b) => rank(a.campaign_id ?? 0) - rank(b.campaign_id ?? 0) || (a.sort < b.sort ? -1 : a.sort > b.sort ? 1 : 0));
+  const taken: Allocation<T>["taken"] = [];
+  const counts: Record<CapGroup, number> = { window: 0, overdue: 0, first_floor: 0, late: 0, first: 0 };
+  const floorSlots = Math.min(floor, room);
+  const protect = planFloor ? floorSlots : Math.min(floorSlots, firsts.length);
+  let left = room;
+  const take = (list: T[], group: CapGroup, max: number) => { const n = Math.min(list.length, Math.max(0, max)); for (const item of list.splice(0, n)) taken.push({ item, group }); counts[group] += n; left -= n; return n; };
+  const win = by("window"), over = by("overdue"), late = by("late");
+  take(win, "window", left - protect);
+  take(over, "overdue", left - protect);
+  const floorRoom = Math.max(0, Math.min(protect, left));
+  const filled = take(firsts, "first_floor", floorRoom);
+  // In the work plan a protected slot with no email yet still holds its place: it is what the Lead Hunter has to fill.
+  const emptyFloor = planFloor ? floorRoom - filled : 0;
+  left -= emptyFloor;
+  take(late, "late", Math.min(lateLimit, left));
+  take(firsts, "first", left);
+  return { taken, pushed: [...win, ...over, ...late, ...firsts], counts, empty_floor: emptyFloor, free: Math.max(0, left) };
+}
+
+export type CapCandidate = { task_id: number; message_version_id: number; lead_id: number; campaign_id: number; scheduled: string | null; kind: CapKind; sort: string };
+export type SenderCap = {
+  sender: Sender; steps: Step[]; cap: number | null; step_from: string | null; warmup: boolean; not_started: boolean;
+  used: number; used_first: number; reserved: number; status: string; usedPer: Map<number | null, number>; floor: number;
+  campaigns: Map<number, { reserved: number; pushed: number }>; pushed: (CapCandidate & { group: CapKind })[];
+  groups: Record<CapGroup, { reserved: number; pushed: number }>; reservedTasks: Set<number>;
+};
+const dayOf = (iso: string | null) => (iso ? todayYmd(undefined, new Date(iso)) : null);
+const daysBetween = (a: string, b: string) => Math.round((Date.parse(`${a}T00:00:00Z`) - Date.parse(`${b}T00:00:00Z`)) / 86400000);
+/** Which priority group a send belongs to on a given day. */
+export function capKind(r: { step_number?: unknown; action?: unknown; action_type?: unknown; is_late?: unknown; window_end_on?: unknown; scheduled?: unknown }, ymd: string, overdueDays: number): CapKind {
+  const follow = Number(r.step_number ?? 0) > 1 || r.action === "follow_up" || r.action === "other" || /follow/i.test(String(r.action_type ?? ""));
+  if (!follow) return "first";
+  if (Number(r.is_late ?? 0)) return "late";
+  const end = (r.window_end_on as string | null) ?? dayOf((r.scheduled as string | null) ?? null) ?? ymd;
+  const past = daysBetween(ymd, end);
+  return past <= 0 ? "window" : past <= overdueDays ? "overdue" : "late";
+}
+
+/**
+ * Per-sender capacity for one day. Approved (Owner send authorization active) tasks due that day (for today: also any overdue ones)
+ * reserve a sender's remaining capacity in the priority order above; what does not fit is "pushed to the next day".
  */
 export async function capacityData(ymd: string) {
   const [from, to] = dayRange(ymd);
   const today = todayYmd();
   const upper = to; // overdue tasks only count toward today
   const lower = ymd === today ? "0000-01-01T00:00:00.000Z" : from;
-  const [{ senders, steps }, set, used, cand] = await Promise.all([
+  const [{ senders, steps }, set, used, cand, firstUsed, seq] = await Promise.all([
     loadSenders(), capacitySettings(), sentOn(ymd),
     all(
-      `SELECT t.id AS task_id, mv.id AS message_version_id, mv.lead_id, mv.campaign_id, mv.sender_id, COALESCE(t.scheduled_at,t.due_at) AS scheduled
+      `SELECT t.id AS task_id, mv.id AS message_version_id, mv.lead_id, mv.campaign_id, mv.sender_id, COALESCE(t.scheduled_at,t.due_at) AS scheduled,
+              t.step_number, t.action_type, t.is_late, t.window_end_on,
+              (SELECT a.permitted_action FROM send_authorizations a WHERE a.message_version_id=mv.id AND a.kind='send' AND a.status='active' ORDER BY a.id DESC LIMIT 1) AS action
        FROM tasks t JOIN message_versions mv ON mv.id=t.message_version_id
        WHERE t.status NOT IN ('completed','cancelled') AND t.is_demo=0 AND COALESCE(t.scheduled_at,t.due_at)>=? AND COALESCE(t.scheduled_at,t.due_at)<?
          AND EXISTS (SELECT 1 FROM send_authorizations a WHERE a.message_version_id=mv.id AND a.kind='send' AND a.status='active')
        ORDER BY COALESCE(t.scheduled_at,t.due_at), t.id`, [lower, upper]),
+    all(`SELECT COALESCE(a.sender_id,1) AS sender_id, COUNT(*) AS n FROM activities a WHERE a.type='message' AND a.outcome='sent' AND a.message_kind='first_email' AND a.is_demo=0 AND a.occurred_precision='time' AND a.occurred_at>=? AND a.occurred_at<? GROUP BY 1`, [from, to]),
+    seqSettings(),
   ]);
   const rank = (id: number) => { const i = set.priority.indexOf(id); return i === -1 ? 1e6 + id : i; };
+  const usedFirst = new Map(firstUsed.map((r) => [r.sender_id as number, Number(r.n)]));
   const out: SenderCap[] = senders.map((s) => {
     const st = steps.get(s.id) ?? [];
     const c = capOn(s, st, ymd);
     const u = used.bySender.get(s.id);
-    const mine = cand.filter((r) => r.sender_id === s.id).sort((a, b) => rank(a.campaign_id as number) - rank(b.campaign_id as number));
-    let room = c.cap === null ? Infinity : Math.max(0, c.cap - (u?.total ?? 0));
+    const mine: (CapCandidate & { group: CapKind })[] = cand.filter((r) => r.sender_id === s.id).map((r) => {
+      const kind = capKind(r, ymd, seq.overdue_days);
+      const when = (r.scheduled as string) ?? "";
+      return { task_id: r.task_id as number, message_version_id: r.message_version_id as number, lead_id: r.lead_id as number, campaign_id: r.campaign_id as number, scheduled: (r.scheduled as string) ?? null, kind, group: kind,
+        sort: kind === "first" ? when : `${(r.window_end_on as string) ?? when.slice(0, 10)}|${when}` };
+    });
+    const room = c.cap === null ? Infinity : Math.max(0, c.cap - (u?.total ?? 0));
+    const floor = Math.max(0, Math.min(s.first_email_floor, c.cap ?? Infinity) - (usedFirst.get(s.id) ?? 0));
+    const al = allocate(room, floor, seq.late_daily_limit, mine, rank);
     const campaigns = new Map<number, { reserved: number; pushed: number }>();
-    const pushed: SenderCap["pushed"] = [];
-    let reserved = 0;
-    for (const r of mine) {
-      const k = campaigns.get(r.campaign_id as number) ?? campaigns.set(r.campaign_id as number, { reserved: 0, pushed: 0 }).get(r.campaign_id as number)!;
-      if (room > 0) { room--; reserved++; k.reserved++; }
-      else { k.pushed++; pushed.push({ task_id: r.task_id as number, message_version_id: r.message_version_id as number, lead_id: r.lead_id as number, campaign_id: r.campaign_id as number, scheduled: (r.scheduled as string) ?? null }); }
-    }
-    return { sender: s, steps: st, cap: c.cap, step_from: c.step_from, warmup: c.warmup, not_started: c.not_started, used: u?.total ?? 0, reserved, status: statusOn(s, st, ymd), usedPer: u?.per ?? new Map(), campaigns, pushed };
+    const groups = Object.fromEntries(CAP_GROUPS.map((g) => [g, { reserved: al.counts[g], pushed: 0 }])) as SenderCap["groups"];
+    const camp = (id: number) => campaigns.get(id) ?? campaigns.set(id, { reserved: 0, pushed: 0 }).get(id)!;
+    for (const x of al.taken) camp(x.item.campaign_id).reserved++;
+    for (const p of al.pushed) { camp(p.campaign_id).pushed++; groups[p.kind].pushed++; }
+    return { sender: s, steps: st, cap: c.cap, step_from: c.step_from, warmup: c.warmup, not_started: c.not_started, used: u?.total ?? 0, used_first: usedFirst.get(s.id) ?? 0, reserved: al.taken.length, status: statusOn(s, st, ymd), usedPer: u?.per ?? new Map(), floor: s.first_email_floor,
+      campaigns, pushed: al.pushed, groups, reservedTasks: new Set(al.taken.map((x) => x.item.task_id)) };
   });
-  return { ymd, senders: out, used, set, rank };
+  return { ymd, senders: out, used, set, rank, seq };
 }
 
 export async function capacityFor(date?: string) {
@@ -124,6 +183,8 @@ export async function capacityFor(date?: string) {
       sender_id: x.sender.id, email: x.sender.email, display_name: x.sender.display_name, status: x.status,
       daily_cap: x.cap, unlimited, warmup: x.warmup, warmup_not_started: x.not_started, warmup_step_from: x.step_from,
       used: x.used, reserved: x.reserved, remaining: unlimited ? null : Math.max(0, (x.cap as number) - x.used - x.reserved),
+      first_email_floor: x.floor, first_emails_sent: x.used_first,
+      groups: CAP_GROUPS.map((g) => ({ group: g, label: CAP_GROUP_LABEL[g], reserved: x.groups[g].reserved, pushed_to_next_day: x.groups[g].pushed })),
       cap_reached: !unlimited && x.used >= (x.cap as number),
       campaigns: per.filter((c) => c.allowed || c.used || c.reserved || c.pushed_to_next_day),
       pushed_to_next_day: x.pushed,
@@ -152,6 +213,7 @@ export async function capacityFor(date?: string) {
     remaining: unlimited ? null : sendersOut.reduce((a, b) => a + (b.remaining ?? 0), 0),
     cap_reached: capped.length > 0 && !unlimited && capped.every((x) => x.used >= (x.daily_cap as number)),
     used_unassigned: used.per.get(null) ?? 0,
-    rules: "Capacity is per sender (Asia/Hebron day). used = messages recorded as sent that day from that sender. reserved = approved (Owner send authorization active) tasks scheduled that day, taking the sender's remaining capacity in campaign-priority order (China, then US, then Gulf by default); tasks that do not fit are listed in pushed_to_next_day and are blocked with daily_cap_reached. remaining = cap - used - reserved. A sender with a warm-up schedule has cap 0 before its first step.",
+    priority_order: CAP_GROUPS.map((g, i) => ({ position: i + 1, group: g, label: CAP_GROUP_LABEL[g] })), late_daily_limit: (await seqSettings()).late_daily_limit,
+    rules: "Capacity is per sender (Asia/Hebron day). used = messages recorded as sent that day from that sender. reserved = approved (Owner send authorization active) tasks due that day, taking the sender's remaining capacity in this order: follow-ups inside their window (soonest window end first), overdue follow-ups up to 7 days late (oldest first), the protected first-email minimum (first_email_floor), late backfill items up to late_daily_limit, then the remaining first emails. Campaign priority (China, then US, then Gulf by default) applies inside each group. A follow-up only ever uses its own sender's capacity. Tasks that do not fit are listed in pushed_to_next_day and are blocked with daily_cap_reached. remaining = cap - used - reserved. A sender with a warm-up schedule has cap 0 before its first step.",
   };
 }

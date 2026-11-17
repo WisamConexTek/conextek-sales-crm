@@ -633,4 +633,179 @@ CREATE TABLE IF NOT EXISTS api_idempotency (
   PRIMARY KEY (actor_id, key)
 );
 `,
+  `
+-- Migration 14 (additive): follow-up sequences, enrollments, automatic next-step tasks, soft bounces, reply reclassification,
+-- suppression list, first-email floor, work-plan shortfalls, experiment labels. Nothing existing is changed, moved or deleted.
+CREATE TABLE IF NOT EXISTS sequences (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  key TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL,
+  campaign_id INTEGER REFERENCES campaigns(id),
+  channel TEXT NOT NULL,
+  market TEXT,
+  version INTEGER NOT NULL DEFAULT 1,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('draft','active','retired')),
+  day_mode TEXT NOT NULL DEFAULT 'calendar' CHECK (day_mode IN ('calendar','business')),
+  max_touches INTEGER NOT NULL DEFAULT 3,
+  min_days_between INTEGER NOT NULL DEFAULT 3,
+  rest_days INTEGER NOT NULL DEFAULT 60,
+  end_action TEXT NOT NULL DEFAULT 'rest' CHECK (end_action IN ('rest','close','review','stop')),
+  auto_enroll INTEGER NOT NULL DEFAULT 1,
+  updated_by INTEGER REFERENCES users(id),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+-- Steps are kept per sequence version: a running enrollment keeps the version it started with.
+CREATE TABLE IF NOT EXISTS sequence_steps (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  sequence_id INTEGER NOT NULL REFERENCES sequences(id),
+  version INTEGER NOT NULL DEFAULT 1,
+  position INTEGER NOT NULL,
+  step_code TEXT NOT NULL,
+  anchor TEXT NOT NULL DEFAULT 'first' CHECK (anchor IN ('first','previous','condition')),
+  offset_start INTEGER NOT NULL DEFAULT 0,
+  offset_end INTEGER NOT NULL DEFAULT 0,
+  min_gap_prev INTEGER,
+  thread_reply INTEGER NOT NULL DEFAULT 1,
+  assignee_role TEXT NOT NULL DEFAULT 'writer',
+  active INTEGER NOT NULL DEFAULT 1,
+  UNIQUE (sequence_id, version, position)
+);
+CREATE TABLE IF NOT EXISTS enrollments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  lead_id INTEGER NOT NULL REFERENCES leads(id),
+  contact_id INTEGER REFERENCES contacts(id),
+  sequence_id INTEGER NOT NULL REFERENCES sequences(id),
+  sequence_version INTEGER NOT NULL,
+  campaign_id INTEGER REFERENCES campaigns(id),
+  channel TEXT NOT NULL,
+  market_group TEXT NOT NULL DEFAULT 'us',
+  status TEXT NOT NULL DEFAULT 'running' CHECK (status IN ('running','paused','stopped','completed','resting')),
+  stop_reason TEXT,
+  sender_id INTEGER,
+  thread_subject TEXT,
+  thread_ref TEXT,
+  labels TEXT,
+  steps_sent INTEGER NOT NULL DEFAULT 0,
+  last_step_code TEXT,
+  first_sent_at TEXT,
+  last_sent_at TEXT,
+  anchor_on TEXT,
+  next_due_on TEXT,
+  rest_until TEXT,
+  paused_until TEXT,
+  delay_days INTEGER NOT NULL DEFAULT 0,
+  soft_bounces INTEGER NOT NULL DEFAULT 0,
+  backfilled INTEGER NOT NULL DEFAULT 0,
+  created_by INTEGER REFERENCES users(id),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_enr_lead_channel ON enrollments(lead_id, channel);
+CREATE INDEX IF NOT EXISTS idx_enr_status ON enrollments(status, next_due_on);
+-- UNIQUE (enrollment, position) is what makes task creation idempotent: a step can only ever exist once.
+CREATE TABLE IF NOT EXISTS enrollment_steps (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  enrollment_id INTEGER NOT NULL REFERENCES enrollments(id),
+  position INTEGER NOT NULL,
+  step_code TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'planned' CHECK (status IN ('planned','sent','skipped','cancelled')),
+  due_on TEXT,
+  window_end_on TEXT,
+  late INTEGER NOT NULL DEFAULT 0,
+  task_id INTEGER,
+  sent_at TEXT,
+  activity_id INTEGER,
+  message_version_id INTEGER,
+  subject TEXT,
+  note TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (enrollment_id, position)
+);
+ALTER TABLE tasks ADD COLUMN enrollment_id INTEGER;
+ALTER TABLE tasks ADD COLUMN step_code TEXT;
+ALTER TABLE tasks ADD COLUMN step_number INTEGER;
+ALTER TABLE tasks ADD COLUMN step_total INTEGER;
+ALTER TABLE tasks ADD COLUMN window_end_on TEXT;
+ALTER TABLE tasks ADD COLUMN draft_deadline TEXT;
+ALTER TABLE tasks ADD COLUMN auto_generated INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE tasks ADD COLUMN labels TEXT;
+ALTER TABLE tasks ADD COLUMN sender_id INTEGER;
+ALTER TABLE tasks ADD COLUMN thread_subject TEXT;
+ALTER TABLE tasks ADD COLUMN is_late INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_tasks_enrollment ON tasks(enrollment_id);
+ALTER TABLE message_versions ADD COLUMN labels TEXT;
+ALTER TABLE activities ADD COLUMN labels TEXT;
+ALTER TABLE activities ADD COLUMN step_code TEXT;
+ALTER TABLE activities ADD COLUMN bounce_type TEXT;
+ALTER TABLE activities ADD COLUMN classified_by INTEGER;
+CREATE TABLE IF NOT EXISTS reply_classifications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  activity_id INTEGER NOT NULL REFERENCES activities(id),
+  from_class TEXT,
+  to_class TEXT NOT NULL,
+  reason TEXT,
+  actor_id INTEGER REFERENCES users(id),
+  actor_kind TEXT NOT NULL DEFAULT 'person',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reclass_activity ON reply_classifications(activity_id, id);
+-- Do-not-contact, opt-out and bounce entries, including ones from before the CRM. value = an email address or a domain, lower case.
+CREATE TABLE IF NOT EXISTS suppressions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL CHECK (kind IN ('dnc','opt_out','bounce')),
+  scope TEXT NOT NULL CHECK (scope IN ('email','domain')),
+  value TEXT NOT NULL,
+  occurred_at TEXT,
+  source TEXT,
+  note TEXT,
+  lead_id INTEGER,
+  created_by INTEGER REFERENCES users(id),
+  created_at TEXT NOT NULL,
+  UNIQUE (kind, scope, value)
+);
+CREATE INDEX IF NOT EXISTS idx_suppr_value ON suppressions(value);
+ALTER TABLE senders ADD COLUMN first_email_floor INTEGER NOT NULL DEFAULT 0;
+UPDATE senders SET first_email_floor=5 WHERE id=1;
+CREATE TABLE IF NOT EXISTS plan_shortfalls (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  plan_date TEXT NOT NULL,
+  role TEXT NOT NULL,
+  sender_id INTEGER NOT NULL DEFAULT 0,
+  kind TEXT NOT NULL,
+  message TEXT NOT NULL,
+  gap INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','resolved')),
+  first_seen TEXT NOT NULL,
+  last_seen TEXT NOT NULL,
+  resolved_at TEXT,
+  UNIQUE (plan_date, role, sender_id, kind)
+);
+-- Default sequences (the cadence approved on 15 Nov 2026). The Owner edits them in Settings.
+INSERT OR IGNORE INTO sequences (key,name,campaign_id,channel,rest_days,end_action,created_at,updated_at)
+  SELECT 'canton_fair_email','Canton Fair, email',(SELECT id FROM campaigns WHERE key='canton_fair'),'email',60,'rest',strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE EXISTS (SELECT 1 FROM campaigns WHERE key='canton_fair');
+INSERT OR IGNORE INTO sequences (key,name,campaign_id,channel,rest_days,end_action,created_at,updated_at)
+  SELECT 'us_car_dealers_email','US Car Dealers, email',(SELECT id FROM campaigns WHERE key='us_car_dealers'),'email',60,'rest',strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE EXISTS (SELECT 1 FROM campaigns WHERE key='us_car_dealers');
+INSERT OR IGNORE INTO sequences (key,name,campaign_id,channel,rest_days,end_action,created_at,updated_at)
+  SELECT 'gulf_car_dealers_email','Gulf Car Dealers, email',(SELECT id FROM campaigns WHERE key='gulf_car_dealers'),'email',60,'rest',strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE EXISTS (SELECT 1 FROM campaigns WHERE key='gulf_car_dealers');
+INSERT OR IGNORE INTO sequences (key,name,campaign_id,channel,rest_days,end_action,created_at,updated_at)
+  VALUES ('default_email','Any other campaign, email',NULL,'email',60,'rest',strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+INSERT OR IGNORE INTO sequences (key,name,campaign_id,channel,rest_days,end_action,max_touches,created_at,updated_at)
+  VALUES ('default_linkedin','Any campaign, LinkedIn',NULL,'linkedin',60,'stop',3,strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+INSERT OR IGNORE INTO sequence_steps (sequence_id,version,position,step_code,anchor,offset_start,offset_end,min_gap_prev,thread_reply,assignee_role)
+  SELECT id,1,1,'E1','first',0,0,NULL,0,'writer' FROM sequences WHERE channel='email';
+INSERT OR IGNORE INTO sequence_steps (sequence_id,version,position,step_code,anchor,offset_start,offset_end,min_gap_prev,thread_reply,assignee_role)
+  SELECT id,1,2,'FU1','first',4,7,NULL,1,'writer' FROM sequences WHERE channel='email';
+INSERT OR IGNORE INTO sequence_steps (sequence_id,version,position,step_code,anchor,offset_start,offset_end,min_gap_prev,thread_reply,assignee_role)
+  SELECT id,1,3,'FU2','first',11,14,7,1,'writer' FROM sequences WHERE key='canton_fair_email';
+INSERT OR IGNORE INTO sequence_steps (sequence_id,version,position,step_code,anchor,offset_start,offset_end,min_gap_prev,thread_reply,assignee_role)
+  SELECT id,1,3,'FU2','previous',7,10,NULL,1,'writer' FROM sequences WHERE channel='email' AND key<>'canton_fair_email';
+INSERT OR IGNORE INTO sequence_steps (sequence_id,version,position,step_code,anchor,offset_start,offset_end,min_gap_prev,thread_reply,assignee_role)
+  SELECT id,1,1,'DM1','condition',0,2,NULL,0,'linkedin' FROM sequences WHERE key='default_linkedin';
+INSERT OR IGNORE INTO sequence_steps (sequence_id,version,position,step_code,anchor,offset_start,offset_end,min_gap_prev,thread_reply,assignee_role)
+  SELECT id,1,2,'DM2','previous',5,7,NULL,0,'linkedin' FROM sequences WHERE key='default_linkedin';
+INSERT OR IGNORE INTO sequence_steps (sequence_id,version,position,step_code,anchor,offset_start,offset_end,min_gap_prev,thread_reply,assignee_role)
+  SELECT id,1,3,'DM3','previous',5,7,NULL,0,'linkedin' FROM sequences WHERE key='default_linkedin';
+`,
 ];

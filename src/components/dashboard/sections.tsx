@@ -62,9 +62,9 @@ export function Kpis({ me, sc, period }: PP) {
           sub={`from ${plural(m.reply_leads, "lead")}`} trend={b?.map((x) => x.m.replies)} />
         <KpiCard icon="rate" tint="bg-viz-3/10 text-viz-3" label="Reply rate" value={pct(replyRate)} delta={replyRate != null && prevReply != null && <Delta cur={replyRate} prev={prevReply} fmt={pts} />}
           sub={`${m.reply_leads} of ${plural(m.first_emails, "first email")}`} trend={b?.map((x) => rate(x.m.reply_leads, x.m.first_emails) ?? 0)} />
-        <KpiCard icon="alert" tint={bounce != null && bounce > 0.03 ? "bg-red-50 text-red-600" : "bg-slate-100 text-slate-600"} label="Bounce rate" value={<span className={bounce != null && bounce > 0.03 ? "text-red-600" : ""}>{pct(bounce)}</span>}
+        <KpiCard icon="alert" tint={bounce != null && bounce > 0.02 ? "bg-red-50 text-red-600" : "bg-slate-100 text-slate-600"} label="Bounce rate" value={<span className={bounce != null && bounce > 0.02 ? "text-red-600" : ""}>{pct(bounce)}</span>}
           delta={bounce != null && prevBounce != null && <Delta cur={bounce} prev={prevBounce} goodUp={false} fmt={pts} />}
-          sub={`${m.first_email_bounces} of ${m.first_emails} · limit 3%`} trend={b?.map((x) => rate(x.m.first_email_bounces, x.m.first_emails) ?? 0)} />
+          sub={`${m.first_email_bounces} of ${m.first_emails} · limit 2%`} trend={b?.map((x) => rate(x.m.first_email_bounces, x.m.first_emails) ?? 0)} />
         <KpiCard icon="calendar" tint="bg-brand-50 text-brand-700" label="Meetings" value={m.meetings} delta={pm && <Delta cur={m.meetings} prev={pm.meetings} />}
           sub={`${m.won} won · ${m.lost} lost`} trend={b?.map((x) => x.m.meetings)} />
         <KpiCard icon="userPlus" tint="bg-brand-50 text-brand-700" label="Leads added" value={m.leads_added} delta={pm && <Delta cur={m.leads_added} prev={pm.leads_added} />}
@@ -213,7 +213,7 @@ export function Sending({ me, className = "" }: P & { className?: string }) {
         {s.senders.length === 0 ? <Quiet>No senders are set up.</Quiet> : (
           <ul className="space-y-4">
             {s.senders.map((x) => {
-              const hot = x.bounceRate7 !== null && x.bounceRate7 > 0.03;
+              const hot = x.bounceRate7 !== null && x.bounceRate7 > 0.02;
               return (
                 <li key={x.id} className="flex items-center gap-3">
                   <Ring used={x.used} reserved={x.reserved} cap={x.unlimited ? null : (x.cap as number)} tone={x.status === "paused" || x.status === "inactive" ? "off" : "ok"} />
@@ -283,7 +283,7 @@ export function Campaigns({ me, sc, period, className = "" }: PP & { className?:
               </tr></thead>
               <tbody className="divide-y divide-slate-100 tabular-nums">
                 {c.map((x) => {
-                  const hot = x.firstBounceRate !== null && x.firstBounceRate > 0.03;
+                  const hot = x.firstBounceRate !== null && x.firstBounceRate > 0.02;
                   return (
                     <tr key={x.id} className="hover:bg-slate-50">
                       <td className="px-2 py-2.5"><Link href={`/leads?campaign=${x.id}`} className="font-medium">{x.name}</Link>{x.status !== "active" && <> <Badge tone={x.status === "paused" ? "amber" : "gray"}>{x.status}</Badge></>}</td>

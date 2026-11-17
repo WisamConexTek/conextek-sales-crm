@@ -8,13 +8,21 @@ import { audit, parse, optText } from "./common";
  * Every message version and every recorded send names its sender. Caps, warm-up and the deliverability guard are per sender.
  */
 export const DEFAULT_SENDER_ID = 1;
-export const BOUNCE_LIMIT = 0.03;
+/** Default pause threshold for the 7-day bounce rate. The Owner can change it (PATCH /settings/capacity {bounce_limit}). */
+export const BOUNCE_LIMIT = 0.02;
+export async function bounceLimit(): Promise<number> {
+  const r = await one("SELECT value FROM app_settings WHERE key='bounce_limit'");
+  const n = r?.value == null ? NaN : Number(r.value);
+  return n > 0 && n < 1 ? n : BOUNCE_LIMIT;
+}
 export const LANGUAGES = ["en", "ar", "zh"] as const;
 
 export type Sender = {
   id: number; email: string; display_name: string; title: string | null; domain: string;
   languages: string[]; campaign_ids: number[] | null; daily_cap: number | null; active: boolean;
   paused_at: string | null; paused_by: number | null; pause_reason: string | null; pause_kind: "auto" | "manual" | null; resumed_at: string | null;
+  /** Protected minimum of first-email slots per day, so a follow-up backlog never stops new outreach. Never above the day's cap. */
+  first_email_floor: number;
   created_at: string; updated_at: string;
 };
 export type Step = { from_date: string; daily_cap: number };
@@ -29,7 +37,7 @@ export function toSender(r: Row): Sender {
     languages: ((jsonArr(r.languages) ?? ["en"]) as string[]).map(String), campaign_ids: jsonArr(r.campaign_ids) === null ? null : (jsonArr(r.campaign_ids) as unknown[]).map(Number),
     daily_cap: r.daily_cap == null ? null : Number(r.daily_cap), active: !!r.active,
     paused_at: (r.paused_at as string) ?? null, paused_by: (r.paused_by as number) ?? null, pause_reason: (r.pause_reason as string) ?? null,
-    pause_kind: (r.pause_kind as "auto" | "manual") ?? null, resumed_at: (r.resumed_at as string) ?? null,
+    pause_kind: (r.pause_kind as "auto" | "manual") ?? null, resumed_at: (r.resumed_at as string) ?? null, first_email_floor: Number(r.first_email_floor ?? 0),
     created_at: r.created_at as string, updated_at: r.updated_at as string,
   };
 }
@@ -145,6 +153,12 @@ export async function updateSender(actor: Actor, id: number, input: unknown) {
   if (d.campaign_ids !== undefined) set("campaign_ids", d.campaign_ids ? JSON.stringify(d.campaign_ids) : null);
   if (d.daily_cap !== undefined) set("daily_cap", d.daily_cap);
   if (d.active !== undefined) set("active", d.active ? 1 : 0);
+  const floor = (input as { first_email_floor?: unknown } | null)?.first_email_floor;
+  if (floor !== undefined && floor !== null && floor !== "") {
+    const n = Number(floor);
+    if (!Number.isInteger(n) || n < 0 || n > 500) throw new HttpError(400, "first_email_floor: a whole number from 0 to 500.");
+    set("first_email_floor", n);
+  }
   if (!sets.length) throw new HttpError(400, "Nothing to change.");
   set("updated_at", now());
   await run(`UPDATE senders SET ${sets.join(",")} WHERE id=?`, [...args, id]);
@@ -245,7 +259,7 @@ export async function senderStats(from?: Map<number, string>): Promise<Map<numbe
 }
 
 /**
- * The guard: more than 3% bounces in the last 7 days, or any spam complaint, pauses cold sends for that sender until the Owner resumes it.
+ * The guard: more than 2% bounces in the last 7 days (Owner-editable), or any spam complaint, pauses cold sends for that sender until the Owner resumes it.
  * After a resume only events from the resume onwards count, so one Owner decision is not undone by the same old bounces.
  */
 export async function evaluateDeliverability(actor: Actor, senderId: number): Promise<{ paused: boolean; reason?: string }> {
@@ -254,8 +268,9 @@ export async function evaluateDeliverability(actor: Actor, senderId: number): Pr
   if (!s || s.paused_at) return { paused: !!s?.paused_at };
   const stats = (await senderStats(s.resumed_at ? new Map([[s.id, s.resumed_at]]) : undefined)).get(s.id)!;
   let why: string | null = null;
+  const limit = await bounceLimit();
   if (stats.complaints > 0) why = `${stats.complaints} spam complaint${stats.complaints > 1 ? "s" : ""} in the last 7 days`;
-  else if (stats.bounce_rate !== null && stats.bounce_rate > BOUNCE_LIMIT) why = `7-day bounce rate ${(stats.bounce_rate * 100).toFixed(1)}% (${stats.bounces} of ${stats.sent} sent) is above ${BOUNCE_LIMIT * 100}%`;
+  else if (stats.bounce_rate !== null && stats.bounce_rate > limit) why = `7-day bounce rate ${(stats.bounce_rate * 100).toFixed(1)}% (${stats.bounces} of ${stats.sent} sent) is above ${+(limit * 100).toFixed(2)}%`;
   if (!why) return { paused: false };
   const t = now();
   const res = await run("UPDATE senders SET paused_at=?, paused_by=NULL, pause_reason=?, pause_kind='auto', updated_at=? WHERE id=? AND paused_at IS NULL", [t, why, t, s.id]);

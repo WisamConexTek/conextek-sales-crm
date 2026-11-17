@@ -7,6 +7,8 @@ import { Card, PageHeader, Stat } from "@/components/ui";
 import { pct } from "@/lib/format";
 import { todayYmd } from "@/lib/db";
 import { q, sget, snum, type SP } from "@/lib/view";
+import { SortTh } from "@/components/Sort";
+import { parseSort, sortRows, type SortValue } from "@/lib/sort";
 
 const COLS: [keyof Metrics | "fb" | "fub", string][] = [
   ["leads_added", "Leads added"], ["first_emails", "First emails"], ["fb", "First-email bounce"], ["follow_ups", "Follow-ups"], ["fub", "Follow-up bounce"],
@@ -17,6 +19,18 @@ const cell = (m: Metrics, k: keyof Metrics | "fb" | "fub") =>
   k === "fb" ? (m.first_emails ? `${pct(rate(m.first_email_bounces, m.first_emails))} (${m.first_email_bounces}/${m.first_emails})` : "—")
   : k === "fub" ? (m.follow_ups ? `${pct(rate(m.follow_up_bounces, m.follow_ups))} (${m.follow_up_bounces}/${m.follow_ups})` : "—")
   : m[k];
+/** The number a column sorts by: a rate for the bounce columns, the count for the rest. */
+const num = (m: Metrics, k: keyof Metrics | "fb" | "fub"): SortValue => (k === "fb" ? rate(m.first_email_bounces, m.first_emails) : k === "fub" ? rate(m.follow_up_bounces, m.follow_ups) : (m[k] as number));
+type Sp = Record<string, string | string[] | undefined>;
+/** Sortable headers and sorted rows for one metrics table. Each table keeps its own sort in the URL (se, ss, sb). */
+function sortable<T>(sp: Sp, param: string, first: [string, (r: T) => SortValue], cols: [keyof Metrics | "fb" | "fub", string][], getM: (r: T) => Metrics, rows: T[], extra?: [string, string, (r: T) => SortValue]) {
+  const spec: Record<string, (r: T) => SortValue> = { name: first[1], ...Object.fromEntries(cols.map(([k]) => [k as string, (r: T) => num(getM(r), k)])), ...(extra ? { [extra[0]]: extra[2] } : {}) };
+  const ps = parseSort(sget(sp, param), Object.keys(spec));
+  const flat = Object.fromEntries(Object.entries(sp).map(([k, v]) => [k, Array.isArray(v) ? v[0] : v]));
+  const href = (v?: string) => `/reports${q({ ...flat, [param]: v })}`;
+  const head = (<tr><SortTh label={first[0]} field="name" sort={ps.applied} href={href} />{cols.map(([k, l]) => <SortTh key={l} label={l} field={k as string} sort={ps.applied} href={href} />)}{extra ? <SortTh label={extra[1]} field={extra[0]} sort={ps.applied} href={href} /> : null}</tr>);
+  return { head, rows: sortRows(rows, spec, ps) };
+}
 
 export default async function Reports({ searchParams }: { searchParams: SP }) {
   const me = await requireUser();
@@ -71,9 +85,9 @@ export default async function Reports({ searchParams }: { searchParams: SP }) {
         <Card title={`By employee — ${r.current.label}`}>
           <div className="overflow-x-auto">
             <table className="w-full min-w-[900px] text-sm">
-              <thead className="border-b border-slate-200"><tr><th className="th">Employee</th>{COLS.map(([, l]) => <th key={l} className="th">{l}</th>)}<th className="th">Overdue now</th></tr></thead>
+              <thead className="border-b border-slate-200">{sortable(sp, "se", ["Employee", (e: (typeof r.byEmployee)[number]) => e.user.name], COLS, (e) => e.m, r.byEmployee, ["overdue", "Overdue now", (e) => (e as { overdue?: number }).overdue ?? null]).head}</thead>
               <tbody className="divide-y divide-slate-100">
-                {r.byEmployee.map((e) => (
+                {sortable(sp, "se", ["Employee", (e: (typeof r.byEmployee)[number]) => e.user.name], COLS, (e) => e.m, r.byEmployee, ["overdue", "Overdue now", (e) => (e as { overdue?: number }).overdue ?? null]).rows.map((e) => (
                   <tr key={e.user.id}><td className="td font-medium">{e.user.name}{!e.user.active && <span className="text-xs text-slate-400"> (disabled)</span>}</td>
                     {COLS.map(([k]) => <td key={k} className="td whitespace-nowrap">{cell(e.m, k)}</td>)}
                     <td className={`td ${e.overdue ? "font-medium text-red-600" : ""}`}>{e.overdue}</td></tr>
@@ -89,9 +103,9 @@ export default async function Reports({ searchParams }: { searchParams: SP }) {
         <Card title={`By sender${r.sender ? " (filtered)" : ""}${` — ${r.current.label}`}`}>
           <div className="overflow-x-auto">
             <table className="w-full min-w-[700px] text-sm">
-              <thead className="border-b border-slate-200"><tr><th className="th">Sender</th>{SCOLS.map(([, l]) => <th key={l} className="th">{l}</th>)}</tr></thead>
+              <thead className="border-b border-slate-200">{sortable(sp, "ss", ["Sender", (x: (typeof r.bySender)[number]) => x.name], SCOLS, (x) => x.m, r.bySender).head}</thead>
               <tbody className="divide-y divide-slate-100">
-                {r.bySender.map((x) => <tr key={x.sender_id}><td className="td font-medium">{x.name}<div className="text-xs font-normal text-slate-500">{x.email}</div></td>{SCOLS.map(([k]) => <td key={k} className="td whitespace-nowrap">{cell(x.m, k)}</td>)}</tr>)}
+                {sortable(sp, "ss", ["Sender", (x: (typeof r.bySender)[number]) => x.name], SCOLS, (x) => x.m, r.bySender).rows.map((x) => <tr key={x.sender_id}><td className="td font-medium">{x.name}<div className="text-xs font-normal text-slate-500">{x.email}</div></td>{SCOLS.map(([k]) => <td key={k} className="td whitespace-nowrap">{cell(x.m, k)}</td>)}</tr>)}
               </tbody>
             </table>
           </div>
@@ -102,9 +116,9 @@ export default async function Reports({ searchParams }: { searchParams: SP }) {
       <Card title={`${title} breakdown`}>
         <div className="overflow-x-auto">
           <table className="w-full min-w-[900px] text-sm">
-            <thead className="border-b border-slate-200"><tr><th className="th">Period</th>{COLS.map(([, l]) => <th key={l} className="th">{l}</th>)}</tr></thead>
+            <thead className="border-b border-slate-200">{sortable(sp, "sb", ["Period", (b: (typeof r.buckets)[number]) => b.start], COLS, (b) => b.m, [...r.buckets].reverse()).head}</thead>
             <tbody className="divide-y divide-slate-100">
-              {[...r.buckets].reverse().map((b) => (
+              {sortable(sp, "sb", ["Period", (b: (typeof r.buckets)[number]) => b.start], COLS, (b) => b.m, [...r.buckets].reverse()).rows.map((b) => (
                 <tr key={b.start} className={b.start === r.current.start ? "bg-brand-50/50" : ""}>
                   <td className="td whitespace-nowrap font-medium"><Link href={`/reports${q({ ...base, at: b.start })}`}>{b.label}</Link></td>
                   {COLS.map(([k]) => <td key={k} className="td whitespace-nowrap">{cell(b.m, k)}</td>)}
@@ -181,9 +195,9 @@ async function RangeView({ me, sp }: { me: Awaited<ReturnType<typeof requireUser
         <Card title="By employee">
           <div className="overflow-x-auto">
             <table className="w-full min-w-[900px] text-sm">
-              <thead className="border-b border-slate-200"><tr><th className="th">Employee</th>{COLS.map(([, l]) => <th key={l} className="th">{l}</th>)}</tr></thead>
+              <thead className="border-b border-slate-200">{sortable(sp, "se", ["Employee", (e: (typeof r.byEmployee)[number]) => e.user.name], COLS, (e) => e.m, r.byEmployee).head}</thead>
               <tbody className="divide-y divide-slate-100">
-                {r.byEmployee.map((e) => (
+                {sortable(sp, "se", ["Employee", (e: (typeof r.byEmployee)[number]) => e.user.name], COLS, (e) => e.m, r.byEmployee, ["overdue", "Overdue now", (e) => (e as { overdue?: number }).overdue ?? null]).rows.map((e) => (
                   <tr key={e.user.id}><td className="td font-medium">{e.user.name}{!e.user.active && <span className="text-xs text-slate-400"> (disabled)</span>}</td>{COLS.map(([k]) => <td key={k} className="td whitespace-nowrap">{cell(e.m, k)}</td>)}</tr>
                 ))}
                 <tr className="bg-slate-50 font-semibold"><td className="td">Total</td>{COLS.map(([k]) => <td key={k} className="td whitespace-nowrap">{cell(t, k)}</td>)}</tr>
@@ -196,9 +210,9 @@ async function RangeView({ me, sp }: { me: Awaited<ReturnType<typeof requireUser
         <Card title={`By sender${r.sender ? " (filtered)" : ""}${""}`}>
           <div className="overflow-x-auto">
             <table className="w-full min-w-[700px] text-sm">
-              <thead className="border-b border-slate-200"><tr><th className="th">Sender</th>{SCOLS.map(([, l]) => <th key={l} className="th">{l}</th>)}</tr></thead>
+              <thead className="border-b border-slate-200">{sortable(sp, "ss", ["Sender", (x: (typeof r.bySender)[number]) => x.name], SCOLS, (x) => x.m, r.bySender).head}</thead>
               <tbody className="divide-y divide-slate-100">
-                {r.bySender.map((x) => <tr key={x.sender_id}><td className="td font-medium">{x.name}<div className="text-xs font-normal text-slate-500">{x.email}</div></td>{SCOLS.map(([k]) => <td key={k} className="td whitespace-nowrap">{cell(x.m, k)}</td>)}</tr>)}
+                {sortable(sp, "ss", ["Sender", (x: (typeof r.bySender)[number]) => x.name], SCOLS, (x) => x.m, r.bySender).rows.map((x) => <tr key={x.sender_id}><td className="td font-medium">{x.name}<div className="text-xs font-normal text-slate-500">{x.email}</div></td>{SCOLS.map(([k]) => <td key={k} className="td whitespace-nowrap">{cell(x.m, k)}</td>)}</tr>)}
               </tbody>
             </table>
           </div>
@@ -209,9 +223,9 @@ async function RangeView({ me, sp }: { me: Awaited<ReturnType<typeof requireUser
       <Card title={`${brk} breakdown (dated records only)`}>
         <div className="overflow-x-auto">
           <table className="w-full min-w-[900px] text-sm">
-            <thead className="border-b border-slate-200"><tr><th className="th">Period</th>{COLS.map(([, l]) => <th key={l} className="th">{l}</th>)}</tr></thead>
+            <thead className="border-b border-slate-200">{sortable(sp, "sb", ["Period", (b: (typeof r.buckets)[number]) => b.start], COLS, (b) => b.m, [...r.buckets].reverse()).head}</thead>
             <tbody className="divide-y divide-slate-100">
-              {[...r.buckets].reverse().map((b) => (
+              {sortable(sp, "sb", ["Period", (b: (typeof r.buckets)[number]) => b.start], COLS, (b) => b.m, [...r.buckets].reverse()).rows.map((b) => (
                 <tr key={b.start}><td className="td whitespace-nowrap font-medium">{b.label}</td>{COLS.map(([k]) => <td key={k} className="td whitespace-nowrap">{cell(b.m, k)}</td>)}</tr>
               ))}
               {r.unknown && <tr className="bg-amber-50/60"><td className="td font-medium">Date unknown</td>{COLS.map(([k]) => <td key={k} className="td whitespace-nowrap">{cell(r.unknown!, k)}</td>)}</tr>}

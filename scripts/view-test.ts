@@ -34,7 +34,8 @@ async function main() {
 
   console.log("Today / Tomorrow work view");
   const mk = (title: string, extra: Record<string, unknown>) => T.createTask(chief, { title, lead_id: lead, assignee_id: emp.id, campaign_id: us, channel: "email", ...extra });
-  const future = new Date(Date.now() + 3 * 3600000).toISOString();
+  // a few minutes ahead, so it is still today when the suite runs late in the evening
+  const future = new Date(Date.now() + 4 * 60000).toISOString();
   const past = new Date(Date.now() - 3 * 3600000).toISOString();
   const tReady = await mk("ready one", { scheduled_at: future, prep_status: "ready_for_execution" });
   const tPlanned = await mk("planned one", { scheduled_at: future, prep_status: "draft_needed" });

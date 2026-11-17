@@ -12,6 +12,8 @@ import * as Tasks from "@/lib/service/tasks";
 import * as Campaigns from "@/lib/service/campaigns";
 import * as Sends from "@/lib/service/sends";
 import * as Senders from "@/lib/service/senders";
+import * as Sequences from "@/lib/service/sequences";
+import * as Capacity from "@/lib/service/capacity";
 import { recordActivity } from "@/lib/service/activities";
 import { prepareImport, commitImport } from "@/lib/service/csv";
 import { correctLeadDates, type DateFixRow } from "@/lib/service/history";
@@ -390,4 +392,48 @@ export async function pauseSenderAction(fd: FD) {
 export async function resumeSenderAction(fd: FD) {
   const a = await requireUser();
   await guard(fd, async () => { await Senders.resumeSender(a, Number(s(fd, "id")), s(fd, "reason")); return "Sender resumed."; }, safeBack(fd, "/settings?tab=senders"));
+}
+
+/* ---------- follow-up sequences ---------- */
+export async function saveSequenceAction(fd: FD) {
+  await guard(fd, async () => {
+    const me = await requireUser();
+    const count = n(fd, "step_count");
+    const steps = Array.from({ length: count }, (_, i) => ({
+      step_code: s(fd, `code_${i}`), anchor: s(fd, `anchor_${i}`) || "first", offset_start: s(fd, `start_${i}`) || "0", offset_end: s(fd, `end_${i}`) || s(fd, `start_${i}`) || "0",
+      min_gap_prev: s(fd, `gap_${i}`), assignee_role: s(fd, `role_${i}`) || undefined, active: fd.get(`active_${i}`) === "on",
+    }));
+    const r = (await Sequences.updateSequence(me, n(fd, "id"), { steps, rest_days: s(fd, "rest_days") || undefined, day_mode: s(fd, "day_mode") || undefined, status: s(fd, "status") || undefined, auto_enroll: fd.get("auto_enroll") === "on", reason: s(fd, "reason") || undefined })) as { note?: string };
+    return r.note ?? "Sequence saved.";
+  }, "/settings/sequences");
+}
+export async function saveSequenceSettingsAction(fd: FD) {
+  await guard(fd, async () => {
+    const me = await requireUser();
+    const days = (k: string) => fd.getAll(k).map((x) => Number(x));
+    const roles = Object.fromEntries(["writer", "hunter", "inbox", "linkedin", "chief", "compliance"].map((r) => [r, s(fd, `role_${r}`) ? Number(s(fd, `role_${r}`)) : null]));
+    await Sequences.setSeqSettings(me, {
+      weekends: { china: days("weekend_china"), us: days("weekend_us"), gulf: days("weekend_gulf") }, roles,
+      late_daily_limit: s(fd, "late_daily_limit"), plan_buffer: Number(s(fd, "plan_buffer_pct")) / 100, draft_deadline_time: s(fd, "draft_deadline_time"), reply_sla_hours: s(fd, "reply_sla_hours"),
+      cutoffs: { hunter: s(fd, "cut_hunter"), writer: s(fd, "cut_writer"), chief: s(fd, "cut_chief"), owner: s(fd, "cut_owner") },
+    });
+    for (const [k, v] of fd.entries()) if (k.startsWith("floor_")) await Senders.updateSender(me, Number(k.slice(6)), { first_email_floor: String(v) });
+    if (s(fd, "bounce_limit_pct")) await Capacity.setCapacitySettings(me, { bounce_limit: Number(s(fd, "bounce_limit_pct")) / 100 });
+    return "Follow-up settings saved.";
+  }, "/settings/sequences");
+}
+export async function backfillAction(fd: FD) {
+  await guard(fd, async () => {
+    const me = await requireUser();
+    const r = (await Sequences.backfill(me, { dry_run: false, campaign_id: s(fd, "campaign_id") ? n(fd, "campaign_id") : null, limit: 40 })) as { committed: number; remaining: number; tasks_created: number };
+    return `${r.committed} lead${r.committed === 1 ? "" : "s"} enrolled, ${r.tasks_created} task${r.tasks_created === 1 ? "" : "s"} created. ${r.remaining ? `${r.remaining} still to do: press the button again.` : "The backfill is complete."}`;
+  }, "/settings/sequences");
+}
+export async function controlSequenceAction(fd: FD) {
+  await guard(fd, async () => {
+    const me = await requireUser();
+    await Leads.assertLeadAccess(me, n(fd, "lead_id"));
+    await Sequences.controlSequence(me, n(fd, "lead_id"), { action: s(fd, "action"), reason: s(fd, "reason"), channel: s(fd, "channel") || undefined, resume_on: s(fd, "resume_on") || undefined });
+    return `Sequence ${s(fd, "action") === "stop" ? "stopped" : s(fd, "action") === "pause" ? "paused" : "resumed"}.`;
+  });
 }

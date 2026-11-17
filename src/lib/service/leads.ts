@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { InValue } from "@libsql/client";
-import { all, one, run, now, tx, type Row } from "../db";
+import { all, one, run, now, tx, localMidnight, addDays, todayYmd, type Row } from "../db";
 import { HttpError, can, requirePerm, isManager, type Actor } from "../auth";
 import { liveTasks } from "./taskview";
 import { audit, parse, optText, reqText, optDate, optBool, domainOf, assertListKey, optInt, parseEventDate, eventDateText, dateProblem, type EventDate } from "./common";
@@ -381,7 +381,11 @@ export async function getContact(actor: Actor, contactId: number) {
  * so a number on the dashboard always opens exactly the leads it counted.
  */
 export { ATTENTION, type Attention } from "../constants";
-import { ATTENTION, type Attention } from "../constants";
+import { ATTENTION, STEP_LONG, type Attention } from "../constants";
+import { parseSort } from "../sort";
+import { displayType } from "./tasklist";
+import { leadSequenceInfo, type LeadSeq } from "./sequences";
+import { fmtYmd, toLocalInput } from "../format";
 type SqlPart = { sql: string; args: InValue[] };
 
 /** A real lead whose latest reply (last `days` days) is newer than our latest message, still open and not opted out. */
@@ -415,6 +419,10 @@ export type Outreach = (typeof OUTREACH)[number];
 export const TASK_FILTER = ["open", "overdue", "none"] as const;
 export const ACTIVE_FILTER = ["7", "30", "90", "stale30", "stale90"] as const;
 export const CONTACT_FILTER = ["has_email", "no_email"] as const;
+export const NEXT_STEP_FILTER = ["due_today", "overdue", "due_week", "missing"] as const;
+export const SEQ_STATUS_FILTER = ["running", "paused", "stopped_reply", "stopped_bounce", "stopped", "completed", "resting", "none"] as const;
+export const LEAD_SORTS = ["company", "stage", "market", "country", "owner_name", "id", "created_at", "updated_at", "lead_date", "last_activity_at", "next_due", "first_email_sent_at", "last_email_sent_at", "emails_sent", "source", "campaign"] as const;
+const LEAD_SORT_ALIASES: Record<string, string> = { oldest: "last_activity_at", due: "next_due", "-due": "-next_due", next_due_at: "next_due", "-next_due_at": "-next_due", added: "-lead_date", newest: "-lead_date", owner: "owner_name", "-owner": "-owner_name", last_activity: "last_activity_at", "-last_activity": "-last_activity_at", name: "company", "-name": "-company" };
 export type LeadFilters = {
   q?: string; owner?: number | "none"; market?: string; segment?: string; stage?: string; channel?: string; testOnly?: boolean;
   includeDemo?: boolean; includeHistorical?: boolean; page?: number; pageSize?: number; sort?: string;
@@ -432,6 +440,16 @@ export type LeadFilters = {
   /** Activity in the last 7 / 30 / 90 days, or none for 30+ / 90+ days. */
   active?: (typeof ACTIVE_FILTER)[number];
   contact?: (typeof CONTACT_FILTER)[number];
+  /** The lead's next step: due today, overdue, due this week, or missing altogether. */
+  nextStep?: (typeof NEXT_STEP_FILTER)[number];
+  sequenceStatus?: (typeof SEQ_STATUS_FILTER)[number];
+  /** The last sequence step that was sent: E1, FU1, FU2 ... */
+  sequenceStep?: string;
+  sender?: number;
+  /** Experiment label, whole ("MI-A") or by prefix ("MI"). */
+  label?: string;
+  /** Filter values that were not understood (reported back instead of being ignored silently). */
+  warnings?: string[];
 };
 
 const oneOf = <T extends readonly string[]>(list: T, v: string | null | undefined): T[number] | undefined => (v && (list as readonly string[]).includes(v) ? (v as T[number]) : undefined);
@@ -440,13 +458,21 @@ const ymdOk = (v: string | null | undefined) => (v && /^\d{4}-\d{2}-\d{2}$/.test
 /** The lead filters as they arrive in a URL (the Leads page, the CSV export and the API all read them the same way). */
 export function leadFiltersFrom(get: (key: string) => string | null | undefined): LeadFilters {
   const str = (k: string) => get(k)?.trim() || undefined;
+  const warnings: string[] = [];
+  const oneOf = <T extends readonly string[]>(list: T, v: string | null | undefined, k = ""): T[number] | undefined => {
+    if (v && !(list as readonly string[]).includes(v)) warnings.push(`${k}: "${v}" is not one of ${list.join(", ")}; it was ignored.`);
+    return v && (list as readonly string[]).includes(v) ? (v as T[number]) : undefined;
+  };
+  const ymdOk = (v: string | null | undefined, k = "") => { if (v && !/^\d{4}-\d{2}-\d{2}$/.test(v)) warnings.push(`${k}: use YYYY-MM-DD; "${v}" was ignored.`); return v && /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : undefined; };
   const id = (k: string): number | "none" | undefined => { const v = get(k); return v === "none" ? "none" : v && /^\d+$/.test(v) ? Number(v) : undefined; };
   return {
     q: str("q"), owner: id("owner"), market: str("market"), segment: str("segment"), stage: str("stage"), channel: str("channel"), sort: str("sort"),
-    campaign: id("campaign") ?? id("campaign_id"), attention: oneOf(ATTENTION, get("attention")),
+    campaign: id("campaign") ?? id("campaign_id"), attention: oneOf(ATTENTION, get("attention"), "attention"),
     industry: str("industry"), source: str("source"), service: str("service"), language: str("language"), country: str("country"),
-    outreach: oneOf(OUTREACH, get("outreach")), task: oneOf(TASK_FILTER, get("task")), active: oneOf(ACTIVE_FILTER, get("active")), contact: oneOf(CONTACT_FILTER, get("contact")),
-    addedFrom: ymdOk(get("added_from")), addedTo: ymdOk(get("added_to")),
+    outreach: oneOf(OUTREACH, get("outreach"), "outreach"), task: oneOf(TASK_FILTER, get("task"), "task"), active: oneOf(ACTIVE_FILTER, get("active"), "active"), contact: oneOf(CONTACT_FILTER, get("contact"), "contact"),
+    addedFrom: ymdOk(get("added_from"), "added_from"), addedTo: ymdOk(get("added_to"), "added_to"),
+    nextStep: oneOf(NEXT_STEP_FILTER, get("next_step"), "next_step"), sequenceStatus: oneOf(SEQ_STATUS_FILTER, get("sequence_status"), "sequence_status"),
+    sequenceStep: str("sequence_step")?.toUpperCase(), sender: typeof id("sender") === "number" ? (id("sender") as number) : undefined, label: str("label"), warnings,
   };
 }
 
@@ -481,7 +507,11 @@ function leadWhere(actor: Actor, f: LeadFilters, skip: { stage?: boolean } = {})
     args.push(...a.args);
   }
   if (f.outreach === "not_contacted") where.push(`NOT ${SENT()}`);
-  if (f.outreach === "no_reply") where.push(`${SENT()} AND NOT ${REPLIED}`);
+  // Contacted and still waiting: no reply, and still contactable (not opted out, not suppressed, not historical-only, at least one address that did not bounce).
+  if (f.outreach === "no_reply") where.push(`${SENT()} AND NOT ${REPLIED} AND l.historical_only=0
+    AND NOT EXISTS (SELECT 1 FROM contacts c WHERE c.lead_id=l.id AND c.email_status='opted_out')
+    AND NOT (EXISTS (SELECT 1 FROM contacts c WHERE c.lead_id=l.id) AND NOT EXISTS (SELECT 1 FROM contacts c WHERE c.lead_id=l.id AND c.email_status<>'bounced'))
+    AND NOT EXISTS (SELECT 1 FROM suppressions sp WHERE sp.kind IN ('dnc','opt_out') AND ((sp.scope='domain' AND sp.value=l.domain) OR (sp.scope='email' AND sp.value IN (SELECT lower(c.email) FROM contacts c WHERE c.lead_id=l.id))))`);
   if (f.outreach === "replied") where.push(REPLIED);
   if (f.outreach === "bounced") where.push("(EXISTS (SELECT 1 FROM activities a WHERE a.lead_id=l.id AND a.outcome='bounced') OR EXISTS (SELECT 1 FROM contacts c WHERE c.lead_id=l.id AND c.email_status='bounced'))");
   if (f.outreach === "opted_out") where.push("EXISTS (SELECT 1 FROM contacts c WHERE c.lead_id=l.id AND c.email_status='opted_out')");
@@ -496,6 +526,22 @@ function leadWhere(actor: Actor, f: LeadFilters, skip: { stage?: boolean } = {})
     where.push(`COALESCE(l.last_activity_at,l.created_at)${stale ? "<" : ">="}?`);
     args.push(cut);
   }
+  const NEXT_AT = `(SELECT MIN(COALESCE(t.scheduled_at,t.due_at)) FROM tasks t WHERE t.lead_id=l.id AND ${OPEN_TASK})`;
+  if (f.nextStep === "overdue") (where.push(`${NEXT_AT}<?`), args.push(now()));
+  if (f.nextStep === "due_today") (where.push(`${NEXT_AT}>=? AND ${NEXT_AT}<?`), args.push(localMidnight(todayYmd()).toISOString(), localMidnight(addDays(todayYmd(), 1)).toISOString()));
+  if (f.nextStep === "due_week") { let d = todayYmd(); while (new Date(`${d}T00:00:00Z`).getUTCDay() !== 6) d = addDays(d, 1); where.push(`${NEXT_AT}<?`); args.push(localMidnight(addDays(d, 1)).toISOString()); }
+  // An active, contacted lead with nothing planned: no open task and no sequence that is resting or paused.
+  if (f.nextStep === "missing") where.push(`l.historical_only=0 AND ${SENT()} AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.lead_id=l.id AND ${OPEN_TASK})
+    AND NOT EXISTS (SELECT 1 FROM enrollments e WHERE e.lead_id=l.id AND e.status IN ('resting','paused'))
+    AND NOT EXISTS (SELECT 1 FROM lists s WHERE s.kind='stage' AND s.key=l.stage AND s.flag IN ('won','lost','closed'))
+    AND NOT EXISTS (SELECT 1 FROM contacts c WHERE c.lead_id=l.id AND c.email_status='opted_out')`);
+  if (f.sequenceStatus === "none") where.push("NOT EXISTS (SELECT 1 FROM enrollments e WHERE e.lead_id=l.id)");
+  else if (f.sequenceStatus === "stopped_reply") where.push("EXISTS (SELECT 1 FROM enrollments e WHERE e.lead_id=l.id AND e.status='stopped' AND e.stop_reason LIKE 'reply%')");
+  else if (f.sequenceStatus === "stopped_bounce") where.push("EXISTS (SELECT 1 FROM enrollments e WHERE e.lead_id=l.id AND e.status='stopped' AND (e.stop_reason LIKE '%bounce%' OR e.stop_reason LIKE '%opt%'))");
+  else if (f.sequenceStatus) (where.push("EXISTS (SELECT 1 FROM enrollments e WHERE e.lead_id=l.id AND e.status=?)"), args.push(f.sequenceStatus));
+  if (f.sequenceStep) (where.push("EXISTS (SELECT 1 FROM enrollments e WHERE e.lead_id=l.id AND e.last_step_code=?)"), args.push(f.sequenceStep));
+  if (f.sender) (where.push("(EXISTS (SELECT 1 FROM enrollments e WHERE e.lead_id=l.id AND e.sender_id=?) OR EXISTS (SELECT 1 FROM activities a WHERE a.lead_id=l.id AND a.type='message' AND a.outcome='sent' AND COALESCE(a.sender_id,1)=?))"), args.push(f.sender, f.sender));
+  if (f.label) (where.push("EXISTS (SELECT 1 FROM enrollments e WHERE e.lead_id=l.id AND e.labels LIKE ?)"), args.push(`%"${f.label.replace(/[%_"]/g, "")}%`));
   if (f.contact === "has_email") where.push("EXISTS (SELECT 1 FROM contacts c WHERE c.lead_id=l.id AND c.email IS NOT NULL AND c.email<>'')");
   if (f.contact === "no_email") where.push("NOT EXISTS (SELECT 1 FROM contacts c WHERE c.lead_id=l.id AND c.email IS NOT NULL AND c.email<>'')");
   return { W: where.join(" AND "), args };
@@ -505,12 +551,19 @@ export async function listLeads(actor: Actor, f: LeadFilters) {
   const { W, args } = leadWhere(actor, f);
   const size = f.pageSize ?? 50;
   const page = Math.max(1, f.page ?? 1);
-  const order =
-    f.sort === "company" ? "lower(l.company) ASC"
-    : f.sort === "due" ? "l.next_due_at IS NULL, l.next_due_at ASC"
-    : f.sort === "added" ? "COALESCE(l.lead_date,l.created_at) DESC"
-    : f.sort === "oldest" ? "COALESCE(l.last_activity_at, l.created_at) ASC"
-    : "COALESCE(l.last_activity_at, l.created_at) DESC";
+  const MAILS = (fn: string) => `(SELECT ${fn} FROM activities a WHERE a.lead_id=l.id AND a.type='message' AND a.outcome='sent' AND COALESCE(a.channel,'email')='email' AND a.occurred_precision<>'unknown')`;
+  const EXPR: Record<(typeof LEAD_SORTS)[number], string> = {
+    company: "lower(l.company)", stage: "l.stage", market: "l.market", country: "lower(l.country)", owner_name: "lower(u.name)", id: "l.id", created_at: "l.created_at", updated_at: "l.updated_at",
+    lead_date: "COALESCE(l.lead_date,l.created_at)", last_activity_at: "COALESCE(l.last_activity_at,l.created_at)", source: "l.source",
+    next_due: `(SELECT MIN(COALESCE(t.scheduled_at,t.due_at)) FROM tasks t WHERE t.lead_id=l.id AND ${OPEN_TASK})`,
+    first_email_sent_at: MAILS("MIN(a.occurred_at)"), last_email_sent_at: MAILS("MAX(a.occurred_at)"), emails_sent: MAILS("COUNT(*)"),
+    campaign: "(SELECT lower(c.name) FROM lead_campaigns lc JOIN campaigns c ON c.id=lc.campaign_id WHERE lc.lead_id=l.id AND lc.status='active' ORDER BY lc.id LIMIT 1)",
+  };
+  const sort = parseSort(f.sort, LEAD_SORTS, LEAD_SORT_ALIASES, "-last_activity_at");
+  const ex = EXPR[sort.field as (typeof LEAD_SORTS)[number]];
+  // empty values last in both directions
+  const order = `(${ex} IS NULL OR ${ex}=''), ${ex} ${sort.desc ? "DESC" : "ASC"}`;
+  const warnings = [...(f.warnings ?? []), ...(sort.warning ? [sort.warning] : [])];
   const [totalRow, rows] = await Promise.all([one(`SELECT COUNT(*) AS n FROM leads l WHERE ${W}`, args), all(
     `SELECT l.*, u.name AS owner_name FROM leads l LEFT JOIN users u ON u.id=l.owner_id
      WHERE ${W} ORDER BY ${order}, l.id DESC LIMIT ? OFFSET ?`,
@@ -518,7 +571,7 @@ export async function listLeads(actor: Actor, f: LeadFilters) {
   )]);
   const total = Number(totalRow!.n);
   // page_size / has_more are the names every paged list uses; pageSize is kept for older clients.
-  return { rows, total, page, pageSize: size, page_size: size, has_more: page * size < total };
+  return { rows, total, page, pageSize: size, page_size: size, has_more: page * size < total, applied_sort: sort.applied, warnings };
 }
 
 /** How many leads each stage holds under the current filters (the stage filter itself is left out, so the strip works as a switch). */
@@ -546,6 +599,7 @@ export async function leadListExtras(leadIds: number[]) {
     all(`SELECT lc.lead_id,c.id,c.name FROM lead_campaigns lc JOIN campaigns c ON c.id=lc.campaign_id WHERE lc.status='active' AND lc.lead_id IN (${marks}) ORDER BY lc.joined_at`, leadIds),
     all(
       `SELECT t.id,t.title,t.status,t.lead_id,t.prep_status,t.blockers,t.scheduled_at,t.due_at,t.message_version_id,t.sent_at,t.activity_id,t.due_on,t.scheduled_on,t.hold_reason,t.rescheduled_from,
+              t.step_code,t.step_number,t.step_total,t.window_end_on,t.action_type,t.task_type,t.channel,t.enrollment_id,t.is_late,t.assignee_id,
               u.name AS assignee_name, COALESCE(t.scheduled_at,t.due_at) AS sort_at
        FROM tasks t JOIN users u ON u.id=t.assignee_id WHERE t.lead_id IN (${marks}) AND t.status NOT IN ('completed','cancelled')
        ORDER BY (COALESCE(t.scheduled_at,t.due_at) IS NULL), COALESCE(t.scheduled_at,t.due_at), t.id`, leadIds),
@@ -600,4 +654,43 @@ export async function getLead(actor: Actor, id: number) {
   const contacts = withContactStatus(contactRows);
   const tasks = await liveTasks(taskRows);
   return { lead, contacts, history, tasks };
+}
+
+/* ---------- the next step of a lead ---------- */
+export type NextStep = { task_id: number | null; label: string; action_type: string | null; step_number: number | null; step_total: number | null; due_on: string | null; window_end_on: string | null; state: "due" | "overdue" | "planned" | "blocked" | "resting" | "none"; days_overdue: number; note: string | null; text: string };
+const TYPE_LONG: Record<string, string> = { "Email 1": "First email", FU1: "Follow-up email 1", FU2: "Follow-up email 2", FU3: "Follow-up email 3", Reply: "Handle reply", "Email 1 draft": "First email draft", "FU draft": "Follow-up draft" };
+const PREP_NOTE: Record<string, string> = { draft_needed: "draft needed", internal_review: "draft waiting for the Chief's review", user_approval_needed: "draft waiting for approval", ready_for_execution: "approved, ready to send", validation_needed: "blocked" };
+/**
+ * One concrete next step per lead, computed live from its open task and its sequence: never from the free-text next_action.
+ * `hasSent` decides whether a lead with nothing planned is a problem ("No next step") or simply not started.
+ */
+export function nextStepOf(task: Row | null | undefined, seq: LeadSeq | undefined, today = todayYmd()): NextStep {
+  if (task) {
+    const day = (task.due_on as string | null) ?? (task.scheduled_on as string | null) ?? ((task.scheduled_at ?? task.due_at) ? toLocalInput((task.scheduled_at ?? task.due_at) as string).slice(0, 10) : null);
+    const type = displayType(task);
+    const label = task.step_code ? STEP_LONG[task.step_code as string] ?? type : TYPE_LONG[type] ?? (type === "Other" ? String(task.title).slice(0, 48) : type);
+    const late = day && day < today ? Math.round((Date.parse(`${today}T00:00:00Z`) - Date.parse(`${day}T00:00:00Z`)) / 86400000) : 0;
+    const state: NextStep["state"] = late > 0 || task.is_overdue ? "overdue" : task.state === "blocked" && task.prep_status === "validation_needed" ? "blocked" : day === today ? "due" : "planned";
+    const note = task.message_version_id || task.step_code ? PREP_NOTE[String(task.prep_status ?? "")] ?? null : null;
+    const when = !day ? "no date" : day === today ? "today" : fmtYmd(day);
+    return { task_id: task.id as number, label, action_type: (task.action_type as string) ?? null, step_number: (task.step_number as number) ?? null, step_total: (task.step_total as number) ?? null, due_on: day, window_end_on: (task.window_end_on as string) ?? null,
+      state, days_overdue: late, note, text: `${label} · ${when}${state === "overdue" && late > 0 ? ` (overdue ${late} day${late === 1 ? "" : "s"})` : note && note !== "draft needed" ? ` (${note})` : ""}` };
+  }
+  const none = { task_id: null, action_type: null, step_number: null, step_total: null, window_end_on: null, days_overdue: 0, note: null };
+  if (seq?.sequence_status === "resting" && seq.rest_until) return { ...none, label: "Resting", due_on: seq.rest_until, state: "resting", text: `Resting until ${fmtYmd(seq.rest_until)}` };
+  if (seq?.sequence_status === "paused") return { ...none, label: "Sequence paused", due_on: null, state: "resting", text: "Sequence paused" };
+  return { ...none, label: "No next step", due_on: null, state: "none", text: "No next step" };
+}
+
+/** GET /leads rows with the computed next step and the sequence facts (three extra queries for the whole page). */
+export async function withNextStep(rows: Row[]) {
+  const ids = rows.map((r) => r.id as number);
+  const [ex, seq] = await Promise.all([leadListExtras(ids), leadSequenceInfo(ids)]);
+  const today = todayYmd();
+  return rows.map((r) => {
+    const sq = seq.get(r.id as number);
+    return { ...r, next_step: nextStepOf(ex.nextTask.get(r.id as number), sq, today), first_email_sent_at: sq?.first_email_sent_at ?? null, last_email_sent_at: sq?.last_email_sent_at ?? null, last_email_step: sq?.last_email_step ?? null,
+      sequence_status: sq?.sequence_status ?? null, sequence_step: sq?.sequence_step ?? null, sequence_step_total: sq?.step_total ?? null, emails_sent_count: sq?.emails_sent_count ?? 0, experiment_labels: sq?.experiment_labels ?? [],
+      campaigns: ex.campaigns.get(r.id as number) ?? [] };
+  });
 }

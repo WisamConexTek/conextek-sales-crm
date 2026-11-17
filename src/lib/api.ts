@@ -93,6 +93,8 @@ export async function execute(req: Request, o: ExecOpts, fn: (actor: Actor, note
   try {
     actor = actor ?? (await getApiActor(req));
     actor = { ...actor, requestId, runId: runId ?? undefined };
+    // The compliance monitor reads everything and changes nothing: every write is refused here, whatever the endpoint, and the refusal is logged like any other call.
+    if (write && actor.role === "employee" && actor.perms.has("compliance.view")) throw new HttpError(403, "This account is a read-only compliance monitor. It cannot create, change or delete anything. Report findings to the Chief.", "read_only");
     const key = write ? (o.idempotencyKey ?? header(req, "idempotency-key", 120)) : null;
     const seen = key ? await one("SELECT method,path,response FROM api_idempotency WHERE actor_id=? AND key=?", [actor.id, key]) : null;
     if (seen) {

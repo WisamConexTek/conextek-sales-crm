@@ -29,13 +29,16 @@ export default async function AppLayout({ children }: { children: React.ReactNod
   const items: NavItem[] = [
     { href: "/", label: "Dashboard" },
     { href: "/leads", label: "Leads" },
+    { href: "/tasks", label: "Tasks" },
     { href: "/my-work", label: "My Work", badge: mine },
     { href: "/schedule", label: "Today & Tomorrow" },
+    { href: "/plan", label: "Daily plan" },
     { href: "/approvals", label: "Approvals", badge: toDecide },
     ...(nav.canSend ? [{ href: "/send-approvals", label: "Send approvals", badge: nav.sendPending ?? 0 }] : []),
     { href: "/reports", label: can(me, "reports.view") || isManager(me) ? "Reports" : "My numbers" },
   ];
   if (can(me, "campaigns.manage") || can(me, "reports.view") || isManager(me)) items.push({ href: "/campaigns", label: "Campaigns" });
+  if (isManager(me) || can(me, "compliance.view")) items.push({ href: "/compliance", label: "Compliance" });
   if (isManager(me)) items.push({ href: "/agents", label: "Agent activity" });
   if (isManager(me)) items.push({ href: "/settings", label: "Settings & Permissions" });
   if (can(me, "history.import")) items.push({ href: "/settings/history", label: "Historical data" });

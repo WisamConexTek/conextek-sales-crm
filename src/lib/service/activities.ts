@@ -4,6 +4,7 @@ import { HttpError, requirePerm, isManager, type Actor } from "../auth";
 import { MESSAGE_KINDS, RECORDABLE_TYPES } from "../constants";
 import { parse, optText, optInt, assertListKey, parseEventDate, dateProblem } from "./common";
 import { assertLeadAccess } from "./leads";
+import { afterSend, linkedinAccepted } from "./sequences";
 
 const schema = z.object({
   type: z.enum(RECORDABLE_TYPES),
@@ -18,6 +19,8 @@ const schema = z.object({
   task_id: optInt,
   parent_id: optInt,
   occurred_at: z.unknown().optional(),
+  /** linkedin_accepted: the prospect accepted the LinkedIn invitation. It starts the LinkedIn sequence (first message planned). */
+  event: z.enum(["linkedin_accepted"]).nullable().optional(),
 });
 
 /**
@@ -112,5 +115,9 @@ export async function recordActivity(actor: Actor, leadId: number, input: unknow
     args: [occurred, occurred, t, leadId],
   });
   await tx(stmts);
-  return { id: r.id, warnings };
+  // Follow-up sequence: a send recorded by hand advances the lead's sequence exactly like a confirmed send does.
+  let sequence = null;
+  if (!unknownDate && d.type === "message") sequence = await afterSend(actor, leadId, d.channel);
+  else if (!unknownDate && d.event === "linkedin_accepted") sequence = await linkedinAccepted(actor, leadId, occurred);
+  return { id: r.id, warnings, ...(sequence ? { sequence: { enrollment_id: sequence.enrollment_id, status: sequence.status, steps_sent: sequence.steps_sent, next_task_id: sequence.next_task_id, next_step: sequence.next_step, note: sequence.note ?? null } } : {}) };
 }

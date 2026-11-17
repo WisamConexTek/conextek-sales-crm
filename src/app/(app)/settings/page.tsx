@@ -23,7 +23,7 @@ export default async function Settings({ searchParams }: { searchParams: SP }) {
 
   return (
     <div className="space-y-5">
-      <PageHeader title="Settings & Permissions" sub={owner ? "Full owner access" : "Chief: you can add employees, adjust their permissions, reset passwords and issue or revoke employee API keys"} />
+      <PageHeader title="Settings & Permissions" sub={owner ? "Full owner access" : "Chief: you can add employees, adjust their permissions, reset passwords and issue or revoke employee API keys"}><a href="/settings/sequences" className="btn">Follow-up sequences</a></PageHeader>
       <Flash ok={sget(sp, "ok")} err={sget(sp, "err")} />
       <div className="flex gap-1 border-b border-slate-200">
         {tabs.map(([k, l]) => <Link key={k} href={`/settings?tab=${k}`} className={`-mb-px border-b-2 px-4 py-2 text-sm no-underline hover:no-underline ${tab === k ? "border-brand-600 font-semibold text-brand-700" : "border-transparent text-slate-600"}`}>{l}</Link>)}
@@ -221,7 +221,7 @@ async function Senders() {
                   <input type="hidden" name="_back" value={back} /><input type="hidden" name="id" value={x.id} />
                   <label className="label">Pause cold sends from this mailbox</label>
                   <input name="reason" className="input" placeholder="Reason (required, shown to everyone)" required minLength={3} />
-                  <p className="mt-1 text-xs text-slate-500">It also pauses itself if its 7-day bounce rate goes above 3% or it gets any spam complaint. Only you can resume it.</p>
+                  <p className="mt-1 text-xs text-slate-500">It also pauses itself if its 7-day bounce rate goes above 2% or it gets any spam complaint. Only you can resume it.</p>
                   <button className="btn btn-sm mt-2">Pause sender</button>
                 </form>
               )}

@@ -6,6 +6,9 @@ import { leadScope } from "./leads";
 import { liveTasks } from "./taskview";
 import { toLocalInput } from "../format";
 import { getVersion, checkEligibility } from "./sends";
+import { displayType } from "./tasklist";
+import { parseLabels } from "./sequences";
+import { syncShortfalls } from "./workplan";
 
 /**
  * Two calls that replace most of an agent's stitching:
@@ -21,7 +24,9 @@ type Urgency = "overdue" | "today" | "tomorrow" | "undated";
 const URGENCY: Record<Urgency, number> = { overdue: 0, today: 1, tomorrow: 2, undated: 3 };
 const isOutreach = (t: Row) => /send|email|follow|outreach|message|linkedin/i.test(`${t.action_type ?? ""} ${t.task_type ?? ""}`) || !!t.channel;
 
-export async function nextWork(actor: Actor, o: { limit?: number; assignee?: number | "all"; action?: string | null } = {}) {
+const KINDS = ["follow_up", "first_email", "late"] as const;
+export async function nextWork(actor: Actor, o: { limit?: number; assignee?: number | "all"; action?: string | null; kind?: string | null } = {}) {
+  if (o.kind && !(KINDS as readonly string[]).includes(o.kind)) throw new HttpError(400, `kind: one of ${KINDS.join(", ")}.`);
   const viewAll = can(actor, "tasks.view_all") || isManager(actor);
   const team = o.assignee === "all";
   if (team && !viewAll) throw new HttpError(403, "Only the Owner or a Chief can read the whole team's work list.");
@@ -37,6 +42,8 @@ export async function nextWork(actor: Actor, o: { limit?: number; assignee?: num
   // Dated work (late, today, tomorrow) and undated work are read separately, so a pile of undated tasks can never crowd out dated ones.
   const cols = `t.id,t.title,t.instructions,t.status,t.task_type,t.action_type,t.channel,t.prep_status,t.blockers,t.scheduled_at,t.due_at,t.lead_id,t.assignee_id,t.campaign_id,t.change_request,
               t.message_version_id,t.sent_at,t.activity_id,t.completed_at,t.due_on,t.scheduled_on,t.hold_reason,t.rescheduled_from,
+              t.enrollment_id,t.step_code,t.step_number,t.step_total,t.window_end_on,t.draft_deadline,t.labels,t.sender_id,t.thread_subject,t.is_late,t.auto_generated,
+              (SELECT sd.email FROM senders sd WHERE sd.id=t.sender_id) AS step_sender_email, (SELECT sd.display_name FROM senders sd WHERE sd.id=t.sender_id) AS step_sender_name,
               COALESCE(t.scheduled_at,t.due_at) AS sort_at, c.name AS campaign, c.status AS campaign_status, u.name AS assignee_name
        FROM tasks t LEFT JOIN campaigns c ON c.id=t.campaign_id LEFT JOIN users u ON u.id=t.assignee_id
        WHERE t.is_demo=0 AND t.status NOT IN ('completed','cancelled')${mine}`;
@@ -45,7 +52,8 @@ export async function nextWork(actor: Actor, o: { limit?: number; assignee?: num
     all(`SELECT ${cols} AND t.scheduled_at IS NULL AND t.due_at IS NULL ORDER BY t.id LIMIT 100`, mineArgs),
     one(`SELECT COUNT(*) AS n FROM tasks t WHERE t.is_demo=0 AND t.status NOT IN ('completed','cancelled')${mine} AND t.scheduled_at IS NULL AND t.due_at IS NULL`, mineArgs),
   ]);
-  const live = await liveTasks([...dated, ...undated]);
+  const kindOf = (t: Row) => (t.is_late ? "late" : /^FU\d|^LinkedIn DM|^Final/.test(displayType(t)) ? "follow_up" : displayType(t) === "Email 1" ? "first_email" : "other");
+  const live = (await liveTasks([...dated, ...undated])).filter((t) => !o.kind || kindOf(t) === o.kind);
   const counts = { ready: 0, overdue: 0, planned: 0, blocked: 0 };
   for (const t of live) if (t.state in counts) counts[t.state as keyof typeof counts]++;
   // By urgency: late first, then due today, then tomorrow, then work with no date. Inside a group: earliest first.
@@ -103,7 +111,11 @@ export async function nextWork(actor: Actor, o: { limit?: number; assignee?: num
       return {
         task: { id: t.id, title: t.title, instructions: t.instructions, status: t.status, state: t.state, urgency, reason: t.reason, task_type: t.task_type, action_type: t.action_type, channel: t.channel,
           scheduled_at: t.scheduled_at, due_at: t.due_at, date_only: t.date_only, on: t.on, held: t.held, hold_reason: t.hold_reason, moved_from: t.rescheduled_from ?? t.rescheduled_from_on ?? null, moved_reason: t.moved_reason,
-          prep_status: t.prep_status, blockers: t.blockers ?? null, assignee: { id: t.assignee_id, name: t.assignee_name } },
+          prep_status: t.prep_status, blockers: t.blockers ?? null, assignee: { id: t.assignee_id, name: t.assignee_name },
+          type: displayType(t), kind: kindOf(t),
+          // Set on tasks a follow-up sequence planned: which step this is, the thread it answers, its window and its drafting deadline.
+          sequence: t.enrollment_id ? { step_code: t.step_code, step_number: t.step_number, step_total: t.step_total, due_on: t.due_on, window_end_on: t.window_end_on, draft_deadline: t.draft_deadline, late: !!t.is_late,
+            thread_subject: t.thread_subject, sender: t.sender_id ? { id: t.sender_id, email: t.step_sender_email, display_name: t.step_sender_name } : null, experiment_labels: parseLabels(t.labels) } : null },
         next_step: { action, instruction: step, ...(stale ? { note: stale } : {}) },
         lead: lead ? { id: lead.id, company: lead.company, website: lead.website, country: lead.country, language: lead.language, stage: lead.stage, historical_only: !!lead.historical_only } : null,
         contacts: people,
@@ -126,7 +138,7 @@ export async function nextWork(actor: Actor, o: { limit?: number; assignee?: num
     if (!only) break;
   }
   return {
-    now: now(), timezone: TZ(), guide_version: GUIDE_VERSION, assignee_id: who, assignee: team ? "all" : who, action: only, limit,
+    now: now(), timezone: TZ(), guide_version: GUIDE_VERSION, assignee_id: who, assignee: team ? "all" : who, action: only, kind: o.kind ?? null, limit,
     counts, by_urgency, undated_open_tasks: Number(undatedRow!.n), total_open: live.length, returned: items.length,
     has_more: only ? scanned < pool.length : pool.length > items.length,
     scope: `${team ? "Every assignee's" : "Your"} open tasks that are late, due today or tomorrow, or have no date${only ? `, where the next step is "${only}"` : ""}. Work planned further ahead is not listed yet.`,
@@ -153,7 +165,16 @@ export async function changesSince(actor: Actor, o: { since?: string | null; lim
   // Drafts are "mine" when I wrote them; managers see every draft.
   const mine = mgr ? "" : " AND v.created_by=?";
   const mineArgs: InValue[] = mgr ? [] : [actor.id];
-  const [decisions, auths, approvals, inbound, tasks] = await Promise.all([
+  const seeAll = mgr || actor.perms.has("compliance.view");
+  if (seeAll) { try { await syncShortfalls(); } catch (e) { console.error("shortfall sync failed", e); } }
+  const [seqEvents, stepDue, shortfalls, decisions, auths, approvals, inbound, tasks] = await Promise.all([
+    // What the follow-up sequences did. Managers and the compliance monitor see all of it; everyone else sees what concerns their own tasks.
+    all(`SELECT a.action,a.entity,a.entity_id,a.detail,a.created_at AS at,a.actor_name FROM audit_log a
+         WHERE a.created_at>? AND a.created_at<=? AND a.action IN ('sequence_task_created','sequence_paused','sequence_resumed','sequence_stopped','sequence_completed','reply_reclassified','sequence_settings_changed','sequence_enrolled')
+         ${seeAll ? "" : "AND a.action='sequence_task_created' AND a.detail LIKE ?"} ORDER BY a.id LIMIT ?`, [since, until, ...(seeAll ? [] : [`%"assignee_id":${actor.id}%`]), limit]),
+    all(`SELECT t.id,t.title,t.lead_id,t.step_code,t.due_on,t.due_at,t.window_end_on,t.assignee_id FROM tasks t
+         WHERE t.is_demo=0 AND t.enrollment_id IS NOT NULL AND t.status NOT IN ('completed','cancelled') AND t.due_on IS NOT NULL ${seeAll ? "" : "AND t.assignee_id=?"} AND t.due_at>? LIMIT 2000`, [...(seeAll ? [] : [actor.id]), new Date(new Date(since).getTime() - 2 * 86400000).toISOString()]),
+    seeAll ? all("SELECT * FROM plan_shortfalls WHERE (first_seen>? AND first_seen<=?) OR (resolved_at>? AND resolved_at<=?) ORDER BY id LIMIT ?", [since, until, since, until, limit]) : Promise.resolve([] as Row[]),
     all(`SELECT d.kind,d.reason,d.new_version_id,d.created_at AS at,v.id AS vid,v.lead_id,v.task_id,l.company,u.name AS by_name
          FROM message_decisions d JOIN message_versions v ON v.id=d.message_version_id JOIN leads l ON l.id=v.lead_id JOIN users u ON u.id=d.decided_by
          WHERE d.created_at>? AND d.created_at<=?${mine} ORDER BY d.created_at LIMIT ?`, [since, until, ...mineArgs, limit]),
@@ -169,6 +190,30 @@ export async function changesSince(actor: Actor, o: { since?: string | null; lim
          WHERE t.is_demo=0 AND t.assignee_id=? AND t.updated_at>? AND t.updated_at<=? ORDER BY t.updated_at LIMIT ?`, [actor.id, since, until, limit]),
   ]);
   const out: Change[] = [];
+  for (const e of seqEvents) {
+    let det: Record<string, unknown> = {};
+    try { det = e.detail ? (JSON.parse(String(e.detail)) as Record<string, unknown>) : {}; } catch { det = {}; }
+    const leadId = e.entity === "lead" ? Number(e.entity_id) : (det.lead_id as number) ?? null;
+    const taskId = e.entity === "task" ? Number(e.entity_id) : null;
+    const text: Record<string, string> = {
+      sequence_task_created: `The follow-up sequence planned ${det.step ?? "a step"}${det.due_on ? `, due ${det.due_on}` : ""}${det.late ? " (LATE)" : ""}. It needs a draft.`,
+      sequence_enrolled: "The lead entered a follow-up sequence.", sequence_paused: `Sequence paused: ${det.reason ?? ""}`.trim(), sequence_resumed: "Sequence resumed.",
+      sequence_stopped: `Sequence stopped: ${det.reason ?? "no reason given"}. Pending follow-ups were cancelled; do not send them.`,
+      sequence_completed: det.rest_until ? `Sequence finished; the lead rests until ${det.rest_until}.` : "Sequence finished.",
+      reply_reclassified: `${e.actor_name} changed a reply from ${det.from} to ${det.to}: ${det.reason ?? ""}`.trim(), sequence_settings_changed: `${e.actor_name} changed the follow-up settings.`,
+    };
+    out.push({ type: e.action as string, at: e.at as string, lead_id: leadId, task_id: taskId, message_version_id: null, summary: text[e.action as string] ?? String(e.action), detail: det });
+  }
+  // A step becomes due at the start of its due day and overdue at the end of it (Asia/Hebron).
+  for (const t of stepDue) {
+    const start = localMidnight(t.due_on as string).toISOString();
+    if (start > since && start <= until) out.push({ type: "sequence_step_due", at: start, lead_id: t.lead_id, task_id: t.id, message_version_id: null, summary: `${t.title} is due today${t.window_end_on ? ` (window to ${t.window_end_on})` : ""}.`, detail: { step: t.step_code, due_on: t.due_on, window_end_on: t.window_end_on } });
+    if ((t.due_at as string) > since && (t.due_at as string) <= until) out.push({ type: "sequence_step_overdue", at: t.due_at as string, lead_id: t.lead_id, task_id: t.id, message_version_id: null, summary: `${t.title} was due ${t.due_on} and is not sent.`, detail: { step: t.step_code, due_on: t.due_on, window_end_on: t.window_end_on } });
+  }
+  for (const s of shortfalls) {
+    if ((s.first_seen as string) > since) out.push({ type: "work_plan_shortfall", at: s.first_seen as string, lead_id: null, task_id: null, message_version_id: null, summary: s.message as string, detail: { plan_date: s.plan_date, role: s.role, sender_id: s.sender_id || null, kind: s.kind, gap: s.gap, status: "open" } });
+    if (s.resolved_at && (s.resolved_at as string) > since) out.push({ type: "work_plan_shortfall_resolved", at: s.resolved_at as string, lead_id: null, task_id: null, message_version_id: null, summary: `Closed: ${s.message}`, detail: { plan_date: s.plan_date, role: s.role, sender_id: s.sender_id || null, kind: s.kind, status: "resolved" } });
+  }
   for (const d of decisions) out.push({ type: d.kind === "rejected" ? "draft_rejected" : "draft_edited", at: d.at, lead_id: d.lead_id, task_id: d.task_id ?? null, message_version_id: d.vid,
     summary: d.kind === "rejected" ? `${d.by_name} rejected the draft for ${d.company}: ${d.reason ?? "no reason given"}. Prepare a new, different version.` : `${d.by_name} edited the draft for ${d.company}; the new text is version ${d.new_version_id}. Use that one.`,
     detail: { reason: d.reason, new_version_id: d.new_version_id } });

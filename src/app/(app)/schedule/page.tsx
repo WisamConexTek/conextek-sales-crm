@@ -7,6 +7,8 @@ import { addDays, todayYmd } from "@/lib/db";
 import { Badge, Card, Empty, LeadLink, PageHeader, StatusBadge } from "@/components/ui";
 import { fmtShort, fmtYmd, fmtDateTime } from "@/lib/format";
 import { q, sget, snum, type SP } from "@/lib/view";
+import { SortTh } from "@/components/Sort";
+import { parseSort, sortRows, type SortSpec } from "@/lib/sort";
 
 const PREP: Record<string, string> = { validation_needed: "Validation needed", draft_needed: "Draft needed", internal_review: "Internal review", user_approval_needed: "User approval needed", ready_for_execution: "Ready for authorized execution", sent: "Sent", completed: "Completed", cancelled: "Cancelled" };
 const TONE = { overdue: "red", blocked: "amber", ready: "green", planned: "gray", completed: "blue" } as const;
@@ -23,6 +25,10 @@ export default async function Schedule({ searchParams }: { searchParams: SP }) {
   const [r, users, camps, channels, projects] = await Promise.all([schedule(me, f), assignableUsers(), listCampaigns(), listChannels(), listProjects()]);
   const team = can(me, "tasks.view_all") || isManager(me);
   const keep = { employee: f.employee, project: f.project, campaign: f.campaign, channel: f.channel, state: f.state };
+  type SRow = (typeof r.rows)[number];
+  const spec: SortSpec<SRow> = { when: (t) => (t.sent_at ?? t.at ?? t.on) as string, employee: (t) => t.employee as string, campaign: (t) => t.campaign as string, company: (t) => t.company as string, action: (t) => (t.action_type ?? t.channel) as string, prep: (t) => (t.prep_label ?? t.prep_status) as string, status: (t) => t.state as string };
+  const ps = parseSort(sget(sp, "sort"), Object.keys(spec));
+  const rows = sortRows(r.rows, spec, ps);
   const label = open ? "All open work up to tomorrow" : r.from === today ? "Today" : r.from === tomorrow ? "Tomorrow" : r.from;
   return (
     <div className="space-y-5">
@@ -47,9 +53,9 @@ export default async function Schedule({ searchParams }: { searchParams: SP }) {
         {r.rows.length === 0 ? <Empty>Nothing scheduled for this day with these filters. Tasks appear here when they have a scheduled time or a due date on that day.</Empty> : (
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
-              <thead><tr className="text-left text-xs uppercase tracking-wide text-slate-500"><th className="py-1 pr-3 font-medium">When</th><th className="pr-3 font-medium">Employee</th><th className="pr-3 font-medium">Project / campaign</th><th className="pr-3 font-medium">Lead / contact</th><th className="pr-3 font-medium">Channel · action</th><th className="pr-3 font-medium">Preparation</th><th className="font-medium">Status</th></tr></thead>
+              <thead className="bg-slate-50"><tr>{([["When", "when"], ["Employee", "employee"], ["Project / campaign", "campaign"], ["Lead / contact", "company"], ["Channel · action", "action"], ["Preparation", "prep"], ["Status", "status"]] as [string, string][]).map(([l, f]) => <SortTh key={f} label={l} field={f} sort={ps.applied} href={(v) => `/schedule${q({ ...keep, ...(open ? { open: 1 } : date ? { date } : view === "tomorrow" ? { view } : {}), sort: v })}`} className="px-0! pr-3!" />)}</tr></thead>
               <tbody className="divide-y divide-slate-100">
-                {r.rows.map((t) => (
+                {rows.map((t) => (
                   <tr key={t.id} className="align-top">
                     <td className="py-2 pr-3 whitespace-nowrap">{t.sent_at ? <>{fmtDateTime(t.sent_at)}<div className="text-xs text-emerald-700">sent at this time</div></> : t.date_only ? <>{fmtYmd(t.on)}<div className="text-xs text-slate-400">date only (no set time)</div></> : <>{fmtShort(t.at)}<div className="text-xs text-slate-400">{t.at_source === "due_at" ? "due date (no schedule)" : "scheduled"}</div></>}</td>
                     <td className="pr-3">{t.employee}</td>

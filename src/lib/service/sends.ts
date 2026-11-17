@@ -8,6 +8,7 @@ import { assertChannel } from "./campaigns";
 import { capacityData } from "./capacity";
 import { loadSenders, detectLanguage, resolveSender, capOn, type Sender, type Step } from "./senders";
 import { todayYmd } from "../db";
+import { afterSend, emailDomain } from "./sequences";
 
 /**
  * Message versions, scoped authorizations, send confirmation and recording.
@@ -25,7 +26,7 @@ const hash = (subject: string | null, body: string) => createHash("sha256").upda
 
 export async function createVersion(actor: Actor, input: unknown) {
   requirePerm(actor, "activity.record");
-  const d = parse(z.object({ lead_id: z.coerce.number().int(), contact_id: optInt.optional(), channel: z.string().min(1), campaign_id: z.coerce.number().int(), task_id: optInt.optional(), subject: optText(300).optional(), body: z.string().trim().min(1, "required").max(20000), sender_id: optInt.optional(), sender_email: optText(200).optional(), language: z.enum(["en", "ar", "zh"]).nullable().optional() }), input);
+  const d = parse(z.object({ lead_id: z.coerce.number().int(), contact_id: optInt.optional(), channel: z.string().min(1), campaign_id: z.coerce.number().int(), task_id: optInt.optional(), subject: optText(300).optional(), body: z.string().trim().min(1, "required").max(20000), sender_id: optInt.optional(), sender_email: optText(200).optional(), language: z.enum(["en", "ar", "zh"]).nullable().optional(), experiment_labels: z.array(z.string().trim().min(1).max(30)).max(8).optional() }), input);
   const lead = await assertLeadAccess(actor, d.lead_id);
   await assertChannel(d.channel);
   if (!(await one("SELECT id FROM campaigns WHERE id=?", [d.campaign_id]))) throw new HttpError(400, "campaign_id: unknown campaign.");
@@ -41,8 +42,11 @@ export async function createVersion(actor: Actor, input: unknown) {
   if (!senderId) senderId = ((await one("SELECT COALESCE(sender_id,1) AS s FROM activities WHERE lead_id=? AND type='message' AND outcome='sent' AND is_demo=0 ORDER BY occurred_at DESC,id DESC LIMIT 1", [d.lead_id]))?.s as number) ?? 1;
   const language = d.language ?? detectLanguage(`${subject ?? ""} ${d.body}`);
   if (d.task_id == null && prev) { const pt = await one("SELECT task_id FROM message_versions WHERE id=?", [prev.id as number]); if (pt?.task_id) d.task_id = pt.task_id as number; }
-  const r = await run("INSERT INTO message_versions (lead_id,contact_id,channel,campaign_id,task_id,version,subject,body,content_hash,created_by,created_at,sender_id,language) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-    [d.lead_id, d.contact_id ?? null, d.channel, d.campaign_id, d.task_id ?? null, version, subject, d.body, h, actor.id, now(), senderId, language]);
+  // Experiment labels: given here, else carried over from the task (a follow-up inherits them from its sequence), else from the earlier version.
+  const inherited = d.experiment_labels?.length ? JSON.stringify(d.experiment_labels)
+    : ((d.task_id ? ((await one("SELECT labels FROM tasks WHERE id=?", [d.task_id]))?.labels as string | null) : null) ?? (prev ? ((await one("SELECT labels FROM message_versions WHERE id=?", [prev.id as number]))?.labels as string | null) : null) ?? null);
+  const r = await run("INSERT INTO message_versions (lead_id,contact_id,channel,campaign_id,task_id,version,subject,body,content_hash,created_by,created_at,sender_id,language,labels) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    [d.lead_id, d.contact_id ?? null, d.channel, d.campaign_id, d.task_id ?? null, version, subject, d.body, h, actor.id, now(), senderId, language, inherited]);
   // An edit voids every still-active authorization of the earlier versions of this thread.
   const voided = await run("UPDATE send_authorizations SET status='revoked' WHERE status='active' AND message_version_id IN (SELECT id FROM message_versions WHERE lead_id=? AND COALESCE(contact_id,0)=? AND channel=? AND campaign_id=? AND id<>?)", [d.lead_id, d.contact_id ?? 0, d.channel, d.campaign_id, r.id]);
   await audit(actor, "create_message_version", "message_version", r.id, { lead_id: d.lead_id, version, sender_id: senderId, language, revoked_authorizations: voided.changes, is_test: !!lead.is_demo });
@@ -319,6 +323,7 @@ type EligCtx = {
   firstSent: Map<string, number>; activeSendByLead: Map<number, Row[]>; pendingByLead: Map<number, number>; recentByLead: Map<number, number>;
   senders: Map<number, Sender>; steps: Map<number, Step[]>; usedBySender: Map<number, number>; pushed: Map<number, number>;
   threadSenders: Map<number, { contact_id: number | null; sender_id: number }[]>; repliedLeads: Set<number>; today: string;
+  seqTasks: Map<number, Row>; suppressed: Map<string, string>;
 };
 const groupBy = <T extends Row>(rows: T[], key: string) => { const m = new Map<number, T[]>(); for (const r of rows) { const k = r[key] as number; (m.get(k) ?? m.set(k, []).get(k)!).push(r); } return m; };
 const inList = (ids: number[]) => ids.map(() => "?").join(",");
@@ -328,10 +333,10 @@ async function loadEligCtx(versions: Row[]): Promise<EligCtx> {
   const leadIds = [...new Set(versions.map((v) => v.lead_id as number))];
   const campIds = [...new Set(versions.map((v) => v.campaign_id as number))];
   const empty = <T,>() => new Map<number, T>();
-  if (!ids.length) return { latest: empty(), rejected: empty(), auths: empty(), leads: empty(), contacts: empty(), camps: empty(), members: empty(), firstSent: new Map(), activeSendByLead: empty(), pendingByLead: empty(), recentByLead: empty(), senders: empty(), steps: empty(), usedBySender: empty(), pushed: empty(), threadSenders: empty(), repliedLeads: new Set(), today: todayYmd() };
+  if (!ids.length) return { latest: empty(), rejected: empty(), auths: empty(), leads: empty(), contacts: empty(), camps: empty(), members: empty(), firstSent: new Map(), activeSendByLead: empty(), pendingByLead: empty(), recentByLead: empty(), senders: empty(), steps: empty(), usedBySender: empty(), pushed: empty(), threadSenders: empty(), repliedLeads: new Set(), today: todayYmd(), seqTasks: empty(), suppressed: new Map() };
   const L = inList(leadIds);
   const today = todayYmd();
-  const [threads, rej, auths, leads, contacts, camps, members, first, rival, pending, recent, cap, sl, thr, rep_] = await Promise.all([
+  const [threads, rej, auths, leads, contacts, camps, members, first, rival, pending, recent, cap, sl, thr, rep_, seqT, supp] = await Promise.all([
     all(`SELECT id,lead_id,contact_id,channel,campaign_id,version FROM message_versions WHERE lead_id IN (${L})`, leadIds),
     all(`SELECT message_version_id,reason FROM message_decisions WHERE kind='rejected' AND message_version_id IN (${inList(ids)})`, ids),
     all(`SELECT * FROM send_authorizations WHERE message_version_id IN (${inList(ids)}) ORDER BY id`, ids),
@@ -346,10 +351,18 @@ async function loadEligCtx(versions: Row[]): Promise<EligCtx> {
     capacityData(today), loadSenders(),
     all(`SELECT DISTINCT lead_id, contact_id, COALESCE(sender_id,1) AS sender_id FROM activities WHERE type='message' AND outcome='sent' AND is_demo=0 AND lead_id IN (${L})`, leadIds),
     all(`SELECT DISTINCT lead_id FROM activities WHERE outcome='reply_received' AND is_demo=0 AND lead_id IN (${L})`, leadIds),
+    // sequence step tasks of these leads (a follow-up planned by a sequence), with the state of their enrollment
+    all(`SELECT t.id,t.lead_id,t.message_version_id,t.step_number,t.step_code,t.channel,t.campaign_id,e.status AS enrollment_status,e.stop_reason FROM tasks t JOIN enrollments e ON e.id=t.enrollment_id WHERE t.status<>'completed' AND t.lead_id IN (${L}) ORDER BY t.id DESC`, leadIds),
+    all("SELECT kind,scope,value FROM suppressions"),
   ]);
-  const latest = new Map<number, number>();
+  const seqTasks = new Map<number, Row>();
   const best = new Map<string, Row>();
   for (const th of threads) { const k = `${th.lead_id}|${th.contact_id ?? 0}|${th.channel}|${th.campaign_id}`; const b = best.get(k); if (!b || (th.version as number) > (b.version as number)) best.set(k, th); }
+  for (const v of versions) {
+    const tk = seqT.find((x) => x.lead_id === v.lead_id && (x.message_version_id === v.id || x.id === v.task_id || (best.get(`${v.lead_id}|${v.contact_id ?? 0}|${v.channel}|${v.campaign_id}`)?.id === v.id && x.message_version_id && threads.some((th) => th.id === x.message_version_id && th.lead_id === v.lead_id && (th.contact_id ?? 0) === (v.contact_id ?? 0) && th.channel === v.channel && th.campaign_id === v.campaign_id))));
+    if (tk) seqTasks.set(v.id as number, tk);
+  }
+  const latest = new Map<number, number>();
   for (const v of versions) { const b = best.get(`${v.lead_id}|${v.contact_id ?? 0}|${v.channel}|${v.campaign_id}`); latest.set(v.id as number, (b?.id as number) ?? (v.id as number)); }
   return {
     latest, rejected: new Map(rej.map((r) => [r.message_version_id as number, (r.reason as string) ?? null])), auths: groupBy(auths, "message_version_id"),
@@ -361,6 +374,7 @@ async function loadEligCtx(versions: Row[]): Promise<EligCtx> {
     pushed: new Map(cap.senders.flatMap((x) => x.pushed.map((p) => [p.message_version_id, x.sender.id] as [number, number]))),
     threadSenders: new Map([...groupBy(thr, "lead_id")].map(([k, rows]) => [k, rows.map((r) => ({ contact_id: (r.contact_id as number) ?? null, sender_id: r.sender_id as number }))])),
     repliedLeads: new Set(rep_.map((r) => r.lead_id as number)), today,
+    seqTasks, suppressed: new Map(supp.map((x) => [`${x.scope}:${x.value}`, x.kind as string])),
   };
 }
 
@@ -384,6 +398,16 @@ function evaluateEligibility(v: Row, c: EligCtx) {
     if (ct?.is_invalid) add("contact_invalid", "this contact is marked invalid");
     if (v.channel === "email" && !ct?.email) add("no_email", "the recipient has no email address");
   }
+  // Suppression list (do-not-contact, opt-outs and bounces, including the ones imported from before the CRM).
+  const targets = (v.contact_id ? contacts.filter((x) => x.id === v.contact_id) : contacts).map((x) => String(x.email ?? "").trim().toLowerCase()).filter(Boolean);
+  for (const em of targets) {
+    const hit = c.suppressed.get(`email:${em}`) ?? c.suppressed.get(`domain:${emailDomain(em)}`);
+    if (hit) { add("suppressed", `${em} is on the suppression list (${hit === "dnc" ? "do not contact" : hit === "opt_out" ? "opted out" : "bounced"})`); break; }
+  }
+  // A follow-up planned by a sequence never goes out after a reply, and never while its sequence is not running.
+  const seqTask = c.seqTasks.get(versionId);
+  if (seqTask && Number(seqTask.step_number) > 1 && c.repliedLeads.has(v.lead_id as number)) add("reply_received", "a reply from this company was recorded; the follow-up sequence has stopped and this follow-up must not be sent");
+  else if (seqTask && seqTask.enrollment_status !== "running") add("sequence_not_running", `the follow-up sequence of this lead is ${seqTask.enrollment_status}${seqTask.stop_reason ? ` (${seqTask.stop_reason})` : ""}`);
   const camp = c.camps.get(v.campaign_id as number);
   if (camp?.status !== "active") add("campaign_not_active", `campaign "${camp?.name}" is ${camp?.status}, not active`);
   const mem = c.members.get(v.lead_id as number) ?? [];
@@ -409,7 +433,7 @@ function evaluateEligibility(v: Row, c: EligCtx) {
     const cp = capOn(sender, c.steps.get(sender.id), c.today);
     const used = c.usedBySender.get(sender.id) ?? 0;
     if (cp.cap !== null && used >= cp.cap) add("daily_cap_reached", cp.not_started ? `${who} has not started warming up yet (first day is ${c.steps.get(sender.id)?.[0]?.from_date}); cap is 0 until then` : `daily send cap reached for ${who}: ${used} of ${cp.cap} messages already sent today (Asia/Hebron); it can go out on the next send slot`);
-    else if (c.pushed.has(versionId)) add("daily_cap_reached", `${who}'s remaining capacity today (${cp.cap === null ? "-" : Math.max(0, cp.cap - used)}) is taken by higher-priority campaigns; this send is pushed to the next day`);
+    else if (c.pushed.has(versionId)) add("daily_cap_reached", `${who}'s remaining capacity today (${cp.cap === null ? "-" : Math.max(0, cp.cap - used)}) is taken by higher-priority work (follow-ups first, then the first-email floor, then late items, then the remaining first emails); this send is pushed to the next day`);
   }
   if ((c.recentByLead.get(v.lead_id as number) ?? 0) > 0) warnings.push("a message to this lead was recorded in the last 24 hours");
   return { reasons, codes, warnings, authorization_id: (auth?.id as number) ?? null };
@@ -633,7 +657,9 @@ async function recordEvent(actor: Actor, eventId: string) {
   }
   await audit(actor, "record_send", "send_event", e.id as number, { event_id: eventId });
   try { const sv = await one("SELECT * FROM message_versions WHERE id=?", [e.message_version_id as number]); if (sv) await closePrepTasks(actor, sv, "send recorded"); } catch (err) { console.error("prep close failed", err); }
-  return sendEventView(eventId);
+  // The follow-up sequence: this step is marked as sent and the next step gets its task (idempotent; never authorizes anything).
+  const seq = await afterSend(actor, e.lead_id as number, e.channel as string);
+  return ({ ...(await sendEventView(eventId)), sequence: seq ? { enrollment_id: seq.enrollment_id, status: seq.status, steps_sent: seq.steps_sent, next_task_id: seq.next_task_id, next_step: seq.next_step, rest_until: seq.rest_until, note: seq.note ?? null } : null }) as Row;
 }
 
 export async function reconcileSend(actor: Actor, eventId: string) {
@@ -647,7 +673,8 @@ export async function reconcileSend(actor: Actor, eventId: string) {
 export async function listSends(actor: Actor, status?: string) {
   const sc = can(actor, "leads.view_all") ? "1=1" : "e.reported_by=?";
   return all(
-    `SELECT e.event_id,e.status,e.lead_id,l.company,e.contact_id,e.channel,e.campaign_id,e.message_version_id,e.sent_at,e.activity_id,e.last_error,e.created_at,u.name AS reported_by_name
-     FROM send_events e JOIN leads l ON l.id=e.lead_id JOIN users u ON u.id=e.reported_by
+    `SELECT e.event_id,e.status,e.lead_id,l.company,e.contact_id,e.channel,e.campaign_id,e.message_version_id,e.sent_at,e.activity_id,e.last_error,e.created_at,u.name AS reported_by_name,
+            e.sender_id,e.authorization_id,e.evidence,a.title AS subject_as_sent,a.body AS body_as_sent,a.step_code,a.labels AS experiment_labels
+     FROM send_events e JOIN leads l ON l.id=e.lead_id JOIN users u ON u.id=e.reported_by LEFT JOIN activities a ON a.id=e.activity_id
      WHERE ${sc}${status ? " AND e.status=?" : ""} ORDER BY e.id DESC LIMIT 200`, [...(can(actor, "leads.view_all") ? [] : [actor.id]), ...(status ? [status] : [])]);
 }

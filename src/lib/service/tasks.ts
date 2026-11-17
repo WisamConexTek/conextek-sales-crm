@@ -32,6 +32,9 @@ const createSchema = z.object({
   blockers: optText(1000).optional(),
   campaign_id: optInt.optional(),
   is_test: optBool.optional(),
+  /** A/B labels such as ["MI-A","LANG-B"]. Set them on the first-email task; every follow-up, send and reply of that lead inherits them. */
+  experiment_labels: z.array(z.string().trim().min(1).max(30)).max(8).optional(),
+  sender_id: optInt.optional(),
 });
 
 /** scheduled_at accepts the same timestamp formats as event dates (explicit Z/offset preferred); the raw input is kept. */
@@ -74,9 +77,10 @@ export async function createTask(actor: Actor, input: unknown, isDemo = false) {
 
   const t = now();
   const r = await run(
-    `INSERT INTO tasks (lead_id,assignee_id,created_by,title,instructions,task_type,approval_from,due_at,is_demo,created_at,updated_at,scheduled_at,scheduled_input,channel,action_type,prep_status,blockers,campaign_id,due_on,scheduled_on)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-    [d.lead_id, assignee, actor.id, d.title, d.instructions, d.task_type, approvalFrom, d.due_at, isTest ? 1 : 0, t, t, sch.at, sch.input, d.channel ?? null, d.action_type ?? null, d.prep_status ?? null, d.blockers ?? null, d.campaign_id ?? null, dateOnlyOf(d.due_at), dateOnlyOf(sch.at)],
+    `INSERT INTO tasks (lead_id,assignee_id,created_by,title,instructions,task_type,approval_from,due_at,is_demo,created_at,updated_at,scheduled_at,scheduled_input,channel,action_type,prep_status,blockers,campaign_id,due_on,scheduled_on,labels,sender_id)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [d.lead_id, assignee, actor.id, d.title, d.instructions, d.task_type, approvalFrom, d.due_at, isTest ? 1 : 0, t, t, sch.at, sch.input, d.channel ?? null, d.action_type ?? null, d.prep_status ?? null, d.blockers ?? null, d.campaign_id ?? null, dateOnlyOf(d.due_at), dateOnlyOf(sch.at),
+      d.experiment_labels?.length ? JSON.stringify(d.experiment_labels) : null, d.sender_id ?? null],
   );
   if (d.lead_id)
     await run(
@@ -189,6 +193,7 @@ const updateSchema = z.object({
   prep_status: z.preprocess((v) => (v === "" ? null : v), z.enum(PREP_STATUSES).nullable()).optional(),
   blockers: optText(1000).optional(),
   campaign_id: optInt.optional(),
+  experiment_labels: z.array(z.string().trim().min(1).max(30)).max(8).optional(),
 });
 
 export async function updateTask(actor: Actor, id: number, input: Record<string, unknown>) {
@@ -242,6 +247,12 @@ export async function updateTask(actor: Actor, id: number, input: Record<string,
   if (d.action_type !== undefined) set("action_type", d.action_type);
   if (d.campaign_id !== undefined) { await assertCampaign(d.campaign_id); set("campaign_id", d.campaign_id); }
   if (d.scheduled_at !== undefined) { const sch = schedule(d.scheduled_at); set("scheduled_at", sch.at); set("scheduled_input", sch.input); set("scheduled_on", dateOnlyOf(sch.at)); }
+  if (d.experiment_labels !== undefined) {
+    if (!canManage && !(isCreator && isAssignee)) throw new HttpError(403, "Only a manager can change experiment labels.");
+    // Labels are fixed once the first email of the lead's sequence is out: every later step and reply inherits them.
+    if (t.enrollment_id || (t.lead_id && (await one("SELECT 1 AS x FROM enrollments WHERE lead_id=?", [t.lead_id])))) throw new HttpError(409, "Experiment labels are read-only after the first email is sent.");
+    set("labels", d.experiment_labels.length ? JSON.stringify(d.experiment_labels) : null);
+  }
   if (!sets.length) return;
   const stmts = [{ sql: `UPDATE tasks SET ${sets.join(",")}, updated_at=? WHERE id=?`, args: [...args, now(), id] as InValue[] }];
   if (d.status === "cancelled")

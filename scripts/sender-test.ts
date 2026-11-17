@@ -144,7 +144,7 @@ async function main() {
   // Madison: 2 sends today (above). A bounce makes 1/2 = 50% => auto-pause
   const bres = await IN.recordBounce(owner, { contact_id: d.cid, bounced_at: new Date().toISOString(), reason: "mailbox full" });
   ok(bres.sender_id === m.id, "the bounce is charged to the sender of the message");
-  ok((bres as { sender_paused?: boolean }).sender_paused === true, "bounce rate above 3% pauses the sender automatically");
+  ok((bres as { sender_paused?: boolean }).sender_paused === true, "bounce rate above the limit pauses the sender automatically");
   const mp = await SE.getSender(m.id);
   ok(mp.paused_at && mp.pause_kind === "auto" && /bounce rate/.test(mp.pause_reason ?? ""), "pause is recorded with the reason");
   ok((await one("SELECT COUNT(*) AS n FROM sender_events WHERE sender_id=? AND action='paused' AND auto=1", [m.id]))!.n === 1, "the pause is logged");

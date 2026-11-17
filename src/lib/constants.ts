@@ -90,6 +90,7 @@ export const PERMISSIONS = {
   "keys.manage": "Issue and revoke API keys for employees (never for the Owner or other Chiefs)",
   "campaigns.manage": "Create and edit campaigns, enrol and transfer leads between campaigns",
   "history.import": "Import historical records and correct original lead dates (Owner only unless granted)",
+  "compliance.view": "Compliance monitor: reads everything (reports, plan, messages as sent, suppression list) and can change nothing",
 } as const;
 export type Permission = keyof typeof PERMISSIONS;
 export const ALL_PERMISSIONS = Object.keys(PERMISSIONS) as Permission[];
@@ -114,6 +115,11 @@ export const PRESETS: Record<string, { label: string; role: Role; perms: Permiss
     label: "Outreach (can record sends)",
     role: "employee",
     perms: ["leads.edit", "leads.stage", "activity.record", "message.record_sent", "tasks.create_own", "approvals.submit"],
+  },
+  compliance: {
+    label: "Compliance monitor (reads everything, changes nothing)",
+    role: "employee",
+    perms: ["leads.view_all", "tasks.view_all", "reports.view", "reports.export", "compliance.view"],
   },
   readonly: {
     label: "Read-only",
@@ -212,3 +218,23 @@ export const DEFAULT_LISTS: Record<ListKind, { key: string; label: string; flag?
 /** Lead filters for "needs a person". Kept here (a module with no imports) because it is read while other modules are still loading. */
 export const ATTENTION = ["unanswered", "quiet"] as const;
 export type Attention = (typeof ATTENTION)[number];
+
+/* ---------------- Follow-up sequences ---------------- */
+export const REPLY_CLASSES = ["interested", "soft", "not_now", "not_interested", "referral", "unsubscribe", "out_of_office", "auto_reply", "other"] as const;
+export type ReplyClass = (typeof REPLY_CLASSES)[number];
+export const REPLY_CLASS_LABEL: Record<string, string> = {
+  interested: "Interested", soft: "Has questions", not_now: "Not now", not_interested: "Not interested", referral: "Referral / wrong person",
+  unsubscribe: "Unsubscribe", out_of_office: "Out of office", auto_reply: "Auto-reply", other: "Other",
+};
+/** Roles that own a kind of work. The Owner maps each to a user in Settings. */
+export const WORK_ROLES = ["writer", "hunter", "inbox", "linkedin", "chief", "compliance", "owner"] as const;
+export type WorkRole = (typeof WORK_ROLES)[number];
+export const WORK_ROLE_LABEL: Record<WorkRole, string> = { writer: "Outreach Writer", hunter: "Lead Hunter", inbox: "Inbox Manager", linkedin: "LinkedIn Manager", chief: "Chief", compliance: "Quality Coach", owner: "Owner" };
+export const STEP_CODES = ["E1", "FU1", "FU2", "FU3", "FINAL", "LI_CONNECT", "DM1", "DM2", "DM3", "CALL", "OTHER"] as const;
+/** Short label for the Tasks table, and the longer one used on the Leads page. */
+export const STEP_SHORT: Record<string, string> = { E1: "Email 1", FU1: "FU1", FU2: "FU2", FU3: "FU3", FINAL: "Final email", LI_CONNECT: "LinkedIn connect", DM1: "LinkedIn DM1", DM2: "LinkedIn DM2", DM3: "LinkedIn DM3", CALL: "Call", OTHER: "Other" };
+export const STEP_LONG: Record<string, string> = { E1: "First email", FU1: "Follow-up email 1", FU2: "Follow-up email 2", FU3: "Follow-up email 3", FINAL: "Final email", LI_CONNECT: "LinkedIn connect", DM1: "LinkedIn DM 1", DM2: "LinkedIn DM 2", DM3: "LinkedIn DM 3", CALL: "Call", OTHER: "Next step" };
+export const STEP_ACTION: Record<string, string> = { E1: "send_first_email", FU1: "send_follow_up_1", FU2: "send_follow_up_2", FU3: "send_follow_up_3", FINAL: "send_final_email", LI_CONNECT: "send_linkedin_connect", DM1: "send_linkedin_dm_1", DM2: "send_linkedin_dm_2", DM3: "send_linkedin_dm_3", CALL: "call", OTHER: "other" };
+export const TASK_DISPLAY_TYPES = ["Email 1", "FU1", "FU2", "FU3", "Email 1 draft", "FU draft", "Reply", "Research", "LinkedIn connect", "LinkedIn DM1", "LinkedIn DM2", "LinkedIn DM3", "Review", "Revisit", "Pricing / offer", "Other"] as const;
+/** Mail providers whose domain says nothing about the company. Never used to match two contacts to one company. */
+export const FREE_MAIL = ["gmail.com", "googlemail.com", "yahoo.com", "hotmail.com", "outlook.com", "live.com", "msn.com", "icloud.com", "me.com", "aol.com", "proton.me", "protonmail.com", "163.com", "126.com", "qq.com", "foxmail.com", "sina.com", "sina.cn", "sohu.com", "yeah.net", "aliyun.com", "139.com"];

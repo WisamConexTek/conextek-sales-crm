@@ -7,7 +7,8 @@ import { leadOperations } from "@/lib/service/schedule";
 import { listVersions, canAuthorizeSend } from "@/lib/service/sends";
 import { leadApiActivity } from "@/lib/service/agents";
 import { all } from "@/lib/db";
-import { enrolLeadAction } from "@/app/actions";
+import { enrolLeadAction, controlSequenceAction } from "@/app/actions";
+import { getLeadSequence } from "@/lib/service/sequences";
 import { getLists } from "@/lib/service/lists";
 import { assignableUsers } from "@/lib/service/users";
 import {
@@ -54,6 +55,8 @@ export default async function LeadPage({ params, searchParams }: { params: Promi
     return cur && !a.find((x) => x.key === cur) ? [...a, { key: cur, label: `${lab(k)[cur] ?? cur} (retired)` }] : a;
   };
   const back = `/leads/${leadId}`;
+  const sequences = await getLeadSequence(leadId);
+  const SEQ_TONE = { running: "green", paused: "amber", stopped: "gray", completed: "blue", resting: "sky" } as const;
   const asc = sget(sp, "order") === "asc";
   const hist = asc ? [...history].reverse() : history;
   const sentMessages = history.filter((h) => h.type === "message").map((h) => ({ id: h.id as number, label: `${fmtDateTime(h.occurred_at)} · ${MESSAGE_KIND_LABEL[h.message_kind] ?? "Message"}${h.title ? ` · ${h.title}` : ""}` }));
@@ -179,6 +182,37 @@ export default async function LeadPage({ params, searchParams }: { params: Promi
 
 
       {/* ---- Contacts ---- */}
+      {sequences.map((sq) => (
+        <Card key={sq.enrollment_id as number} title={<>Follow-up sequence · {sq.sequence.name as string} <span className="font-normal text-slate-500">v{sq.sequence.version as number}</span></>}
+          right={<Badge tone={SEQ_TONE[sq.status as keyof typeof SEQ_TONE] ?? "gray"}>{sq.status === "resting" && sq.rest_until ? `resting until ${fmtYmd(sq.rest_until as string)}` : `${sq.status}${sq.stop_reason ? ` · ${sq.stop_reason}` : ""}`}</Badge>}>
+          <div className="flex flex-wrap gap-x-6 gap-y-1 text-[13px] text-slate-600">
+            <span>Step {Math.min(Number(sq.steps_sent), sq.step_total)} of {sq.step_total} sent</span>
+            {sq.sender ? <span>Sender: {sq.sender.display_name as string} (locked to the thread)</span> : null}
+            {sq.thread_subject ? <span>Thread: {sq.thread_subject as string}</span> : null}
+            {sq.experiment_labels.length ? <span>Labels: {sq.experiment_labels.join(", ")}</span> : null}
+          </div>
+          <ol className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+            {sq.steps.map((st) => (
+              <li key={st.position as number} className={`rounded-lg border px-3 py-2 text-[13px] ${st.status === "sent" ? "border-emerald-200 bg-emerald-50" : st.status === "planned" ? "border-brand-100 bg-brand-50" : "border-slate-200 bg-slate-50"}`}>
+                <div className="flex items-center justify-between gap-2"><b className="font-medium text-slate-900">{st.position as number}. {st.label as string}</b><span className="text-xs text-slate-500">{st.status === "not_planned" ? "not yet" : (st.status as string)}{st.late ? " · LATE" : ""}</span></div>
+                <div className="mt-0.5 text-xs text-slate-600">
+                  {st.status === "sent" && st.sent_at ? `Sent ${fmtDateTime(st.sent_at as string)}` : st.due_on ? `Due ${fmtYmd(st.due_on as string)}, window to ${fmtYmd(st.window_end_on as string)}` : "Planned when the step before is sent"}
+                  {st.task_id && st.status === "planned" ? <> · <Link href={`/tasks?task=${st.task_id}`}>{st.prep_status ? String(st.prep_status).replace(/_/g, " ") : "task"}</Link></> : null}
+                  {st.note ? <div className="text-slate-500">{st.note as string}</div> : null}
+                </div>
+              </li>
+            ))}
+          </ol>
+          {isManager(me) && ["running", "paused"].includes(sq.status as string) && (
+            <form action={controlSequenceAction} className="mt-3 flex flex-wrap items-end gap-2 border-t border-slate-100 pt-3">
+              <input type="hidden" name="_back" value={back} /><input type="hidden" name="lead_id" value={leadId} /><input type="hidden" name="channel" value={sq.channel as string} />
+              <div className="min-w-56 flex-1"><label className="label">Reason (kept in the history)</label><input name="reason" required minLength={3} className="input" /></div>
+              {sq.status === "running" ? <button name="action" value="pause" className="btn">Pause</button> : <button name="action" value="resume" className="btn btn-primary">Resume</button>}
+              <button name="action" value="stop" className="btn btn-danger">Stop the sequence</button>
+            </form>
+          )}
+        </Card>
+      ))}
       <Card title={`Contacts (${contacts.length})`}>
         {contacts.length === 0 && <p className="text-sm text-slate-500">No contacts yet.</p>}
         <div className="grid gap-3 md:grid-cols-2">

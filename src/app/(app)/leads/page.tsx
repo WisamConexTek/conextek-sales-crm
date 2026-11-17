@@ -1,14 +1,17 @@
 import Link from "next/link";
 import type { ReactNode } from "react";
 import { requireUser, can } from "@/lib/auth";
-import { listLeads, leadListExtras, leadStageCounts, leadFiltersFrom, type LeadFilters } from "@/lib/service/leads";
+import { listLeads, leadListExtras, leadStageCounts, leadFiltersFrom, nextStepOf, type LeadFilters } from "@/lib/service/leads";
+import { leadSequenceInfo } from "@/lib/service/sequences";
+import { listSenders } from "@/lib/service/senders";
+import { SortTh } from "@/components/Sort";
 import { listCampaigns } from "@/lib/service/campaigns";
 import { getLists } from "@/lib/service/lists";
 import { assignableUsers } from "@/lib/service/users";
 import { PageHeader, Flash, StageBadge, DemoBadge, Empty, Badge } from "@/components/ui";
 import { Icon } from "@/components/dashboard/charts";
-import { fmtDate, fmtShort, fmtYmd, isOverdue, toLocalInput } from "@/lib/format";
-import { ACTIVITY_TYPE_LABEL, MESSAGE_KIND_LABEL } from "@/lib/constants";
+import { fmtDateTime, fmtShort, fmtYmd, toLocalInput } from "@/lib/format";
+import { STEP_SHORT } from "@/lib/constants";
 import { demoOn, q, sget, snum, type SP } from "@/lib/view";
 import { todayYmd } from "@/lib/db";
 
@@ -18,7 +21,10 @@ const ACTIVE_LABEL = { "7": "Active in the last 7 days", "30": "Active in the la
 const CONTACT_LABEL = { has_email: "Has an email address", no_email: "No email address" } as const;
 const ATTENTION_LABEL = { unanswered: "Reply not answered yet", quiet: "Nothing planned, quiet 7+ days" } as const;
 const SORT_LABEL = { "": "Latest activity first", oldest: "Longest quiet first", added: "Newest leads first", due: "Next due first", company: "Company A–Z" } as const;
-const STATE_TONE = { overdue: "red", blocked: "amber", ready: "green", planned: "gray", completed: "blue" } as const;
+const NEXT_LABEL = { overdue: "Next step overdue", due_today: "Next step due today", due_week: "Next step due this week", missing: "No next step" } as const;
+const SEQ_LABEL = { running: "Sequence running", paused: "Sequence paused", resting: "Resting", completed: "Sequence finished", stopped_reply: "Stopped by a reply", stopped_bounce: "Stopped by a bounce or opt-out", none: "Not in a sequence" } as const;
+const STEP_SENT_LABEL = { E1: "First email sent", FU1: "Follow-up 1 sent", FU2: "Follow-up 2 sent" } as const;
+const NEXT_TONE = { overdue: "text-red-700", due: "text-amber-700", blocked: "text-amber-700", planned: "text-slate-800", resting: "text-slate-600", none: "text-slate-400" } as const;
 
 const ago = (iso?: string | null) => {
   if (!iso) return null;
@@ -45,8 +51,10 @@ export default async function LeadsPage({ searchParams }: { searchParams: SP }) 
   const size = [25, 50, 100, 200].includes(snum(sp, "size") ?? 0) ? (snum(sp, "size") as number) : 50;
   const f: LeadFilters = { ...leadFiltersFrom((k) => sget(sp, k)), page: snum(sp, "page") ?? 1, pageSize: size, includeDemo: await demoOn(), includeHistorical: !hideHist };
   const viewAll = can(me, "leads.view_all");
-  const [res, stageCounts, lists, users, camps] = await Promise.all([listLeads(me, f), leadStageCounts(me, f), getLists(true), assignableUsers(), listCampaigns()]);
-  const extra = await leadListExtras(res.rows.map((l) => l.id as number));
+  const [res, stageCounts, lists, users, camps, senders] = await Promise.all([listLeads(me, f), leadStageCounts(me, f), getLists(true), assignableUsers(), listCampaigns(), listSenders()]);
+  const ids = res.rows.map((l) => l.id as number);
+  const [extra, seqInfo] = await Promise.all([leadListExtras(ids), leadSequenceInfo(ids)]);
+  const closed = new Set(lists.stage.filter((i) => ["won", "lost", "closed"].includes(String(i.flag ?? ""))).map((i) => i.key));
   const label = (kind: string) => Object.fromEntries(lists[kind].map((i) => [i.key, i.label])) as Record<string, string>;
   const L = { stage: label("stage"), market: label("market"), segment: label("segment"), industry: label("industry"), source: label("source"), service: label("service"), language: label("language"), channel: label("channel") };
   const flag = Object.fromEntries(lists.stage.map((i) => [i.key, i.flag]));
@@ -55,7 +63,7 @@ export default async function LeadsPage({ searchParams }: { searchParams: SP }) 
   // Everything that is in the URL, so links keep the other filters when they change one.
   const keep: Record<string, string | number | undefined> = {
     q: f.q, owner: f.owner, campaign: f.campaign, channel: f.channel, market: f.market, country: f.country, segment: f.segment, industry: f.industry, source: f.source, service: f.service, language: f.language,
-    contact: f.contact, stage: f.stage, outreach: f.outreach, task: f.task, attention: f.attention, added_from: f.addedFrom, added_to: f.addedTo, active: f.active, sort: f.sort, hide_hist: hideHist ? 1 : undefined, size: size === 50 ? undefined : size,
+    contact: f.contact, stage: f.stage, outreach: f.outreach, task: f.task, attention: f.attention, added_from: f.addedFrom, added_to: f.addedTo, active: f.active, sort: f.sort, next_step: f.nextStep, sequence_status: f.sequenceStatus, sequence_step: f.sequenceStep, sender: f.sender, label: f.label, hide_hist: hideHist ? 1 : undefined, size: size === 50 ? undefined : size,
   };
   const href = (change: Record<string, string | number | undefined>) => `/leads${q({ ...keep, ...change, page: undefined })}`;
 
@@ -70,6 +78,11 @@ export default async function LeadsPage({ searchParams }: { searchParams: SP }) 
   chip(f.outreach, "outreach", f.outreach ? OUTREACH_LABEL[f.outreach] : "");
   chip(f.task, "task", f.task ? TASK_LABEL[f.task] : "");
   chip(f.attention, "attention", f.attention ? ATTENTION_LABEL[f.attention] : "");
+  chip(f.nextStep, "next_step", f.nextStep ? NEXT_LABEL[f.nextStep] : "");
+  chip(f.sequenceStatus, "sequence_status", f.sequenceStatus ? SEQ_LABEL[f.sequenceStatus as keyof typeof SEQ_LABEL] ?? f.sequenceStatus : "");
+  chip(f.sequenceStep, "sequence_step", `Last step sent: ${STEP_SHORT[f.sequenceStep ?? ""] ?? f.sequenceStep}`);
+  chip(f.sender, "sender", `Sender: ${senders.find((x) => x.id === f.sender)?.display_name ?? `#${f.sender}`}`);
+  chip(f.label, "label", `Label: ${f.label}`);
   chip(f.market, "market", `Market: ${L.market[f.market ?? ""] ?? f.market}`);
   chip(f.country, "country", `Country: ${f.country}`);
   chip(f.segment, "segment", `Segment: ${L.segment[f.segment ?? ""] ?? f.segment}`);
@@ -106,6 +119,7 @@ export default async function LeadsPage({ searchParams }: { searchParams: SP }) 
   );
   const totalAllStages = [...stageCounts.values()].reduce((a, n) => a + n, 0);
   const th = "th whitespace-nowrap";
+  const today = todayYmd();
 
   return (
     <div>
@@ -142,6 +156,8 @@ export default async function LeadsPage({ searchParams }: { searchParams: SP }) 
               {viewAll && <Sel name="owner" label="Owner" value={f.owner}><option value="">Anyone</option><option value="none">No owner</option>{users.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}</Sel>}
               <Sel name="campaign" label="Campaign" value={f.campaign}><option value="">Any</option><option value="none">In no campaign</option>{camps.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}</Sel>
               <Sel name="channel" label="Channel used" value={f.channel}><option value="">Any</option>{opts("channel")}</Sel>
+              <Sel name="sender" label="Sender" value={f.sender}><option value="">Any</option>{senders.map((x) => <option key={x.id} value={x.id}>{x.display_name}</option>)}</Sel>
+              <div><label className="label" htmlFor="f-label">Experiment label</label><input id="f-label" name="label" defaultValue={f.label} placeholder="e.g. MI-A" className={`input ${f.label ? "border-brand-500! bg-brand-50!" : ""}`} /></div>
             </Group>
             <Group title="Company">
               <Sel name="market" label="Target market" value={f.market}><option value="">Any</option>{opts("market")}</Sel>
@@ -159,6 +175,9 @@ export default async function LeadsPage({ searchParams }: { searchParams: SP }) 
               <Sel name="outreach" label="Outreach" value={f.outreach}><option value="">Any</option>{dict(OUTREACH_LABEL)}</Sel>
               <Sel name="task" label="Open work" value={f.task}><option value="">Any</option>{dict(TASK_LABEL)}</Sel>
               <Sel name="attention" label="Needs attention" value={f.attention}><option value="">Any</option>{dict(ATTENTION_LABEL)}</Sel>
+              <Sel name="next_step" label="Next step" value={f.nextStep}><option value="">Any</option>{dict(NEXT_LABEL)}</Sel>
+              <Sel name="sequence_status" label="Follow-up sequence" value={f.sequenceStatus}><option value="">Any</option>{dict(SEQ_LABEL)}</Sel>
+              <Sel name="sequence_step" label="Last step sent" value={f.sequenceStep}><option value="">Any</option>{dict(STEP_SENT_LABEL)}</Sel>
             </Group>
             <Group title="Dates">
               <Sel name="active" label="Last activity" value={f.active}><option value="">Any time</option>{dict(ACTIVE_LABEL)}</Sel>
@@ -191,13 +210,17 @@ export default async function LeadsPage({ searchParams }: { searchParams: SP }) 
       )}
 
       <div className="card overflow-x-auto">
-        <table className="w-full min-w-[1160px] text-[13px]">
+        <table className="w-full min-w-[1130px] text-[13px] [&_td]:px-2 [&_th]:px-2 [&_td:first-child]:pl-3.5 [&_th:first-child]:pl-3.5">
           <thead className="border-b border-slate-200 bg-slate-50"><tr>
-            {["Date added", "Company", "Contact", "Campaign · owner", "Stage", "Outreach", "Last activity", "Next step", "Source"].map((h) => <th key={h} className={th}>{h}</th>)}
+            {([["Date added", "lead_date"], ["Company", "company"], ["Contact", null], ["Campaign · owner", "campaign"], ["Stage", "stage"], ["Outreach", "emails_sent"], ["Emails sent", "last_email_sent_at"], ["Next step", "next_due"], ["Source", "source"]] as [string, string | null][]).map(([h, field]) =>
+              field ? <SortTh key={h} label={h} field={field} sort={f.sort ? res.applied_sort : undefined} href={(v) => href({ sort: v })} className="whitespace-nowrap" /> : <th key={h} className={th}>{h}</th>)}
           </tr></thead>
           <tbody className="divide-y divide-slate-100">
             {res.rows.map((l) => {
-              const c = extra.contact.get(l.id), o = extra.outreach.get(l.id), t = extra.nextTask.get(l.id), cs = extra.campaigns.get(l.id);
+              const c = extra.contact.get(l.id), o = extra.outreach.get(l.id), t = extra.nextTask.get(l.id), cs = extra.campaigns.get(l.id), sq = seqInfo.get(l.id);
+              const ns = nextStepOf(t, sq, today);
+              // An open, contacted lead with nothing planned is a gap that should not exist.
+              const gap = ns.state === "none" && (o?.sent ?? 0) > 0 && !l.historical_only && !closed.has(l.stage) && !c?.optedOut && !(o?.replies);
               const mk = l.market ? L.market[l.market] ?? l.market : null;
               const where = [l.country, mk && String(mk).toLowerCase() !== String(l.country ?? "").toLowerCase() ? mk : null].filter(Boolean).join(" · ");
               const kind = [l.industry ? L.industry[l.industry] ?? l.industry : null, l.segment ? L.segment[l.segment] ?? l.segment : null, l.service ? L.service[l.service] ?? l.service : null].filter(Boolean).join(" · ");
@@ -220,7 +243,7 @@ export default async function LeadsPage({ searchParams }: { searchParams: SP }) 
                       </div>
                     ) : <span className="text-slate-400">—</span>}
                   </td>
-                  <td className="td max-w-52">
+                  <td className="td max-w-44">
                     <Link href={`/leads/${l.id}`} className="font-semibold">{l.company}</Link> {l.is_demo ? <DemoBadge /> : null}{l.historical_only ? <> <Badge tone="gray">historical</Badge></> : null}
                     <div className="truncate text-xs text-slate-500">{l.website ? <a href={l.website} target="_blank" rel="noreferrer" className="text-slate-500">{l.domain ?? l.website}</a> : "no website"}{where ? ` · ${where}` : ""}</div>
                     {kind && <div className="truncate text-xs text-slate-400">{kind}</div>}
@@ -243,24 +266,31 @@ export default async function LeadsPage({ searchParams }: { searchParams: SP }) 
                     {!o || (o.sent === 0 && o.replies === 0) ? <span className="text-slate-400">not contacted</span> : (
                       <>
                         <div className="flex items-center gap-1.5"><span className="font-semibold text-slate-900 tabular-nums">{o.sent}</span><span className="text-slate-500">sent</span>{o.replies > 0 && <Badge tone="green">{o.replies} {o.replies === 1 ? "reply" : "replies"}</Badge>}{o.bounced && <Badge tone="red">bounce</Badge>}</div>
-                        <div className="text-xs text-slate-500">{o.lastReplyAt ? `replied ${ago(o.lastReplyAt)}` : o.lastSentAt ? `last sent ${ago(o.lastSentAt)}` : ""}</div>
+                        <div className="text-xs text-slate-500">{o.lastReplyAt ? `replied ${ago(o.lastReplyAt)}` : o.lastSentAt ? `${ago(o.lastSentAt)}` : ""}</div>
                       </>
                     )}
                   </td>
                   <td className="td whitespace-nowrap">
-                    {o?.lastType ? <div className="text-slate-800">{o.lastType === "message" ? MESSAGE_KIND_LABEL[o.lastKind ?? ""] ?? "Message" : ACTIVITY_TYPE_LABEL[o.lastType] ?? o.lastType}</div> : <div className="text-slate-400">nothing yet</div>}
-                    <div className="text-xs text-slate-500" title={fmtShort(l.last_activity_at)}>{ago(l.last_activity_at) ?? "—"}</div>
+                    {sq?.first_email_sent_at ? (
+                      <>
+                        <div className="text-slate-800"><span className="text-slate-500">1st email</span> · <span title={fmtDateTime(sq.first_email_sent_at)}>{fmtShort(sq.first_email_sent_at)}</span></div>
+                        {sq.emails_sent_count > 1 && sq.last_email_sent_at ? <div className="text-xs text-slate-600"><span className="text-slate-500">Last</span> · {sq.last_email_step ? `${STEP_SHORT[sq.last_email_step] ?? sq.last_email_step} · ` : ""}{fmtShort(sq.last_email_sent_at)}</div> : null}
+                        {sq.step_total ? <div className="text-xs text-slate-500">Step {Math.min(sq.steps_sent, sq.step_total)} of {sq.step_total}{sq.experiment_labels.length ? ` · ${sq.experiment_labels.join(", ")}` : ""}</div> : null}
+                      </>
+                    ) : <span className="text-slate-400" title={l.last_activity_at ? `Last activity ${fmtShort(l.last_activity_at)}` : undefined}>no email yet</span>}
                   </td>
-                  <td className="td max-w-52">
+                  <td className="td max-w-56">
                     {t ? (
                       <>
-                        <div className="flex items-center gap-2"><Link href={`/tasks/${t.id}`} className="truncate font-medium">{t.title}</Link><Badge tone={STATE_TONE[t.state as keyof typeof STATE_TONE]}>{t.state}</Badge></div>
-                        <div className="truncate text-xs text-slate-500" title={t.reason ?? undefined}>{t.assignee_name}{t.date_only ? ` · ${fmtYmd(t.on)}` : t.sort_at ? ` · ${fmtShort(t.sort_at)}` : " · no date"}{t.reason ? ` · ${t.reason}` : ""}</div>
+                        <Link href={`/tasks?task=${t.id}`} className={`block truncate font-medium no-underline hover:underline ${NEXT_TONE[ns.state]}!`} title={t.title}>{ns.label}{ns.step_number ? <span className="font-normal text-slate-400"> · {ns.step_number}/{ns.step_total}</span> : null}</Link>
+                        <div className={`text-xs ${ns.state === "overdue" ? "font-semibold text-red-700" : ns.state === "due" ? "font-semibold text-amber-700" : "text-slate-500"}`}>
+                          {ns.state === "overdue" && ns.days_overdue > 0 ? `Overdue ${ns.days_overdue} day${ns.days_overdue === 1 ? "" : "s"} · ` : ""}{!ns.due_on ? "no date" : ns.due_on === today ? "today" : fmtYmd(ns.due_on)}
+                        </div>
+                        <div className="truncate text-xs text-slate-500" title={t.reason ?? undefined}>{t.assignee_name}{ns.note ? ` · ${ns.note}` : ""}</div>
                       </>
-                    ) : l.next_action ? (
-                      // No open task: fall back to the old free-text note, clearly marked as such.
-                      <><div className="truncate text-slate-600">{l.next_action}</div><div className={`text-xs ${isOverdue(l.next_due_at) ? "text-red-600" : "text-slate-400"}`}>old note, no task{l.next_due_at ? ` · ${fmtDate(l.next_due_at)}` : ""}</div></>
-                    ) : <span className="text-slate-400">nothing planned</span>}
+                    ) : ns.state === "resting" ? <span className="text-slate-600">{ns.text}</span>
+                      : gap ? <span className="font-semibold text-red-700">⚠ No next step</span>
+                      : <span className="text-slate-400">{sq?.sequence_status?.startsWith("stopped") ? `sequence stopped${sq.stop_reason ? ` (${sq.stop_reason})` : ""}` : "nothing planned"}</span>}
                   </td>
                   <td className="td whitespace-nowrap">
                     {l.source ? <span className="text-slate-700">{L.source[l.source] ?? l.source}</span> : <span className="text-slate-400">—</span>}

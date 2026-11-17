@@ -255,7 +255,7 @@ async function main() {
   console.log("Leads list and dashboard");
   const ll = await L.listLeads(owner, { campaign: camp });
   const ex = await L.leadListExtras(ll.rows.map((l) => l.id as number));
-  ok(ll.total === 3 && ll.page_size === 50 && ll.has_more === false && ex.campaigns.get(leadId)![0].name === "Agent Test" && ex.nextTask.get(lead2)!.title === "Research Pluto" && !ex.nextTask.has(leadId), "the leads list shows each lead's campaign and its live next task");
+  ok(ll.total === 3 && ll.page_size === 50 && ll.has_more === false && ex.campaigns.get(leadId)![0].name === "Agent Test" && ex.nextTask.get(lead2)!.title === "Research Pluto" && /^FU1 · /.test(String(ex.nextTask.get(leadId)?.title)), "the leads list shows each lead's campaign and its live next task (the sent lead now has its follow-up planned)");
   for (const [who2, label] of [[owner, "Owner"], [await actorById(novaId, "session"), "agent"]] as const) {
     const sc = D.dashScope(who2), p = D.resolvePeriod({});
     const [b, a, at, res, pl, f] = await Promise.all([D.loadBoard(who2, sc), D.loadActions(who2, sc), D.loadAttention(who2, sc), D.loadResults(who2, sc, p), D.loadPipeline(who2, sc, p), D.loadFeed(who2, sc)]);
