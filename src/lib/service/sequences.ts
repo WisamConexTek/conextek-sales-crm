@@ -208,6 +208,10 @@ export async function updateSequence(actor: Actor, id: number, input: unknown) {
   const d = parse(seqSchema, input);
   const s = await one("SELECT * FROM sequences WHERE id=?", [id]);
   if (!s) throw new HttpError(404, "Sequence not found.");
+  if (d.status === "active" && s.status !== "active") {
+    const other = await clash(id, (s.campaign_id as number) ?? null, s.channel as string, (s.market as string) ?? null);
+    if (other) throw new HttpError(409, `"${other.name}" is already the active sequence for this campaign and channel. Retire it first, then activate this one.`);
+  }
   const t = now();
   let version = s.version as number;
   if (d.steps) {
@@ -226,6 +230,41 @@ export async function updateSequence(actor: Actor, id: number, input: unknown) {
   await audit(actor, "sequence_settings_changed", "sequence", id, { reason: d.reason ?? null, from_version: s.version, to_version: version, changed: Object.keys(d).filter((k) => k !== "reason"), running_enrollments_keep_their_version: running });
   return { ...(await getSequence(id)), running_enrollments: running, note: version !== s.version ? `Version ${version} applies to leads enrolled from now on. ${running} running lead${running === 1 ? "" : "s"} keep version ${s.version}.` : undefined };
 }
+const createSchema = z.object({
+  name: z.string().trim().min(2, "required").max(120), campaign_id: z.preprocess((v) => (v === "" || v == null ? null : Number(v)), z.number().int().nullable()).optional(),
+  channel: z.enum(["email", "linkedin"]), market: optText(40).optional(), copy_from: z.coerce.number().int().optional(),
+  steps: z.array(stepSchema).min(1).max(12).optional(), rest_days: z.coerce.number().int().min(0).max(730).optional(), day_mode: z.enum(["calendar", "business"]).optional(), end_action: z.enum(["rest", "close", "review", "stop"]).optional(),
+});
+/** Two active sequences for the same campaign, channel and market would make it unclear which one a lead follows. */
+async function clash(id: number, campaignId: number | null, channel: string, market: string | null) {
+  return one("SELECT id,name FROM sequences WHERE id<>? AND status='active' AND channel=? AND COALESCE(campaign_id,0)=? AND COALESCE(market,'')=?", [id, channel, campaignId ?? 0, market ?? ""]);
+}
+/** Owner only. A new sequence starts as a draft: nothing follows it until the Owner activates it. Steps are given, or copied from another sequence. */
+export async function createSequence(actor: Actor, input: unknown) {
+  if (actor.role !== "owner") throw new HttpError(403, "Only the Owner can create a follow-up sequence.");
+  const d = parse(createSchema, input);
+  if (d.campaign_id && !(await one("SELECT id FROM campaigns WHERE id=?", [d.campaign_id]))) throw new HttpError(400, "campaign_id: unknown campaign.");
+  let steps: Row[] | z.infer<typeof stepSchema>[] | undefined = d.steps;
+  if (!steps && d.copy_from) {
+    const src = await one("SELECT id,version,channel FROM sequences WHERE id=?", [d.copy_from]);
+    if (!src) throw new HttpError(400, "copy_from: unknown sequence.");
+    if (src.channel !== d.channel) throw new HttpError(400, "copy_from: that sequence is for another channel.");
+    steps = await all("SELECT step_code,anchor,offset_start,offset_end,min_gap_prev,thread_reply,assignee_role,active FROM sequence_steps WHERE sequence_id=? AND version=? ORDER BY position", [src.id as number, src.version as number]);
+  }
+  if (!steps?.length) throw new HttpError(400, "steps: give the steps, or copy_from another sequence.");
+  for (const [i, st] of steps.entries()) if (Number(st.offset_end) < Number(st.offset_start)) throw new HttpError(400, `steps.${i}.offset_end: the window cannot end before it starts.`);
+  const t = now();
+  let key = d.name.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 40) || "sequence";
+  while (await one("SELECT id FROM sequences WHERE key=?", [key])) key = `${key.slice(0, 36)}_${Math.random().toString(36).slice(2, 5)}`;
+  const r = await run("INSERT INTO sequences (key,name,campaign_id,channel,market,version,status,day_mode,rest_days,end_action,updated_by,created_at,updated_at) VALUES (?,?,?,?,?,1,'draft',?,?,?,?,?,?)",
+    [key, d.name, d.campaign_id ?? null, d.channel, d.market ?? null, d.day_mode ?? "calendar", d.rest_days ?? 60, d.end_action ?? (d.channel === "linkedin" ? "stop" : "rest"), actor.id, t, t]);
+  for (const [i, st] of steps.entries())
+    await run("INSERT INTO sequence_steps (sequence_id,version,position,step_code,anchor,offset_start,offset_end,min_gap_prev,thread_reply,assignee_role,active) VALUES (?,1,?,?,?,?,?,?,?,?,?)",
+      [r.id, i + 1, st.step_code as string, i === 0 && st.anchor === "previous" ? "first" : (st.anchor as string) ?? "first", Number(st.offset_start), Number(st.offset_end), st.min_gap_prev == null ? null : Number(st.min_gap_prev), st.thread_reply === false || st.thread_reply === 0 || i === 0 ? 0 : 1, (st.assignee_role as string) ?? (d.channel === "linkedin" ? "linkedin" : "writer"), st.active === false || st.active === 0 ? 0 : 1]);
+  await audit(actor, "sequence_settings_changed", "sequence", r.id, { created: true, name: d.name, campaign_id: d.campaign_id ?? null, channel: d.channel, copy_from: d.copy_from ?? null });
+  return { ...(await getSequence(r.id)), note: "Created as a draft. Activate it when it is ready (POST /sequences/{id}/activate); until then no lead follows it." };
+}
+
 export async function sequenceLog(limit = 100) {
   return all("SELECT id,actor_name,action,entity,entity_id,detail,created_at FROM audit_log WHERE action='sequence_settings_changed' ORDER BY id DESC LIMIT ?", [Math.min(Math.max(limit, 1), 500)]);
 }
@@ -233,11 +272,11 @@ export async function sequenceLog(limit = 100) {
 /* ---------- the plan for one lead and channel ---------- */
 type Ctx = { settings: SeqSettings; sequences: Row[]; steps: Row[]; campaigns: Map<number, Row> };
 async function loadCtx(): Promise<Ctx> {
-  const [settings, sequences, steps, camps] = await Promise.all([seqSettings(), all("SELECT * FROM sequences WHERE status='active'"), all("SELECT * FROM sequence_steps WHERE active=1 ORDER BY sequence_id,version,position"), all("SELECT id,key,name,status FROM campaigns")]);
+  const [settings, sequences, steps, camps] = await Promise.all([seqSettings(), all("SELECT * FROM sequences"), all("SELECT * FROM sequence_steps WHERE active=1 ORDER BY sequence_id,version,position"), all("SELECT id,key,name,status FROM campaigns")]);
   return { settings, sequences, steps, campaigns: new Map(camps.map((c) => [c.id as number, c])) };
 }
 function resolveSequence(ctx: Ctx, campaignId: number | null, channel: string, market: string | null): Row | null {
-  const pool = ctx.sequences.filter((s) => s.channel === channel);
+  const pool = ctx.sequences.filter((s) => s.channel === channel && s.status === "active");
   return pool.find((s) => campaignId && s.campaign_id === campaignId && s.market && s.market === market)
     ?? pool.find((s) => campaignId && s.campaign_id === campaignId && !s.market)
     ?? pool.find((s) => !s.campaign_id && !s.market) ?? null;
@@ -255,7 +294,7 @@ export type LeadPlan = {
   step_total: number; next: StepPlan | null; rest_until: string | null; end_action: string; action: string;
 };
 
-function buildPlan(ctx: Ctx, lead: Row, channel: string, sends: Row[], memberships: number[], opts: { acceptOn?: string | null; version?: number; sequenceId?: number } = {}): LeadPlan | null {
+function buildPlan(ctx: Ctx, lead: Row, channel: string, sends: Row[], memberships: number[], opts: { acceptOn?: string | null; version?: number; sequenceId?: number; skipped?: Map<number, string> } = {}): LeadPlan | null {
   const mine = sends.filter((s) => s.channel === channel);
   const campaignId = (mine.find((s) => s.campaign_id)?.campaign_id as number | undefined) ?? (memberships.length ? memberships[memberships.length - 1] : null);
   const camp = campaignId ? ctx.campaigns.get(campaignId) ?? null : null;
@@ -267,12 +306,17 @@ function buildPlan(ctx: Ctx, lead: Row, channel: string, sends: Row[], membershi
   const group = marketOfCampaign(camp, lead);
   const weekend = ctx.settings.weekends[group];
   const today = todayYmd();
-  const sent = mine.slice(0, steps.length).map((s, i) => ({ position: steps[i].position as number, code: steps[i].step_code as string, sent_at: s.occurred_at as string, activity_id: s.id as number, message_version_id: (s.message_version_id as number) ?? null, subject: (s.title as string) ?? null, precision: s.occurred_precision as string }));
+  // A skipped step is passed over: sends are matched to the steps that are left, and the day it was skipped counts as "the step before".
+  const skipped = opts.skipped ?? new Map<number, string>();
+  const live = steps.filter((s) => !skipped.has(s.position as number));
+  const sent = mine.slice(0, live.length).map((s, i) => ({ position: live[i].position as number, code: live[i].step_code as string, sent_at: s.occurred_at as string, activity_id: s.id as number, message_version_id: (s.message_version_id as number) ?? null, subject: (s.title as string) ?? null, precision: s.occurred_precision as string }));
   const first = sent[0];
   const firstOn = first ? sentDay(first.sent_at, first.precision, group) : opts.acceptOn ?? null;
   const last = sent[sent.length - 1];
-  const prevOn = last ? sentDay(last.sent_at, last.precision, group) : opts.acceptOn ?? null;
-  const nextStep = steps[sent.length];
+  const lastSkip = [...skipped.values()].sort().pop() ?? null;
+  const lastSentOn = last ? sentDay(last.sent_at, last.precision, group) : opts.acceptOn ?? null;
+  const prevOn = lastSkip && (!lastSentOn || lastSkip > lastSentOn) ? lastSkip : lastSentOn;
+  const nextStep = live[sent.length];
   let next: StepPlan | null = null;
   if (nextStep && firstOn && (sent.length > 0 || nextStep.anchor === "condition")) {
     const p = planStep(nextStep, firstOn, prevOn, weekend, seq.day_mode === "business");
@@ -327,7 +371,9 @@ export async function syncEnrollment(actor: Actor, leadId: number, channel: stri
   if (enr && enr.status !== "running") return { ...none, enrolled: true, enrollment_id: enr.id as number, status: enr.status as string, steps_sent: Number(enr.steps_sent), rest_until: (enr.rest_until as string) ?? null, note: `The sequence is ${enr.status}${enr.stop_reason ? ` (${enr.stop_reason})` : ""}; nothing was planned.` };
   const [sends, mem] = await Promise.all([all(SENDS_SQL("?"), [leadId]), all("SELECT campaign_id FROM lead_campaigns WHERE lead_id=? AND status='active' ORDER BY id", [leadId])]);
   const acceptOn = opts.acceptOn ?? (enr?.anchor_on as string | null) ?? null;
-  const plan = buildPlan(ctx, lead, channel, sends, mem.map((m) => m.campaign_id as number), { acceptOn, version: enr ? (enr.sequence_version as number) : undefined, sequenceId: enr ? (enr.sequence_id as number) : undefined });
+  const skipRows = enr ? await all("SELECT position, sent_at FROM enrollment_steps WHERE enrollment_id=? AND status='skipped'", [enr.id as number]) : [];
+  const skipped = new Map(skipRows.map((r) => [r.position as number, todayYmd(undefined, new Date((r.sent_at as string) ?? now()))]));
+  const plan = buildPlan(ctx, lead, channel, sends, mem.map((m) => m.campaign_id as number), { acceptOn, version: enr ? (enr.sequence_version as number) : undefined, sequenceId: enr ? (enr.sequence_id as number) : undefined, skipped });
   if (!plan || (!plan.sent.length && !acceptOn)) return none;
   const t = now();
   let created = false;
@@ -468,10 +514,10 @@ export async function stopSequences(actor: Actor, leadId: number, reason: string
   return { sequences_stopped: enrs.map((e) => e.id as number), tasks_cancelled: pend.map((p) => p.id as number), send_authorizations_revoked: revoked };
 }
 
-const controlSchema = z.object({ action: z.enum(["pause", "resume", "stop"]), reason: z.string().trim().min(3, "reason: say why").max(500), channel: z.string().optional(), resume_on: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional() });
+const controlSchema = z.object({ action: z.enum(["pause", "resume", "stop", "skip", "restart"]), reason: z.string().trim().min(3, "reason: say why").max(500), channel: z.string().optional(), resume_on: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional() });
 /** Owner and Chief: pause, resume or stop a lead's sequence by hand. Every action is written to the change history. */
 export async function controlSequence(actor: Actor, leadId: number, input: unknown) {
-  if (!isManager(actor)) throw new HttpError(403, "Only the Owner or a Chief can pause, resume or stop a sequence.");
+  if (!isManager(actor)) throw new HttpError(403, "Only the Owner or a Chief can pause, resume, skip, stop or restart a sequence.");
   const d = parse(controlSchema, input);
   const enr = await one(`SELECT * FROM enrollments WHERE lead_id=?${d.channel ? " AND channel=?" : ""} ORDER BY (status='running') DESC, id DESC LIMIT 1`, d.channel ? [leadId, d.channel] : [leadId]);
   if (!enr) throw new HttpError(404, "This lead is not in a sequence.");
@@ -479,6 +525,38 @@ export async function controlSequence(actor: Actor, leadId: number, input: unkno
   if (d.action === "stop") {
     if (!["running", "paused"].includes(enr.status as string)) throw new HttpError(409, `The sequence is already ${enr.status}.`);
     return { action: "stop", ...(await stopSequences(actor, leadId, `stopped by ${actor.name}: ${d.reason}`, { channels: [enr.channel as string] })) };
+  }
+  if (d.action === "skip") {
+    if (enr.status !== "running") throw new HttpError(409, `Only a running sequence can skip a step (it is ${enr.status}).`);
+    const step = await one("SELECT * FROM enrollment_steps WHERE enrollment_id=? AND status='planned' ORDER BY position LIMIT 1", [enr.id as number]);
+    if (!step) throw new HttpError(409, "There is no open step to skip.");
+    await run("UPDATE enrollment_steps SET status='skipped', sent_at=?, note=?, updated_at=? WHERE id=?", [t, `Skipped by ${actor.name}: ${d.reason}`, t, step.id as number]);
+    let revoked = 0;
+    if (step.task_id && Number(step.task_id) > 0) {
+      const tk = await one("SELECT id,title,lead_id,is_demo,message_version_id,status FROM tasks WHERE id=?", [step.task_id as number]);
+      if (tk && !["completed", "cancelled"].includes(tk.status as string)) {
+        await run("UPDATE tasks SET status='cancelled', blockers=NULL, completion_note=?, updated_at=? WHERE id=?", [`Step skipped: ${d.reason}`, t, tk.id as number]);
+        await run("INSERT INTO activities (lead_id,task_id,type,title,body,actor_id,occurred_at,created_at,is_demo) VALUES (?,?,'task',?,?,?,?,?,?)", [leadId, tk.id as number, `Task cancelled: ${tk.title}`, `Step skipped: ${d.reason}`, actor.id, t, t, tk.is_demo as number]);
+        // The draft of a skipped step must not stay sendable.
+        if (tk.message_version_id) revoked = (await run("UPDATE send_authorizations SET status='revoked' WHERE status='active' AND kind='send' AND message_version_id=?", [tk.message_version_id as number])).changes;
+      }
+    }
+    await audit(actor, "sequence_step_skipped", "lead", leadId, { enrollment_id: enr.id, step: step.step_code, reason: d.reason, send_authorizations_revoked: revoked });
+    return { action: "skip", skipped: step.step_code, task_cancelled: step.task_id && Number(step.task_id) > 0 ? step.task_id : null, send_authorizations_revoked: revoked, ...(await syncEnrollment(actor, leadId, enr.channel as string)) };
+  }
+  if (d.action === "restart") {
+    // Reopens a sequence that was stopped, and carries on with the steps that are left. A finished or resting sequence has nothing left to plan.
+    if (enr.status !== "stopped") throw new HttpError(409, enr.status === "resting" || enr.status === "completed" ? "This sequence already sent every step, so there is nothing left to restart. Writing again is a new first message with the normal approval steps." : `Only a stopped sequence can be restarted (it is ${enr.status}).`);
+    await run("UPDATE enrollments SET status='running', stop_reason=NULL, rest_until=NULL, updated_at=? WHERE id=?", [t, enr.id as number]);
+    // The step that was cancelled when the sequence stopped is planned again, from today.
+    await run("DELETE FROM enrollment_steps WHERE enrollment_id=? AND status='cancelled'", [enr.id as number]);
+    await audit(actor, "sequence_resumed", "lead", leadId, { enrollment_id: enr.id, reason: d.reason, restarted: true, was: enr.stop_reason });
+    const r = await syncEnrollment(actor, leadId, enr.channel as string);
+    const step = r.status === "running" ? await one("SELECT * FROM enrollment_steps WHERE enrollment_id=? AND status='planned' ORDER BY position LIMIT 1", [enr.id as number]) : null;
+    const settings = await seqSettings();
+    const due = nextWorkday(todayYmd(), settings.weekends[(enr.market_group as MarketGroup) ?? "us"]).ymd;
+    if (step && (step.due_on as string) < due) await moveStep(step, due, `Restarted by ${actor.name}`);
+    return { action: "restart", ...r, note: r.status === "stopped" ? `The sequence stopped again straight away: ${r.note}` : r.note };
   }
   if (d.action === "pause") {
     if (enr.status !== "running") throw new HttpError(409, `Only a running sequence can be paused (it is ${enr.status}).`);

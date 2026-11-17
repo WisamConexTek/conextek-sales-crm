@@ -283,3 +283,30 @@ export function loadFeed(actor: Actor, sc: Scope) {
     return { feed, api };
   });
 }
+
+/** Follow-up health for the dashboard: late and due-today follow-ups per sender, contacted leads with nothing planned, replies waiting, tomorrow's shortfalls. */
+export function loadFollowUps() {
+  return cached("dash:followups", 30000, async () => {
+    const today = todayYmd();
+    const start = localMidnight(today).toISOString(), end = localMidnight(addDays(today, 1)).toISOString();
+    const un = unansweredReplyFilter("l");
+    const [rows, noNext, waiting, shortfalls, backlog] = await Promise.all([
+      all(`SELECT COALESCE(sd.display_name,'No sender') AS sender, c.name AS campaign,
+                  SUM(CASE WHEN t.due_at<? THEN 1 ELSE 0 END) AS overdue, SUM(CASE WHEN t.due_at>=? AND t.due_at<? THEN 1 ELSE 0 END) AS today, SUM(t.is_late) AS late
+           FROM tasks t LEFT JOIN message_versions mv ON mv.id=t.message_version_id LEFT JOIN senders sd ON sd.id=COALESCE(t.sender_id,mv.sender_id) LEFT JOIN campaigns c ON c.id=t.campaign_id
+           WHERE t.is_demo=0 AND t.status NOT IN ('completed','cancelled') AND (t.step_number>1 OR t.action_type LIKE '%follow%' COLLATE NOCASE) AND t.due_at<? GROUP BY 1,2 ORDER BY overdue DESC, today DESC`, [start, start, end, end]),
+      one(`SELECT COUNT(*) AS n FROM leads l WHERE l.is_demo=0 AND l.historical_only=0
+             AND EXISTS (SELECT 1 FROM activities a WHERE a.lead_id=l.id AND a.type='message' AND a.outcome='sent')
+             AND NOT EXISTS (SELECT 1 FROM activities r WHERE r.lead_id=l.id AND r.type='reply')
+             AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.lead_id=l.id AND t.status NOT IN ('completed','cancelled'))
+             AND NOT EXISTS (SELECT 1 FROM enrollments e WHERE e.lead_id=l.id AND e.status IN ('resting','paused','stopped','completed'))
+             AND NOT EXISTS (SELECT 1 FROM lists s WHERE s.kind='stage' AND s.key=l.stage AND s.flag IN ('won','lost','closed'))
+             AND NOT EXISTS (SELECT 1 FROM contacts c WHERE c.lead_id=l.id AND c.email_status='opted_out')`),
+      one(`SELECT COUNT(*) AS n FROM leads l WHERE ${un.sql}`, un.args),
+      all("SELECT role,message FROM plan_shortfalls WHERE status='open' ORDER BY id LIMIT 6"),
+      one("SELECT COUNT(*) AS n FROM enrollments WHERE status='running'"),
+    ]);
+    const list = rows.map((r) => ({ sender: r.sender as string, campaign: (r.campaign as string) ?? "No campaign", overdue: Number(r.overdue), today: Number(r.today), late: Number(r.late) }));
+    return { rows: list, overdue: list.reduce((a, r) => a + r.overdue, 0), today: list.reduce((a, r) => a + r.today, 0), noNextStep: Number(noNext!.n), repliesWaiting: Number(waiting!.n), shortfalls: shortfalls.map((s) => ({ role: s.role as string, message: s.message as string })), running: Number(backlog!.n) };
+  });
+}

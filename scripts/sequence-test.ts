@@ -283,6 +283,33 @@ async function main() {
   await Q.controlSequence(chief, z.id, { action: "resume", reason: "Back" });
   ok(!(await S.checkEligibility(owner, zv.v)).codes.includes("sequence_not_running"), "resuming lifts the block");
 
+  console.log("15. Skip, restart, a new sequence");
+  const sk = await mk("Sierra Steel");
+  const se1 = await send(sk, canton, "first_email");
+  const skv = await send(sk, canton, "follow_up", { task_id: se1.r.sequence.next_task_id, noSend: true });
+  await throws(() => Q.controlSequence(writer, sk.id, { action: "skip", reason: "not allowed" }), "only the Owner or a Chief skips a step", /Owner or a Chief/);
+  const skip = await Q.controlSequence(chief, sk.id, { action: "skip", reason: "FU1 text not ready in time" }) as Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
+  ok(skip.skipped === "FU1" && skip.next_step.code === "FU2" && (await one("SELECT status FROM tasks WHERE id=?", [se1.r.sequence.next_task_id]))!.status === "cancelled" && skip.send_authorizations_revoked === 1, "skipping FU1 cancels its task, withdraws its approval and plans FU2");
+  ok(!(await S.checkEligibility(owner, skv.v)).eligible && (await one("SELECT step_number,step_total FROM tasks WHERE id=?", [skip.next_task_id]))!.step_number === 3, "the skipped draft can no longer be sent; FU2 is still step 3 of 3");
+  await Q.controlSequence(chief, sk.id, { action: "stop", reason: "Wrong contact" });
+  const rs = await Q.controlSequence(chief, sk.id, { action: "restart", reason: "Contact confirmed" }) as Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
+  ok(rs.status === "running" && rs.next_step.code === "FU2" && rs.next_task_id && (await one("SELECT status FROM tasks WHERE id=?", [rs.next_task_id]))!.status === "todo", "restarting a stopped sequence plans the step that was left");
+  await throws(() => Q.controlSequence(chief, a.id, { action: "restart", reason: "again" }), "a finished sequence cannot be restarted", /nothing left/);
+  await throws(() => Q.createSequence(chief, { name: "X", channel: "email", copy_from: cf1.sequence_id }), "only the Owner creates a sequence", /Owner/);
+  const ns2 = await Q.createSequence(owner, { name: "Canton Fair, email, 4 steps", channel: "email", campaign_id: canton, copy_from: cf1.sequence_id }) as Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
+  ok(ns2.status === "draft" && ns2.steps.length === 3, "a new sequence starts as a draft with the copied steps");
+  await throws(() => Q.updateSequence(owner, ns2.id, { status: "active" }), "two active sequences for one campaign and channel are refused", /already the active sequence/);
+  const four = [...ns2.steps.map((x: Record<string, unknown>) => ({ step_code: x.step_code, anchor: x.anchor, offset_start: x.offset_start, offset_end: x.offset_end, min_gap_prev: x.min_gap_prev })), { step_code: "FU3", anchor: "previous", offset_start: 7, offset_end: 10 }];
+  await Q.updateSequence(owner, ns2.id, { steps: four });
+  await Q.updateSequence(owner, cf1.sequence_id as number, { status: "retired" });
+  await Q.updateSequence(owner, ns2.id, { status: "active" });
+  const y = await mk("Yankee Yarn");
+  const ye1 = await send(y, canton, "first_email");
+  ok((await one("SELECT step_total FROM tasks WHERE id=?", [ye1.r.sequence.next_task_id]))!.step_total === 4 && (await one("SELECT status FROM enrollments WHERE lead_id=?", [g2.id]))!.status === "running", "a new lead follows the 4-step sequence; leads on the retired one carry on");
+  const D = await import("../src/lib/service/dashboard");
+  const fu = await D.loadFollowUps();
+  ok(fu.overdue >= 2 && fu.rows.length >= 1 && typeof fu.noNextStep === "number" && typeof fu.repliesWaiting === "number", "the dashboard counts overdue follow-ups per sender, leads with no next step and replies waiting");
+
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 }

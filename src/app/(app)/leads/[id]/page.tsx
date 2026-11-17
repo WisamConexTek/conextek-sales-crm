@@ -203,12 +203,16 @@ export default async function LeadPage({ params, searchParams }: { params: Promi
               </li>
             ))}
           </ol>
-          {isManager(me) && ["running", "paused"].includes(sq.status as string) && (
+          {isManager(me) && ["running", "paused", "stopped"].includes(sq.status as string) && (
             <form action={controlSequenceAction} className="mt-3 flex flex-wrap items-end gap-2 border-t border-slate-100 pt-3">
               <input type="hidden" name="_back" value={back} /><input type="hidden" name="lead_id" value={leadId} /><input type="hidden" name="channel" value={sq.channel as string} />
               <div className="min-w-56 flex-1"><label className="label">Reason (kept in the history)</label><input name="reason" required minLength={3} className="input" /></div>
-              {sq.status === "running" ? <button name="action" value="pause" className="btn">Pause</button> : <button name="action" value="resume" className="btn btn-primary">Resume</button>}
-              <button name="action" value="stop" className="btn btn-danger">Stop the sequence</button>
+              {sq.status === "stopped" ? <button name="action" value="restart" className="btn btn-primary">Restart with the steps that are left</button> : (
+                <>
+                  {sq.status === "running" ? <><button name="action" value="pause" className="btn">Pause</button><button name="action" value="skip" className="btn" title="Cancels the open step and plans the one after it">Skip this step</button></> : <button name="action" value="resume" className="btn btn-primary">Resume</button>}
+                  <button name="action" value="stop" className="btn btn-danger">Stop the sequence</button>
+                </>
+              )}
             </form>
           )}
         </Card>

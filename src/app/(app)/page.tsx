@@ -6,7 +6,7 @@ import { assignableUsers } from "@/lib/service/users";
 import { addDays, todayYmd } from "@/lib/db";
 import { Flash } from "@/components/ui";
 import { Band, Skeleton } from "@/components/dashboard/charts";
-import { Activity, Agents, Campaigns, FunnelPanel, Kpis, NeedsYou, Replies, Sending, Stages, Team, TodayWork, Trend } from "@/components/dashboard/sections";
+import { Activity, Agents, Campaigns, FollowUps, FunnelPanel, Kpis, NeedsYou, Replies, Sending, Stages, Team, TodayWork, Trend } from "@/components/dashboard/sections";
 import { q, sget, snum, type SP } from "@/lib/view";
 
 /**
@@ -89,6 +89,7 @@ export default async function Dashboard({ searchParams }: { searchParams: SP }) 
           {slot(sc.manager ? "lg:col-span-6 xl:col-span-5" : "lg:col-span-6 xl:col-span-7", <TodayWork {...p} className={sc.manager ? "lg:col-span-6 xl:col-span-5" : "lg:col-span-6 xl:col-span-7"} />, "h-96")}
           {sc.manager && slot("lg:col-span-12 xl:col-span-3", <Sending {...p} className="lg:col-span-12 xl:col-span-3" />, "h-96")}
         </div>
+        {sc.teamView && <div className="mt-3">{slot("", <FollowUps />, "h-44")}</div>}
       </Band>
 
       <Band title="Pipeline" sub={sc.teamView ? "Where the leads stand, by stage and by campaign, and what they answer" : "Where your leads stand"}>

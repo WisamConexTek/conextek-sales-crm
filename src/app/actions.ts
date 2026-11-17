@@ -402,9 +402,16 @@ export async function saveSequenceAction(fd: FD) {
     const steps = Array.from({ length: count }, (_, i) => ({
       step_code: s(fd, `code_${i}`), anchor: s(fd, `anchor_${i}`) || "first", offset_start: s(fd, `start_${i}`) || "0", offset_end: s(fd, `end_${i}`) || s(fd, `start_${i}`) || "0",
       min_gap_prev: s(fd, `gap_${i}`), assignee_role: s(fd, `role_${i}`) || undefined, active: fd.get(`active_${i}`) === "on",
-    }));
+    })).filter((st) => st.step_code);
     const r = (await Sequences.updateSequence(me, n(fd, "id"), { steps, rest_days: s(fd, "rest_days") || undefined, day_mode: s(fd, "day_mode") || undefined, status: s(fd, "status") || undefined, auto_enroll: fd.get("auto_enroll") === "on", reason: s(fd, "reason") || undefined })) as { note?: string };
     return r.note ?? "Sequence saved.";
+  }, "/settings/sequences");
+}
+export async function createSequenceAction(fd: FD) {
+  await guard(fd, async () => {
+    const me = await requireUser();
+    await Sequences.createSequence(me, { name: s(fd, "name"), channel: s(fd, "channel"), campaign_id: s(fd, "campaign_id"), copy_from: s(fd, "copy_from") });
+    return "Sequence created as a draft. Set its steps, then switch its status to Active.";
   }, "/settings/sequences");
 }
 export async function saveSequenceSettingsAction(fd: FD) {
@@ -434,6 +441,6 @@ export async function controlSequenceAction(fd: FD) {
     const me = await requireUser();
     await Leads.assertLeadAccess(me, n(fd, "lead_id"));
     await Sequences.controlSequence(me, n(fd, "lead_id"), { action: s(fd, "action"), reason: s(fd, "reason"), channel: s(fd, "channel") || undefined, resume_on: s(fd, "resume_on") || undefined });
-    return `Sequence ${s(fd, "action") === "stop" ? "stopped" : s(fd, "action") === "pause" ? "paused" : "resumed"}.`;
+    return ({ stop: "Sequence stopped.", pause: "Sequence paused.", resume: "Sequence resumed.", skip: "Step skipped; the next step is planned.", restart: "Sequence restarted." } as Record<string, string>)[s(fd, "action")] ?? "Saved.";
   });
 }

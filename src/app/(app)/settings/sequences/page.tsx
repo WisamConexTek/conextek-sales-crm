@@ -3,7 +3,8 @@ import { requireUser, isManager } from "@/lib/auth";
 import { listSequences, seqSettings, roleUsers, backfill, sequenceLog, MARKET_GROUPS } from "@/lib/service/sequences";
 import { listSenders, bounceLimit } from "@/lib/service/senders";
 import { assignableUsers } from "@/lib/service/users";
-import { saveSequenceAction, saveSequenceSettingsAction, backfillAction } from "@/app/actions";
+import { saveSequenceAction, saveSequenceSettingsAction, backfillAction, createSequenceAction } from "@/app/actions";
+import { listCampaigns } from "@/lib/service/campaigns";
 import { STEP_CODES, STEP_SHORT, WORK_ROLE_LABEL, type WorkRole } from "@/lib/constants";
 import { Badge, Card, Empty, Flash, PageHeader } from "@/components/ui";
 import { fmtDateTime, fmtYmd } from "@/lib/format";
@@ -20,7 +21,7 @@ export default async function SequencesSettings({ searchParams }: { searchParams
   const sp = await searchParams;
   if (!isManager(me)) return <div className="space-y-5"><PageHeader title="Follow-up sequences" /><Card><Empty>Only the Owner and the Chief can open this page.</Empty></Card></div>;
   const owner = me.role === "owner";
-  const [seqs, settings, senders, users, limit, dry, log] = await Promise.all([listSequences(), seqSettings(), listSenders(), assignableUsers(), bounceLimit(), backfill(me, { dry_run: true }) as Promise<any>, sequenceLog(8)]);
+  const [seqs, settings, senders, users, limit, dry, log, camps] = await Promise.all([listSequences(), seqSettings(), listSenders(), assignableUsers(), bounceLimit(), backfill(me, { dry_run: true }) as Promise<any>, sequenceLog(8), listCampaigns()]);
   const roles = await roleUsers(settings);
   const dis = owner ? {} : { disabled: true };
   return (
@@ -74,7 +75,7 @@ export default async function SequencesSettings({ searchParams }: { searchParams
         <Card key={s.id} title={<>{s.name} <span className="font-normal text-slate-500">· version {s.version}</span></>} right={<span className="text-slate-500">{Object.entries(s.enrolled).map(([k, n]) => `${n} ${k}`).join(" · ") || "no lead enrolled yet"}</span>}>
           <p className="rounded-lg bg-brand-50 px-3 py-2 text-[13px] text-slate-800">{s.preview}</p>
           <form action={saveSequenceAction} className="mt-3 space-y-3">
-            <input type="hidden" name="_back" value="/settings/sequences" /><input type="hidden" name="id" value={s.id} /><input type="hidden" name="step_count" value={s.steps.length} />
+            <input type="hidden" name="_back" value="/settings/sequences" /><input type="hidden" name="id" value={s.id} /><input type="hidden" name="step_count" value={s.steps.length + 1} />
             <div className="overflow-x-auto">
               <table className="w-full min-w-[820px] text-sm">
                 <thead className="bg-slate-50"><tr>{["#", "Step", "Counted from", "Due on day", "Window ends on day", "At least N days after the step before", "Drafted by", "On"].map((h) => <th key={h} className="th">{h}</th>)}</tr></thead>
@@ -91,6 +92,18 @@ export default async function SequencesSettings({ searchParams }: { searchParams
                       <td className="td"><input type="checkbox" name={`active_${i}`} defaultChecked={!!st.active} aria-label={`Step ${i + 1} active`} {...dis} /></td>
                     </tr>
                   ))}
+                  {owner && (() => { const i = s.steps.length; return (
+                    <tr className="bg-slate-50/60">
+                      <td className="td text-slate-400">+</td>
+                      <td className="td"><select name={`code_${i}`} defaultValue="" className="input w-36" aria-label="Add a step"><option value="">Add a step…</option>{STEP_CODES.map((c) => <option key={c} value={c}>{STEP_SHORT[c]}</option>)}</select></td>
+                      <td className="td"><select name={`anchor_${i}`} defaultValue="previous" className="input w-56">{Object.entries(ANCHOR).map(([k, l]) => <option key={k} value={k}>{l}</option>)}</select></td>
+                      <td className="td"><input type="number" min={0} max={365} name={`start_${i}`} defaultValue={7} className="input w-20" /></td>
+                      <td className="td"><input type="number" min={0} max={365} name={`end_${i}`} defaultValue={10} className="input w-20" /></td>
+                      <td className="td"><input type="number" min={0} max={365} name={`gap_${i}`} placeholder="none" className="input w-20" /></td>
+                      <td className="td"><select name={`role_${i}`} defaultValue={s.channel === "linkedin" ? "linkedin" : "writer"} className="input w-40">{(["writer", "linkedin", "inbox", "hunter", "chief"] as WorkRole[]).map((r) => <option key={r} value={r}>{WORK_ROLE_LABEL[r]}</option>)}</select></td>
+                      <td className="td"><input type="checkbox" name={`active_${i}`} defaultChecked aria-label="New step active" /></td>
+                    </tr>
+                  ); })()}
                 </tbody>
               </table>
             </div>
@@ -106,6 +119,20 @@ export default async function SequencesSettings({ searchParams }: { searchParams
           </form>
         </Card>
       ))}
+
+      {owner && (
+        <Card title="New sequence">
+          <form action={createSequenceAction} className="flex flex-wrap items-end gap-3">
+            <input type="hidden" name="_back" value="/settings/sequences" />
+            <div className="min-w-56 flex-1"><label className="label">Name</label><input name="name" required minLength={2} className="input" placeholder="e.g. Canton Fair, email, 4 steps" /></div>
+            <div><label className="label">Campaign</label><select name="campaign_id" className="input w-48"><option value="">Any campaign</option>{camps.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}</select></div>
+            <div><label className="label">Channel</label><select name="channel" className="input w-32"><option value="email">Email</option><option value="linkedin">LinkedIn</option></select></div>
+            <div><label className="label">Start from the steps of</label><select name="copy_from" required className="input w-56">{seqs.map((x: any) => <option key={x.id} value={x.id}>{x.name}</option>)}</select></div>
+            <button className="btn btn-primary">Create as a draft</button>
+          </form>
+          <p className="mt-2 text-xs text-slate-500">A new sequence is a draft: no lead follows it until you set its status to Active. Only one sequence can be active for the same campaign and channel, so retire the old one first. To add a fourth or fifth email, use the “Add a step” row at the bottom of any sequence and save; to drop a step, untick it.</p>
+        </Card>
+      )}
 
       <Card title="Working days, roles, capacity and deadlines">
         <form action={saveSequenceSettingsAction} className="space-y-5">

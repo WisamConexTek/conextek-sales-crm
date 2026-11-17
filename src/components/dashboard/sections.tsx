@@ -1,7 +1,7 @@
 import Link from "next/link";
 import type { ReactNode } from "react";
 import type { Actor } from "@/lib/auth";
-import { loadActions, loadAgentIds, loadAttention, loadBoard, loadFeed, loadPipeline, loadResults, loadSending, type Period, type Scope } from "@/lib/service/dashboard";
+import { loadFollowUps, loadActions, loadAgentIds, loadAttention, loadBoard, loadFeed, loadPipeline, loadResults, loadSending, type Period, type Scope } from "@/lib/service/dashboard";
 import { Badge, LeadLink } from "@/components/ui";
 import { Avatar, BarRow, Columns, DataTable, Delta, Funnel, Icon, KpiCard, Legend, Mini, More, Panel, Quiet, RateBar, Ring, Segments, type IconName } from "@/components/dashboard/charts";
 import { fmtShort, fmtYmd, pct } from "@/lib/format";
@@ -199,6 +199,47 @@ export function TodayWork({ me, sc, className = "" }: P & { className?: string }
               </li>
             ))}
           </ul>
+        )}
+      </Panel>
+    );
+  });
+}
+
+/** Follow-ups: what is late, what is due today, who has nothing planned, and what tomorrow still lacks. */
+export function FollowUps({ className = "" }: { className?: string }) {
+  return guard("Follow-ups", className, async () => {
+    const f = await loadFollowUps();
+    const tile = (n: number, label: string, href: string, bad: boolean, sub: string) => (
+      <Link href={href} className={`flex-1 rounded-lg border px-3 py-2.5 no-underline hover:no-underline ${bad ? "border-red-200 bg-red-50" : "border-slate-200 bg-white"}`}>
+        <div className={`text-2xl font-semibold leading-none tabular-nums ${bad ? "text-red-700" : "text-slate-900"}`}>{n}</div>
+        <div className="mt-1.5 text-[13px] font-medium text-slate-800">{label}</div>
+        <div className="text-xs text-slate-500">{sub}</div>
+      </Link>
+    );
+    return (
+      <Panel className={className} title="Follow-ups" hint={`${plural(f.running, "lead")} in a running sequence`} right={<More href="/compliance">Compliance</More>}>
+        <div className="grid gap-3 lg:grid-cols-12">
+          <div className="flex flex-wrap gap-2 lg:col-span-7">
+            {tile(f.overdue, "Follow-ups overdue", "/tasks?due=overdue&type=FU1,FU2,FU3", f.overdue > 0, "past their due day")}
+            {tile(f.today, "Due today", "/tasks?due=today&type=FU1,FU2,FU3", false, "follow-ups to send today")}
+            {tile(f.noNextStep, "No next step", "/leads?next_step=missing&outreach=no_reply", f.noNextStep > 0, "contacted, nothing planned")}
+            {tile(f.repliesWaiting, "Replies waiting", "/leads?attention=unanswered", f.repliesWaiting > 0, "not answered yet")}
+          </div>
+          <div className="lg:col-span-5">
+            {f.rows.length === 0 ? <Quiet>No follow-up is late or due today.</Quiet> : (
+              <table className="w-full text-[13px]">
+                <thead><tr><th className="th">Sender</th><th className="th">Campaign</th><th className="th text-right">Overdue</th><th className="th text-right">Today</th></tr></thead>
+                <tbody className="divide-y divide-slate-100">{f.rows.slice(0, 6).map((r) => <tr key={`${r.sender}|${r.campaign}`}><td className="td py-1.5!">{r.sender}</td><td className="td py-1.5! text-slate-600">{r.campaign}</td><td className={`td py-1.5! text-right tabular-nums ${r.overdue ? "font-semibold text-red-700" : ""}`}>{r.overdue}</td><td className="td py-1.5! text-right tabular-nums">{r.today}</td></tr>)}</tbody>
+              </table>
+            )}
+          </div>
+        </div>
+        {f.shortfalls.length > 0 && (
+          <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[13px] text-amber-950">
+            <b>Tomorrow&apos;s plan is short:</b>
+            <ul className="mt-1 list-disc space-y-0.5 pl-5">{f.shortfalls.map((s, i) => <li key={i}>{s.message}</li>)}</ul>
+            <Link href="/plan" className="mt-1 inline-block">Open the daily plan</Link>
+          </div>
         )}
       </Panel>
     );
