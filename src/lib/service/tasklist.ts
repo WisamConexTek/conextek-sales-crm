@@ -18,6 +18,7 @@ export const TASK_SORTS = ["days_overdue", "due", "title", "type", "company", "c
 export function displayType(t: Row): string {
   if (t.step_code && STEP_SHORT[t.step_code as string]) return STEP_SHORT[t.step_code as string];
   const a = String(t.action_type ?? "").toLowerCase(), tt = String(t.task_type ?? "").toLowerCase(), li = t.channel === "linkedin" || a.includes("linkedin");
+  if (a === "send_reply_follow_up") return "Reply FU";
   if (li && /connect|invite/.test(a)) return "LinkedIn connect";
   if (li) { const n = /dm_?(\d)/.exec(a)?.[1]; return n ? `LinkedIn DM${n}` : "LinkedIn DM1"; }
   if (/draft/.test(a) && /first/.test(a)) return "Email 1 draft";

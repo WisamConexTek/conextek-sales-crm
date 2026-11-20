@@ -216,7 +216,7 @@ export const DEFAULT_LISTS: Record<ListKind, { key: string; label: string; flag?
 };
 
 /** Lead filters for "needs a person". Kept here (a module with no imports) because it is read while other modules are still loading. */
-export const ATTENTION = ["unanswered", "quiet"] as const;
+export const ATTENTION = ["unanswered", "quiet", "warm_idle"] as const;
 export type Attention = (typeof ATTENTION)[number];
 
 /* ---------------- Follow-up sequences ---------------- */
@@ -235,6 +235,6 @@ export const STEP_CODES = ["E1", "FU1", "FU2", "FU3", "FINAL", "LI_CONNECT", "DM
 export const STEP_SHORT: Record<string, string> = { E1: "Email 1", FU1: "FU1", FU2: "FU2", FU3: "FU3", FINAL: "Final email", LI_CONNECT: "LinkedIn connect", DM1: "LinkedIn DM1", DM2: "LinkedIn DM2", DM3: "LinkedIn DM3", CALL: "Call", OTHER: "Other" };
 export const STEP_LONG: Record<string, string> = { E1: "First email", FU1: "Follow-up email 1", FU2: "Follow-up email 2", FU3: "Follow-up email 3", FINAL: "Final email", LI_CONNECT: "LinkedIn connect", DM1: "LinkedIn DM 1", DM2: "LinkedIn DM 2", DM3: "LinkedIn DM 3", CALL: "Call", OTHER: "Next step" };
 export const STEP_ACTION: Record<string, string> = { E1: "send_first_email", FU1: "send_follow_up_1", FU2: "send_follow_up_2", FU3: "send_follow_up_3", FINAL: "send_final_email", LI_CONNECT: "send_linkedin_connect", DM1: "send_linkedin_dm_1", DM2: "send_linkedin_dm_2", DM3: "send_linkedin_dm_3", CALL: "call", OTHER: "other" };
-export const TASK_DISPLAY_TYPES = ["Email 1", "FU1", "FU2", "FU3", "Email 1 draft", "FU draft", "Reply", "Research", "LinkedIn connect", "LinkedIn DM1", "LinkedIn DM2", "LinkedIn DM3", "Review", "Revisit", "Pricing / offer", "Other"] as const;
+export const TASK_DISPLAY_TYPES = ["Email 1", "FU1", "FU2", "FU3", "Email 1 draft", "FU draft", "Reply FU", "Reply", "Research", "LinkedIn connect", "LinkedIn DM1", "LinkedIn DM2", "LinkedIn DM3", "Review", "Revisit", "Pricing / offer", "Other"] as const;
 /** Mail providers whose domain says nothing about the company. Never used to match two contacts to one company. */
 export const FREE_MAIL = ["gmail.com", "googlemail.com", "yahoo.com", "hotmail.com", "outlook.com", "live.com", "msn.com", "icloud.com", "me.com", "aol.com", "proton.me", "protonmail.com", "163.com", "126.com", "qq.com", "foxmail.com", "sina.com", "sina.cn", "sohu.com", "yeah.net", "aliyun.com", "139.com"];

@@ -450,3 +450,24 @@ export async function escalateApproval(actor: Actor, approvalId: number, comment
       [ap.lead_id, ap.task_id, approvalId, "approval", `Escalated to Wisam: ${ap.title}`, comment?.trim() || null, actor.id, ts, ts, ap.is_demo]);
   await audit(actor, "approval_escalated", "approval", approvalId, { comment });
 }
+
+/**
+ * Owner or Chief: reopens a task that was closed by mistake (for example a send recorded earlier closed a reply task it did not belong to).
+ * The old completion note is kept in the task's notes, and the reason is written to the lead's history.
+ */
+export async function reopenTask(actor: Actor, id: number, input: unknown) {
+  if (!isManager(actor)) throw new HttpError(403, "Only the Owner or a Chief can reopen a task.");
+  const d = parse(z.object({ reason: z.string().trim().min(3, "reason: say why it is reopened").max(500) }), input);
+  const t = await getTask(actor, id);
+  if (t.status !== "completed") throw new HttpError(409, `Only a completed task can be reopened (this one is ${t.status}).`);
+  const ts = now();
+  const nonSend = /^(handle_reply|revisit|add_referred_contact|choose_alternate_contact|find_contact|review_same_company|review_stalled_warm_lead)$/.test(String(t.action_type ?? ""));
+  const earlier = [t.completion_note, t.sent_at ? `sent ${t.sent_at}` : null].filter(Boolean).join("; ");
+  await tx([
+    { sql: `UPDATE tasks SET status='todo', completed_at=NULL, completed_by=NULL, completion_note=NULL, activity_id=NULL, sent_at=NULL${nonSend ? ", message_version_id=NULL" : ""}, blockers=NULL, updated_at=? WHERE id=?`, args: [ts, id] },
+    { sql: "INSERT INTO task_notes (task_id,kind,body,actor_id,created_at) VALUES (?,'progress',?,?,?)", args: [id, `Reopened by ${actor.name}: ${d.reason}${earlier ? ` (it had been closed: ${earlier})` : ""}`, actor.id, ts] },
+    ...(t.lead_id ? [{ sql: "INSERT INTO activities (lead_id,task_id,type,title,body,actor_id,occurred_at,created_at,is_demo) VALUES (?,?,'task',?,?,?,?,?,?)", args: [t.lead_id as number, id, `Task reopened: ${t.title}`, d.reason, actor.id, ts, ts, t.is_demo as number] }] : []),
+  ]);
+  await audit(actor, "reopen_task", "task", id, { reason: d.reason, was: { completed_at: t.completed_at, completion_note: t.completion_note, activity_id: t.activity_id } });
+  return { id, status: "todo", reopened: true };
+}

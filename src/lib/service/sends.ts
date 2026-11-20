@@ -105,6 +105,13 @@ export async function authorize(actor: Actor, input: unknown) {
   const v = await one("SELECT * FROM message_versions WHERE id=?", [d.message_version_id]);
   if (!v) throw new HttpError(400, "message_version_id: unknown version.");
   if ((await latestVersion(v)) !== v.id) throw new HttpError(409, "That is not the latest version of this message. Review the newest version; authorization never carries over to edited text.");
+  if (d.kind === "send") {
+    // A send approval for someone who opted out, is suppressed, bounced, or replied (for a sequence follow-up) can never be used, so it is not created.
+    const core = await eligibilityCore(v);
+    const STOP = ["opted_out", "suppressed", "bounced", "contact_invalid", "reply_received", "historical_only"];
+    const why = core.reasons.filter((_, i) => STOP.includes(core.codes[i]));
+    if (why.length) throw new HttpError(409, `A send approval cannot be created for this message: ${why.join("; ")}.`, "recipient_blocked");
+  }
   const same = await one("SELECT id FROM send_authorizations WHERE message_version_id=? AND kind=? AND permitted_action=? AND status='active'", [v.id as number, d.kind, d.permitted_action]);
   if (same) return { id: same.id as number, created: false };
   const delegated = d.kind === "send" && actor.role !== "owner" ? 1 : 0;
@@ -303,20 +310,75 @@ export async function revoke(actor: Actor, authId: number) {
   await syncTasks(actor, a.message_version_id as number);
 }
 
+/**
+ * Withdraws every ACTIVE send approval that can no longer be used: the recipient opted out, is suppressed, bounced, is invalid,
+ * or (for a sequence follow-up) has replied. Withdrawing is always the safe direction, so the Owner and the Chief may both do it.
+ * dry_run (default) only lists them.
+ */
+export async function revokeBlockedApprovals(actor: Actor, input: { dry_run?: boolean } = {}) {
+  if (!isManager(actor)) throw new HttpError(403, "Only the Owner or a Chief can withdraw blocked approvals.");
+  const dry = input.dry_run !== false;
+  const auths = await all(`SELECT a.id AS authorization_id, a.message_version_id, a.lead_id, l.company FROM send_authorizations a JOIN leads l ON l.id=a.lead_id WHERE a.kind='send' AND a.status='active' AND l.is_demo=0`);
+  if (!auths.length) return { dry_run: dry, checked: 0, blocked: [] as Row[], revoked: 0 };
+  const versions = await all(`SELECT * FROM message_versions WHERE id IN (${auths.map(() => "?").join(",")})`, auths.map((a) => a.message_version_id as number));
+  const ctx = await loadEligCtx(versions);
+  const STOP = ["opted_out", "suppressed", "bounced", "contact_invalid", "reply_received", "historical_only"];
+  const blocked: Row[] = [];
+  for (const a of auths) {
+    const v = versions.find((x) => x.id === a.message_version_id);
+    if (!v) continue;
+    const el = evaluateEligibility(v, ctx);
+    const why = el.reasons.filter((_, i) => STOP.includes(el.codes[i]));
+    if (why.length) blocked.push({ authorization_id: a.authorization_id, message_version_id: a.message_version_id, lead_id: a.lead_id, company: a.company, reasons: why });
+  }
+  let revoked = 0;
+  if (!dry) for (const b of blocked) {
+    const r = await run("UPDATE send_authorizations SET status='revoked' WHERE id=? AND status='active'", [b.authorization_id as number]);
+    if (r.changes) { revoked++; await audit(actor, "revoke_authorization", "message_version", b.message_version_id as number, { authorization_id: b.authorization_id, reason: (b.reasons as string[]).join("; "), bulk: true }); await syncTasks(actor, b.message_version_id as number); }
+  }
+  return { dry_run: dry, checked: auths.length, blocked, revoked, note: dry ? "Dry run: nothing was changed. Send dry_run:false to withdraw them." : `${revoked} approval${revoked === 1 ? "" : "s"} withdrawn.` };
+}
+
 /* ---------- eligibility ---------- */
 /**
  * `recording: true` is used when a send that ALREADY happened is being written down. The daily cap is a rule for deciding whether to send,
  * so it never blocks recording what really went out (it is reported in `cap_waived` instead). Every other rule still applies.
  */
-export async function checkEligibility(actor: Actor, versionId: number, opts: { recording?: boolean } = {}) {
+/** When the events that now block a lead really happened. Only events with a recorded time count; null = unknown (then nothing is waived). */
+async function blockTimes(v: Row) {
+  const leadId = v.lead_id as number;
+  const [lead, contacts] = await Promise.all([one("SELECT domain FROM leads WHERE id=?", [leadId]), all("SELECT email FROM contacts WHERE lead_id=?", [leadId])]);
+  const emails = contacts.map((c) => String(c.email ?? "").trim().toLowerCase()).filter(Boolean);
+  const domains = [...new Set([...(lead?.domain ? [String(lead.domain).toLowerCase()] : []), ...emails.map((e) => e.split("@")[1]).filter(Boolean)])];
+  const sup = [...(emails.length ? [`(scope='email' AND value IN (${emails.map(() => "?").join(",")}))`] : []), ...(domains.length ? [`(scope='domain' AND value IN (${domains.map(() => "?").join(",")}))`] : [])];
+  const [opt, reply] = await Promise.all([
+    one(`SELECT MIN(t) AS t FROM (SELECT occurred_at AS t FROM activities WHERE lead_id=? AND (outcome='opted_out' OR classification IN ('unsubscribe','not_interested'))
+         ${sup.length ? `UNION ALL SELECT occurred_at FROM suppressions WHERE kind IN ('dnc','opt_out') AND occurred_at IS NOT NULL AND (${sup.join(" OR ")})` : ""})`, [leadId, ...emails.slice(0, emails.length ? 999 : 0), ...domains]),
+    one("SELECT MIN(occurred_at) AS t FROM activities WHERE lead_id=? AND type='reply' AND occurred_precision<>'unknown'", [leadId]),
+  ]);
+  return { optOut: (opt?.t as string | null) ?? null, reply: (reply?.t as string | null) ?? null };
+}
+
+export async function checkEligibility(actor: Actor, versionId: number, opts: { recording?: boolean; sentAt?: string } = {}) {
   const v = await one("SELECT * FROM message_versions WHERE id=?", [versionId]);
   if (!v) throw new HttpError(404, "Message version not found.");
   await assertLeadAccess(actor, v.lead_id as number);
   const full = await eligibilityCore(v);
-  const keep = full.codes.map((c) => !(opts.recording && c === "daily_cap_reached"));
-  const core = { ...full, codes: full.codes.filter((_, i) => keep[i]), reasons: full.reasons.filter((_, i) => keep[i]), cap_waived: full.codes.length !== full.codes.filter((_, i) => keep[i]).length };
+  // Recording something that already happened: the cap never applies, and an opt-out, suppression or reply that came AFTER the send does not make the past send unrecordable.
+  const waive = new Set<string>();
+  if (opts.recording) {
+    waive.add("daily_cap_reached");
+    if (opts.sentAt) {
+      const bt = await blockTimes(v);
+      if (bt.optOut && opts.sentAt < bt.optOut) { waive.add("opted_out"); waive.add("suppressed"); }
+      if (bt.reply && opts.sentAt < bt.reply) waive.add("reply_received");
+    }
+  }
+  const keep = full.codes.map((c) => !waive.has(c));
+  const waived = full.codes.filter((_, i) => !keep[i]);
+  const core = { ...full, codes: full.codes.filter((_, i) => keep[i]), reasons: full.reasons.filter((_, i) => keep[i]), cap_waived: waived.includes("daily_cap_reached"), history_only: waived.some((c) => c !== "daily_cap_reached") };
   const reasons = [...(!can(actor, "message.record_sent") ? ["you do not have message.record_sent, so this send could not be recorded"] : []), ...core.reasons];
-  return { eligible: reasons.length === 0, reasons, codes: core.codes, warnings: core.warnings, authorization_id: core.authorization_id, message_version_id: versionId, cap_waived: core.cap_waived };
+  return { eligible: reasons.length === 0, reasons, codes: core.codes, warnings: core.warnings, authorization_id: core.authorization_id, message_version_id: versionId, cap_waived: core.cap_waived, history_only: core.history_only };
 }
 
 /**
@@ -453,6 +515,9 @@ async function eligibilityCore(v: Row) {
 /** A draft-preparation task closes when its draft is approved; every other open outreach task is a "send" task. */
 export const isPrepTask = (t: Row) => /draft/i.test(String(t.action_type ?? ""));
 const NON_SEND = /prepar|draft|research|validat|review/i;
+/** Tasks that are about something other than sending a message. A recorded send may never adopt or close them by accident. */
+const NON_SEND_TASKS = /^(handle_reply|revisit|add_referred_contact|choose_alternate_contact|find_contact|review_same_company|review_stalled_warm_lead)$/;
+export const isNonSendTask = (t: Row) => NON_SEND_TASKS.test(String(t.action_type ?? ""));
 
 export type Readiness = { state: "ready" | "blocked" | "sent"; prep_status: string | null; blockers: string | null; label: string | null; version_id: number };
 
@@ -499,10 +564,10 @@ export async function readiness(versionId: number): Promise<Readiness> {
 async function linkSendTasks(v: Row): Promise<Row[]> {
   const thread = (await all("SELECT id FROM message_versions WHERE lead_id=? AND COALESCE(contact_id,0)=? AND channel=? AND campaign_id=?", [v.lead_id as number, (v.contact_id as number) ?? 0, v.channel as string, v.campaign_id as number])).map((r) => r.id as number);
   const open = await all("SELECT * FROM tasks WHERE lead_id=? AND status NOT IN ('completed','cancelled') AND is_demo=(SELECT is_demo FROM leads WHERE id=?)", [v.lead_id as number, v.lead_id as number]);
-  let linked = open.filter((t) => !isPrepTask(t) && ((t.message_version_id && thread.includes(t.message_version_id as number)) || t.id === v.task_id));
+  let linked = open.filter((t) => !isPrepTask(t) && !isNonSendTask(t) && ((t.message_version_id && thread.includes(t.message_version_id as number)) || t.id === v.task_id));
   if (!linked.length) {
     // No explicit link: adopt the one open outreach task for this lead, channel and campaign (never guess between several).
-    const cand = open.filter((t) => !NON_SEND.test(String(t.action_type ?? t.title ?? "")) && !t.message_version_id && (!t.channel || t.channel === v.channel) && (!t.campaign_id || t.campaign_id === v.campaign_id) && (t.action_type || t.channel));
+    const cand = open.filter((t) => !isNonSendTask(t) && !NON_SEND.test(String(t.action_type ?? t.title ?? "")) && !t.message_version_id && (!t.channel || t.channel === v.channel) && (!t.campaign_id || t.campaign_id === v.campaign_id) && (t.action_type || t.channel));
     if (cand.length === 1) linked = cand;
   }
   for (const t of linked) if (t.message_version_id !== v.id) await run("UPDATE tasks SET message_version_id=? WHERE id=?", [v.id as number, t.id as number]);
@@ -594,7 +659,7 @@ export async function confirmSend(actor: Actor, input: unknown) {
   if (!v) throw new HttpError(400, "message_version_id: unknown version.");
   await assertLeadAccess(actor, v.lead_id as number);
   // The email is already out: the daily cap must not stop it being recorded (it still counts toward the day's total).
-  const el = await checkEligibility(actor, d.message_version_id, { recording: true });
+  const el = await checkEligibility(actor, d.message_version_id, { recording: true, sentAt: ev.at });
   if (!el.eligible) { const e = new HttpError(409, `Not sent-eligible: ${el.reasons.join("; ")}.`); throw e; }
   // Atomic claim: only one worker can ever consume an authorization.
   const claim = await run("UPDATE send_authorizations SET status='used', used_at=? WHERE id=? AND status='active'", [now(), el.authorization_id]);
@@ -605,15 +670,15 @@ export async function confirmSend(actor: Actor, input: unknown) {
   }
   const t = now();
   try {
-    await run("INSERT INTO send_events (event_id,message_version_id,authorization_id,lead_id,contact_id,channel,campaign_id,status,sent_at,evidence,reported_by,created_at,updated_at,sender_id) VALUES (?,?,?,?,?,?,?,'SENT_CONFIRMED_CRM_PENDING',?,?,?,?,?,?)",
-      [d.event_id, d.message_version_id, el.authorization_id, v.lead_id as number, (v.contact_id as number) ?? null, v.channel as string, v.campaign_id as number, ev.at, d.evidence, actor.id, t, t, (v.sender_id as number) ?? 1]);
+    await run("INSERT INTO send_events (event_id,message_version_id,authorization_id,lead_id,contact_id,channel,campaign_id,status,sent_at,evidence,reported_by,created_at,updated_at,sender_id,history_only) VALUES (?,?,?,?,?,?,?,'SENT_CONFIRMED_CRM_PENDING',?,?,?,?,?,?,?)",
+      [d.event_id, d.message_version_id, el.authorization_id, v.lead_id as number, (v.contact_id as number) ?? null, v.channel as string, v.campaign_id as number, ev.at, d.evidence, actor.id, t, t, (v.sender_id as number) ?? 1, el.history_only ? 1 : 0]);
   } catch (e) {
     const dup = await findEvent(d.event_id);
     if (dup) return { ...dup, duplicate: true };
     throw e;
   }
   await run("UPDATE send_authorizations SET send_event_id=(SELECT id FROM send_events WHERE event_id=?) WHERE id=?", [d.event_id, el.authorization_id]);
-  await audit(actor, "confirm_send", "message_version", d.message_version_id, { event_id: d.event_id, authorization_id: el.authorization_id, ...(el.cap_waived ? { daily_cap_waived: true } : {}) });
+  await audit(actor, "confirm_send", "message_version", d.message_version_id, { event_id: d.event_id, authorization_id: el.authorization_id, ...(el.cap_waived ? { daily_cap_waived: true } : {}), ...(el.history_only ? { history_only: true } : {}) });
   return recordEvent(actor, d.event_id);
 }
 
@@ -648,7 +713,10 @@ async function recordEvent(actor: Actor, eventId: string) {
       stmts.push({ sql: "INSERT INTO activities (lead_id,type,title,body,stage_from,stage_to,actor_id,occurred_at,created_at,is_demo) VALUES (?,'status','Stage changed','Message sent (confirmed send event)',?,'contacted',?,?,?,?)", args: [lead.id as number, lead.stage as string, e.reported_by as number, t, t, lead.is_demo as number] });
     }
     // The linked send task completes by itself, whoever it is assigned to.
-    const doneTasks = (await all("SELECT id,title,action_type,lead_id,is_demo FROM tasks WHERE status NOT IN ('completed','cancelled') AND (message_version_id=? OR id=?)", [v.id as number, (v.task_id as number) ?? 0])).filter((x) => !isPrepTask(x));
+    // Only the task this send belongs to closes. A "handle reply" task closes only when the send answers a reply that came BEFORE it.
+    const lastReply = (await one("SELECT MAX(occurred_at) AS t FROM activities WHERE lead_id=? AND type='reply' AND occurred_precision<>'unknown'", [lead.id as number]))?.t as string | null;
+    const doneTasks = (await all("SELECT id,title,action_type,lead_id,is_demo FROM tasks WHERE status NOT IN ('completed','cancelled') AND (message_version_id=? OR id=?)", [v.id as number, (v.task_id as number) ?? 0]))
+      .filter((x) => !isPrepTask(x) && (!isNonSendTask(x) || (x.action_type === "handle_reply" && (!lastReply || lastReply <= (e.sent_at as string)))));
     for (const tk of doneTasks) {
       stmts.push({ sql: "UPDATE tasks SET status='completed', completed_at=?, completed_by=?, completion_note=?, activity_id=?, sent_at=?, blockers=NULL, message_version_id=?, updated_at=? WHERE id=?", args: [t, e.reported_by as number, `Auto-completed: send recorded (event ${eventId}, activity ${act.id})`, act.id as number, e.sent_at as string, v.id as number, t, tk.id as number] });
       stmts.push({ sql: "UPDATE activities SET task_id=? WHERE id=? AND task_id IS NULL", args: [tk.id as number, act.id as number] });
@@ -665,8 +733,9 @@ async function recordEvent(actor: Actor, eventId: string) {
   await audit(actor, "record_send", "send_event", e.id as number, { event_id: eventId });
   try { const sv = await one("SELECT * FROM message_versions WHERE id=?", [e.message_version_id as number]); if (sv) await closePrepTasks(actor, sv, "send recorded"); } catch (err) { console.error("prep close failed", err); }
   // The follow-up sequence: this step is marked as sent and the next step gets its task (idempotent; never authorizes anything).
-  const seq = await afterSend(actor, e.lead_id as number, e.channel as string);
-  return ({ ...(await sendEventView(eventId)), sequence: seq ? { enrollment_id: seq.enrollment_id, status: seq.status, steps_sent: seq.steps_sent, next_task_id: seq.next_task_id, next_step: seq.next_step, rest_until: seq.rest_until, note: seq.note ?? null } : null }) as Row;
+  const history = !!Number(e.history_only);
+  const seq = history ? null : await afterSend(actor, e.lead_id as number, e.channel as string);
+  return ({ ...(await sendEventView(eventId)), ...(history ? { history_only: true, note: "Recorded as history: this send happened before the opt-out, suppression or reply that now blocks the lead. No sequence step and no follow-up was planned." } : {}), sequence: seq ? { enrollment_id: seq.enrollment_id, status: seq.status, steps_sent: seq.steps_sent, next_task_id: seq.next_task_id, next_step: seq.next_step, rest_until: seq.rest_until, note: seq.note ?? null } : null }) as Row;
 }
 
 export async function reconcileSend(actor: Actor, eventId: string) {

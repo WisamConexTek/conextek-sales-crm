@@ -24,6 +24,7 @@ async function main() {
   const AW = await import("../src/lib/service/agentwork");
   const A = await import("../src/lib/service/activities");
   const API = await import("../src/lib/api");
+  const T = await import("../src/lib/service/tasks");
   await ready();
   let pass = 0, fail = 0;
   const ok = (c: unknown, name: string) => (c ? (pass++, console.log("  ✓", name)) : (fail++, console.log("  ✗ FAIL:", name)));
@@ -328,6 +329,73 @@ async function main() {
   const byCampaign = after.campaigns.reduce((a, c) => a + c.used, 0) + after.used_unassigned;
   ok(byCampaign === after.used, "used = every campaign's used + used_unassigned (no double counting)");
   ok(over.codes.includes("daily_cap_reached") && Number((await one("SELECT COUNT(*) AS n FROM audit_log WHERE action='confirm_send' AND detail LIKE '%daily_cap_waived%'"))!.n) >= 1, "the cap really was reached, and the waiver is kept in the change history");
+
+  console.log("17. Capacity counts email only; history sends; blocked approvals; reply tasks; warm leads");
+  await run("UPDATE senders SET daily_cap=500 WHERE id=1");
+  const lnk = await mk("Linked Only", us);
+  const c0 = await CAP.capacityFor(), u0 = c0.senders.find((x) => x.sender_id === 1)!;
+  await A.recordActivity(li, lnk.id, { type: "message", message_kind: "other", channel: "linkedin", title: "DM", body: "Hi there" });
+  const c1 = await CAP.capacityFor(), u1 = c1.senders.find((x) => x.sender_id === 1)!;
+  ok(u1.used === u0.used && u1.linkedin_sent === u0.linkedin_sent + 1 && c1.used === c0.used && c1.linkedin_sent === c0.linkedin_sent + 1, "a LinkedIn message does not use the email cap; it has its own counter");
+
+  const hs = await mk("Hist Co");
+  const hist1 = await send(hs, canton, "first_email", { noSend: true });
+  const hEmail = (await one("SELECT email FROM contacts WHERE id=?", [hs.cid]))!.email as string;
+  await CO.importSuppressions(chief, { dry_run: false, entries: [{ email: hEmail, kind: "opt_out", occurred_at: new Date(Date.now() - 3600000).toISOString(), source: "reply" }] });
+  ok((await S.checkEligibility(owner, hist1.v)).codes.includes("opted_out"), "the opted-out contact is blocked for a new send");
+  const histRec = await S.confirmSend(writer, { event_id: "ev-hist", message_version_id: hist1.v, sent_at: new Date(Date.now() - 3 * 3600000).toISOString(), evidence: "<hist@outlook>" }) as Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
+  ok(histRec.status === "RECORDED" && histRec.history_only === true && !histRec.sequence && Number((await one("SELECT COUNT(*) AS n FROM tasks WHERE lead_id=? AND status NOT IN ('completed','cancelled')", [hs.id]))!.n) === 0 && Number((await one("SELECT COUNT(*) AS n FROM enrollments WHERE lead_id=?", [hs.id]))!.n) === 0, "a send made BEFORE the opt-out is recorded as history: no sequence, no follow-up");
+  const hs2 = await mk("Hist Late");
+  const hv2 = await send(hs2, canton, "first_email", { noSend: true });
+  const hEmail2 = (await one("SELECT email FROM contacts WHERE id=?", [hs2.cid]))!.email as string;
+  await CO.importSuppressions(chief, { dry_run: false, entries: [{ email: hEmail2, kind: "opt_out", occurred_at: new Date(Date.now() - 3 * 3600000).toISOString(), source: "reply" }] });
+  await throws(() => S.confirmSend(writer, { event_id: "ev-hist2", message_version_id: hv2.v, sent_at: new Date(Date.now() - 3600000).toISOString(), evidence: "<hist2@outlook>" }), "a send made AFTER the opt-out is still refused", /Not sent-eligible/);
+  const nv = await S.createVersion(writer, { lead_id: hs.id, contact_id: hs.cid, channel: "email", campaign_id: canton, subject: "Again", body: "Another try" });
+  await S.authorize(chief, { message_version_id: nv.id, kind: "editorial", permitted_action: "follow_up" });
+  await throws(() => S.authorize(owner, { message_version_id: nv.id, kind: "send", permitted_action: "follow_up" }), "a SEND approval cannot be created for an opted-out contact", /cannot be created/);
+  const hs3 = await mk("Hist Revoke");
+  const hv3 = await send(hs3, canton, "first_email", { noSend: true });
+  await CO.importSuppressions(chief, { dry_run: false, entries: [{ email: (await one("SELECT email FROM contacts WHERE id=?", [hs3.cid]))!.email as string, kind: "dnc", occurred_at: new Date().toISOString(), source: "reply" }] });
+  const dryRevoke = await S.revokeBlockedApprovals(chief, {});
+  ok(dryRevoke.dry_run && dryRevoke.blocked.some((b) => b.message_version_id === hv3.v) && (await one("SELECT status FROM send_authorizations WHERE message_version_id=? AND kind='send'", [hv3.v]))!.status === "active", "withdrawing blocked approvals is a dry run by default");
+  const doRevoke = await S.revokeBlockedApprovals(chief, { dry_run: false });
+  ok(doRevoke.revoked >= 1 && (await one("SELECT status FROM send_authorizations WHERE message_version_id=? AND kind='send'", [hv3.v]))!.status === "revoked", "the approval of a suppressed contact is withdrawn");
+
+  const rw = await mk("Reply Wally");
+  await send(rw, canton, "first_email");
+  const rwr = await IN.recordReply(inbox, { lead_id: rw.id, contact_id: rw.cid, received_at: new Date(Date.now() - 10000).toISOString(), message_id: "<w1@wally>", summary: "what do you mean?", classification: "soft" });
+  const hrW = (rwr.effects.tasks_created as { kind: string; task_id: number }[]).find((x) => x.kind === "handle_reply")!.task_id;
+  const oldV = await send(rw, canton, "follow_up", { noSend: true });
+  await S.confirmSend(writer, { event_id: "ev-oldV-fu", message_version_id: oldV.v, sent_at: new Date(Date.now() - 20000).toISOString(), evidence: "<oldfu@outlook>" });
+  ok((await one("SELECT status FROM tasks WHERE id=?", [hrW]))!.status === "todo", "recording an older send does not close the reply task of a reply that came after it");
+  await T.completeTask(inbox, hrW, { note: "Closed by mistake" });
+  await throws(() => T.reopenTask(writer, hrW, { reason: "x1" }), "only the Owner or a Chief reopens a task", /Owner or a Chief/);
+  await T.reopenTask(chief, hrW, { reason: "The reply is still unanswered" });
+  const re = (await one("SELECT status,completed_at,completion_note FROM tasks WHERE id=?", [hrW]))!;
+  ok(re.status === "todo" && re.completed_at === null && Number((await one("SELECT COUNT(*) AS n FROM task_notes WHERE task_id=? AND body LIKE 'Reopened by%'", [hrW]))!.n) === 1, "a task closed by mistake can be reopened; the reason is kept in its notes");
+
+  const addAct = (leadId: number, cid: number, type: "reply" | "message", daysAgo: number, extra: Record<string, string | null> = {}) => run(`INSERT INTO activities (lead_id,contact_id,type,message_kind,channel,outcome,title,body,actor_id,occurred_at,created_at,is_demo,occurred_precision,sender_id,classification,external_id) VALUES (?,?,?,?,'email',?,?,?,?,?,?,0,'time',1,?,?)`,
+    [leadId, cid, type, type === "message" ? "follow_up" : null, type === "message" ? "sent" : "reply_received", extra.title ?? (type === "reply" ? "Reply" : "Quick note"), "x", writer.id, new Date(Date.now() - daysAgo * 86400000).toISOString(), new Date().toISOString(), type === "reply" ? "soft" : null, type === "reply" ? `reply:t-${leadId}-${daysAgo}` : null]);
+  const wf = await mk("Warm Fuzzy"), wu = await mk("Warm Unanswered"), wz = await mk("Warm Idle");
+  for (const l of [wf, wu, wz]) await run("UPDATE leads SET stage=? WHERE id=?", [l === wu ? "interested" : "replied", l.id]);
+  await addAct(wf.id, wf.cid, "reply", 12); await addAct(wf.id, wf.cid, "message", 9);
+  await addAct(wu.id, wu.cid, "message", 5); await addAct(wu.id, wu.cid, "reply", 2);
+  await addAct(wz.id, wz.cid, "reply", 12); await addAct(wz.id, wz.cid, "message", 1);
+  const warm = await L.listLeads(owner, { attention: "warm_idle", pageSize: 200 });
+  ok(warm.rows.some((r) => r.id === wf.id) && warm.rows.some((r) => r.id === wu.id) && !warm.rows.some((r) => r.id === rw.id), "the quick view finds Interested or Replied leads with nothing planned");
+  const dryFu = await Q.replyFollowUps(chief, {}) as Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
+  const planOf = (id: number) => dryFu.items.find((x: { lead_id: number }) => x.lead_id === id)?.plan;
+  ok(dryFu.dry_run && planOf(wf.id) === "Reply FU" && planOf(wu.id) === "Handle reply" && !planOf(wz.id), "the dry run plans a reply follow-up after 5 quiet working days, a Handle reply for an unanswered reply, and nothing for a lead that was answered yesterday");
+  ok(Number((await one("SELECT COUNT(*) AS n FROM tasks WHERE lead_id=? AND status NOT IN ('completed','cancelled')", [wf.id]))!.n) === 0, "the dry run creates nothing");
+  await Q.replyFollowUps(chief, { dry_run: false });
+  const fuT = (await one("SELECT * FROM tasks WHERE lead_id=? AND action_type='send_reply_follow_up'", [wf.id]))!;
+  ok(fuT && fuT.assignee_id === writer.id && fuT.prep_status === "draft_needed" && fuT.thread_subject === "Re: Quick note" && /^Reply FU · Warm Fuzzy/.test(fuT.title) && TL.displayType(fuT) === "Reply FU", "a Reply FU task goes to the Outreach Writer, draft needed, in the same thread");
+  ok((await one("SELECT assignee_id FROM tasks WHERE lead_id=? AND action_type='handle_reply'", [wu.id]))!.assignee_id === inbox.id, "an unanswered reply gets a Handle reply task for the Inbox Manager");
+  await Q.replyFollowUps(chief, { dry_run: false });
+  ok(Number((await one("SELECT COUNT(*) AS n FROM tasks WHERE lead_id=? AND action_type='send_reply_follow_up'", [wf.id]))!.n) === 1, "running it again creates nothing new");
+  const rv = await send(wf, canton, "follow_up", { task_id: fuT.id as number, noSend: true });
+  ok((await S.checkEligibility(owner, rv.v)).eligible, "a reply follow-up is drafted and approved like any send, and is sendable");
+  ok(((await L.withNextStep([(await one("SELECT * FROM leads WHERE id=?", [wf.id]))!]))[0].next_step.text as string).startsWith("Follow-up on the reply"), "the next step reads 'Follow-up on the reply'");
 
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);

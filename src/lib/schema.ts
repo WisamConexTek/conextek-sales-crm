@@ -808,4 +808,8 @@ INSERT OR IGNORE INTO sequence_steps (sequence_id,version,position,step_code,anc
 INSERT OR IGNORE INTO sequence_steps (sequence_id,version,position,step_code,anchor,offset_start,offset_end,min_gap_prev,thread_reply,assignee_role)
   SELECT id,1,3,'DM3','previous',5,7,NULL,0,'linkedin' FROM sequences WHERE key='default_linkedin';
 `,
+  `
+-- Migration 15 (additive): a send recorded as history (it happened before the opt-out or reply that now blocks the lead) never plans a follow-up.
+ALTER TABLE send_events ADD COLUMN history_only INTEGER NOT NULL DEFAULT 0;
+`,
 ];

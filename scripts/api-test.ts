@@ -100,7 +100,7 @@ async function main() {
   ok((await IN.recordBounce(other, { contact_id: b.cid, message_id: "<bounce1>", bounced_at: new Date(Date.now() - 1000).toISOString() })).duplicate === true, "the same bounce is de-duplicated");
   const bv = await S.createVersion(other, { lead_id: b.id, contact_id: b.cid, channel: "email", campaign_id: camp, subject: "Again", body: "Another try" });
   await S.authorize(chief, { message_version_id: bv.id, kind: "editorial", permitted_action: "follow_up" });
-  await S.authorize(owner, { message_version_id: bv.id, kind: "send", permitted_action: "follow_up" });
+  await throws(() => S.authorize(owner, { message_version_id: bv.id, kind: "send", permitted_action: "follow_up" }), "a SEND approval is refused for a bounced contact", /cannot be created/);
   const el = await S.checkEligibility(owner, bv.id);
   ok(!el.eligible && el.codes.includes("bounced"), "a bounced contact blocks future eligibility (code: bounced)");
 

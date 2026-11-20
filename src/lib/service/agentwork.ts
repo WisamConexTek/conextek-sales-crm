@@ -7,7 +7,7 @@ import { liveTasks } from "./taskview";
 import { toLocalInput } from "../format";
 import { getVersion, checkEligibility } from "./sends";
 import { displayType } from "./tasklist";
-import { parseLabels } from "./sequences";
+import { parseLabels, ensureReplyFollowUps } from "./sequences";
 import { syncShortfalls } from "./workplan";
 
 /**
@@ -52,7 +52,7 @@ export async function nextWork(actor: Actor, o: { limit?: number; assignee?: num
     all(`SELECT ${cols} AND t.scheduled_at IS NULL AND t.due_at IS NULL ORDER BY t.id LIMIT 100`, mineArgs),
     one(`SELECT COUNT(*) AS n FROM tasks t WHERE t.is_demo=0 AND t.status NOT IN ('completed','cancelled')${mine} AND t.scheduled_at IS NULL AND t.due_at IS NULL`, mineArgs),
   ]);
-  const kindOf = (t: Row) => (t.is_late ? "late" : /^FU\d|^LinkedIn DM|^Final/.test(displayType(t)) ? "follow_up" : displayType(t) === "Email 1" ? "first_email" : "other");
+  const kindOf = (t: Row) => (t.is_late ? "late" : /^FU\d|^LinkedIn DM|^Final|^Reply FU/.test(displayType(t)) ? "follow_up" : displayType(t) === "Email 1" ? "first_email" : "other");
   const live = (await liveTasks([...dated, ...undated])).filter((t) => !o.kind || kindOf(t) === o.kind);
   const counts = { ready: 0, overdue: 0, planned: 0, blocked: 0 };
   for (const t of live) if (t.state in counts) counts[t.state as keyof typeof counts]++;
@@ -166,7 +166,7 @@ export async function changesSince(actor: Actor, o: { since?: string | null; lim
   const mine = mgr ? "" : " AND v.created_by=?";
   const mineArgs: InValue[] = mgr ? [] : [actor.id];
   const seeAll = mgr || actor.perms.has("compliance.view");
-  if (seeAll) { try { await syncShortfalls(); } catch (e) { console.error("shortfall sync failed", e); } }
+  if (seeAll) { await ensureReplyFollowUps(); try { await syncShortfalls(); } catch (e) { console.error("shortfall sync failed", e); } }
   const [seqEvents, stepDue, shortfalls, decisions, auths, approvals, inbound, tasks] = await Promise.all([
     // What the follow-up sequences did. Managers and the compliance monitor see all of it; everyone else sees what concerns their own tasks.
     all(`SELECT a.action,a.entity,a.entity_id,a.detail,a.created_at AS at,a.actor_name FROM audit_log a

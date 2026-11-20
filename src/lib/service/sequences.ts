@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { InValue } from "@libsql/client";
 import { all, one, run, now, addDays, todayYmd, localInstant, type Row } from "../db";
-import { HttpError, isManager, type Actor } from "../auth";
+import { HttpError, isManager, actorById, type Actor } from "../auth";
 import { FREE_MAIL, STEP_ACTION, STEP_CODES, STEP_LONG, STEP_SHORT, WORK_ROLES, type WorkRole } from "../constants";
 import { audit, parse, parseWhen, optText } from "./common";
 
@@ -35,11 +35,14 @@ export type SeqSettings = {
   not_now_days: number;
   soft_bounce_hold_days: number;
   ooo_max_delay_days: number;
+  /** A lead that replied and then went quiet: working days without an answer before a reply follow-up is planned, and how many to plan before a person decides. */
+  reply_followup_days: number;
+  reply_followup_max: number;
 };
 const DEFAULTS: SeqSettings = {
   weekends: DEFAULT_WEEKENDS, roles: {}, late_daily_limit: 8, overdue_days: 7, plan_buffer: 0.2,
   cutoffs: { hunter: "14:00", writer: "18:00", chief: "20:00", owner: "22:00" }, draft_deadline_time: "18:00",
-  reply_sla_hours: 4, editorial_sla_hours: 24, not_now_days: 90, soft_bounce_hold_days: 3, ooo_max_delay_days: 14,
+  reply_sla_hours: 4, editorial_sla_hours: 24, not_now_days: 90, soft_bounce_hold_days: 3, ooo_max_delay_days: 14, reply_followup_days: 5, reply_followup_max: 3,
 };
 const SETTINGS_KEY = "sequence_settings";
 const hhmm = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, "HH:MM (24-hour)");
@@ -63,6 +66,8 @@ const settingsSchema = z.object({
   reply_sla_hours: z.coerce.number().int().min(1).max(240).optional(),
   editorial_sla_hours: z.coerce.number().int().min(1).max(240).optional(),
   not_now_days: z.coerce.number().int().min(1).max(730).optional(),
+  reply_followup_days: z.coerce.number().int().min(1).max(60).optional(),
+  reply_followup_max: z.coerce.number().int().min(1).max(20).optional(),
 });
 export async function setSeqSettings(actor: Actor, input: unknown) {
   if (actor.role !== "owner") throw new HttpError(403, "Only the Owner can change the follow-up settings.");
@@ -486,7 +491,14 @@ async function createStepTask(actor: Actor, ctx: Ctx, lead: Row, enr: Row, plan:
 
 /** Called after any recorded send. Never throws: a planning problem must not undo or hide a recorded send. */
 export async function afterSend(actor: Actor, leadId: number, channel: string | null): Promise<SyncResult | null> {
-  try { return await syncEnrollment(actor, leadId, channel || "email"); }
+  try {
+    // A lead that replied, opted out, bounced or is closed gets no new sequence step from a recorded send.
+    const lead = await one("SELECT * FROM leads WHERE id=?", [leadId]);
+    const why = lead ? await blockReason(lead, channel || "email") : null;
+    const running = await one("SELECT 1 AS x FROM enrollments WHERE lead_id=? AND channel=? AND status='running'", [leadId, channel || "email"]);
+    if (why && !running) return { enrolled: false, enrollment_id: null, status: null, steps_sent: 0, next_task_id: null, next_step: null, rest_until: null, created: false, note: `No sequence step was planned: ${why}.` };
+    return await syncEnrollment(actor, leadId, channel || "email");
+  }
   catch (e) { console.error("sequence sync failed", e); return null; }
 }
 
@@ -751,4 +763,97 @@ export async function linkedinAccepted(actor: Actor, leadId: number, at: string)
   const mem = await one("SELECT c.key,c.name FROM lead_campaigns lc JOIN campaigns c ON c.id=lc.campaign_id WHERE lc.lead_id=? AND lc.status='active' ORDER BY lc.id DESC LIMIT 1", [leadId]);
   const on = todayYmd(MARKET_ZONE[marketOfCampaign(mem, lead)], new Date(at));
   try { return await syncEnrollment(actor, leadId, "linkedin", { acceptOn: on }); } catch (e) { console.error("linkedin sequence failed", e); return null; }
+}
+
+
+/* ---------- warm leads that went quiet ---------- */
+const WARM_STAGES = ["replied", "interested"];
+export const REPLY_FU_ACTION = "send_reply_follow_up";
+const workdaysBetween = (fromYmd: string, toYmd: string, weekend: number[]) => {
+  let n = 0;
+  for (let d = addDays(fromYmd, 1); d <= toYmd; d = addDays(d, 1)) if (!weekend.includes(dow(d))) n++;
+  return n;
+};
+/**
+ * Leads that replied (Interested / Replied) and have nothing planned:
+ *  - the reply is still unanswered: a "Handle reply" task for the Inbox Manager;
+ *  - our last message has had no answer for N working days (default 5): a "Reply FU" task for the Outreach Writer, drafted and approved like any send;
+ *  - after reply_followup_max of those with no answer: one "Review" task for the Chief, so a person decides.
+ * Idempotent: a lead with any open task is left alone. dry_run lists what would be created.
+ */
+export async function replyFollowUps(actor: Actor, o: { dry_run?: boolean; limit?: number } = {}) {
+  if (actor.id && !isManager(actor) && actor.via !== "system") throw new HttpError(403, "Only the Owner or a Chief can plan reply follow-ups.");
+  const dry = o.dry_run !== false;
+  const settings = await seqSettings();
+  const today = todayYmd();
+  const stageKeys = WARM_STAGES.map(() => "?").join(",");
+  const leads = await all(
+    `SELECT l.*, (SELECT MAX(r.occurred_at) FROM activities r WHERE r.lead_id=l.id AND r.type='reply' AND r.occurred_precision<>'unknown') AS last_reply_at,
+            (SELECT r.classification FROM activities r WHERE r.lead_id=l.id AND r.type='reply' AND r.occurred_precision<>'unknown' ORDER BY r.occurred_at DESC, r.id DESC LIMIT 1) AS last_reply_class,
+            (SELECT r.body FROM activities r WHERE r.lead_id=l.id AND r.type='reply' AND r.occurred_precision<>'unknown' ORDER BY r.occurred_at DESC, r.id DESC LIMIT 1) AS last_reply_body,
+            (SELECT MAX(m.occurred_at) FROM activities m WHERE m.lead_id=l.id AND m.type='message' AND m.outcome='sent' AND m.occurred_precision<>'unknown') AS last_msg_at,
+            (SELECT m.title FROM activities m WHERE m.lead_id=l.id AND m.type='message' AND m.outcome='sent' AND COALESCE(m.channel,'email')='email' AND m.occurred_precision<>'unknown' ORDER BY m.occurred_at DESC, m.id DESC LIMIT 1) AS last_subject,
+            (SELECT COALESCE(m.sender_id,1) FROM activities m WHERE m.lead_id=l.id AND m.type='message' AND m.outcome='sent' AND m.occurred_precision<>'unknown' ORDER BY m.occurred_at DESC, m.id DESC LIMIT 1) AS last_sender_id,
+            (SELECT COUNT(*) FROM tasks t WHERE t.lead_id=l.id AND t.action_type=? AND t.status='completed') AS done_fu,
+            (SELECT COUNT(*) FROM tasks t WHERE t.lead_id=l.id AND t.action_type='review_stalled_warm_lead') AS reviews
+     FROM leads l
+     WHERE l.is_demo=0 AND l.historical_only=0 AND (l.stage IN (${stageKeys}) OR EXISTS (SELECT 1 FROM lists s WHERE s.kind='stage' AND s.key=l.stage AND s.flag='replied'))
+       AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.lead_id=l.id AND t.status NOT IN ('completed','cancelled'))
+       AND NOT EXISTS (SELECT 1 FROM contacts c WHERE c.lead_id=l.id AND c.email_status='opted_out')
+       AND NOT (EXISTS (SELECT 1 FROM contacts c WHERE c.lead_id=l.id) AND NOT EXISTS (SELECT 1 FROM contacts c WHERE c.lead_id=l.id AND c.email_status<>'bounced'))
+       AND NOT EXISTS (SELECT 1 FROM suppressions sp WHERE sp.kind IN ('dnc','opt_out') AND ((sp.scope='domain' AND sp.value=l.domain) OR (sp.scope='email' AND sp.value IN (SELECT lower(c.email) FROM contacts c WHERE c.lead_id=l.id))))
+     ORDER BY l.id LIMIT 500`, [REPLY_FU_ACTION, ...WARM_STAGES]);
+  const roles = await roleUsers(settings);
+  const out: { lead_id: number; company: string; plan: string; reason: string; task_id?: number | null }[] = [];
+  let made = 0;
+  for (const l of leads) {
+    if (!l.last_reply_at || ["not_now", "not_interested", "unsubscribe", "referral"].includes(String(l.last_reply_class))) continue;
+    const mem = await one("SELECT c.id,c.key,c.name FROM lead_campaigns lc JOIN campaigns c ON c.id=lc.campaign_id WHERE lc.lead_id=? AND lc.status='active' ORDER BY lc.id DESC LIMIT 1", [l.id as number]);
+    const group = marketOfCampaign(mem, l);
+    const weekend = settings.weekends[group];
+    const unanswered = !l.last_msg_at || (l.last_msg_at as string) < (l.last_reply_at as string);
+    const item = { lead_id: l.id as number, company: l.company as string };
+    if (unanswered) {
+      out.push({ ...item, plan: "Handle reply", reason: "The last reply has not been answered and no task is open." });
+      if (!dry && made < (o.limit ?? 100)) { out[out.length - 1].task_id = await systemTask(actor, l, { role: "inbox", type: "Reply", action: "handle_reply", taskType: "reply_draft", dueAt: addWorkingHours(l.last_reply_at as string, settings.reply_sla_hours, group, weekend), instructions: `This lead replied and the reply has not been answered, and no task was open. ${String(l.last_reply_body ?? "").slice(0, 400)}` }); made++; }
+      continue;
+    }
+    const lastDay = todayYmd(MARKET_ZONE[group], new Date(l.last_msg_at as string));
+    const quiet = workdaysBetween(lastDay, todayYmd(MARKET_ZONE[group]), weekend);
+    if (quiet < settings.reply_followup_days) continue;
+    if (Number(l.done_fu) >= settings.reply_followup_max) {
+      if (Number(l.reviews) > 0) continue;
+      out.push({ ...item, plan: "Review", reason: `${l.done_fu} reply follow-ups were sent and the lead has not answered. A person decides what next.` });
+      if (!dry && made < (o.limit ?? 100)) { out[out.length - 1].task_id = await systemTask(actor, l, { role: "chief", type: "Review", action: "review_stalled_warm_lead", dueOn: today, instructions: `${l.company} replied earlier and has not answered ${l.done_fu} follow-ups. Decide: one more try, move to Nurture, or close.` }); made++; }
+      continue;
+    }
+    out.push({ ...item, plan: "Reply FU", reason: `Our last message went out ${quiet} working days ago and has had no answer.` });
+    if (dry || made >= (o.limit ?? 100)) continue;
+    const t = now();
+    const sender = l.last_sender_id ? await one("SELECT id,email,display_name FROM senders WHERE id=?", [l.last_sender_id as number]) : null;
+    const dueOn = nextWorkday(today, weekend).ymd;
+    const assignee = roles.writer ?? roles.chief ?? roles.owner ?? actor.id;
+    const subject = l.last_subject ? `Re: ${String(l.last_subject).replace(/^\s*(re|fwd?)\s*:\s*/i, "")}` : null;
+    const title = shortTitle("Reply FU", l.company as string, sender ? firstWord(sender.display_name) : null);
+    const text = `This lead replied (${fmtDay(l.last_reply_at as string)}) and our last message (${fmtDay(l.last_msg_at as string)}) has had no answer for ${quiet} working days. Write a short, useful follow-up in the same thread${subject ? ` (subject "${subject}")` : ""}${sender ? `, from ${sender.email}` : ""}. It needs a draft, the Chief's review and the Owner's send approval like any message. Created automatically.`;
+    const r = await run(`INSERT INTO tasks (lead_id,assignee_id,created_by,title,instructions,task_type,approval_from,due_at,due_on,is_demo,created_at,updated_at,channel,action_type,prep_status,campaign_id,sender_id,thread_subject,auto_generated)
+                         VALUES (?,?,?,?,?,NULL,NULL,?,?,?,?,?,'email',?,'draft_needed',?,?,?,1)`,
+      [l.id as number, assignee, actor.id || assignee, title, text, endOfDay(dueOn), dueOn, l.is_demo as number, t, t, REPLY_FU_ACTION, (mem?.id as number) ?? null, (l.last_sender_id as number) ?? null, subject]);
+    await run("INSERT INTO activities (lead_id,task_id,type,title,body,actor_id,occurred_at,created_at,is_demo) VALUES (?,?,'task',?,?,?,?,?,?)", [l.id as number, r.id, `Task created: ${title}`, text, actor.id || null, t, t, l.is_demo as number]);
+    await audit(actor, "sequence_task_created", "task", r.id, { lead_id: l.id, action: REPLY_FU_ACTION, due_on: dueOn, assignee_id: assignee, quiet_working_days: quiet });
+    out[out.length - 1].task_id = r.id;
+    made++;
+  }
+  return { dry_run: dry, found: out.length, created: dry ? 0 : made, rule: `A lead in Interested or Replied with no open task. If our last message is older than its reply: a Handle reply task. Otherwise, after ${settings.reply_followup_days} working days without an answer: a Reply FU task (at most ${settings.reply_followup_max}, then a Review task for the Chief).`, items: out };
+}
+const fmtDay = (iso: string) => todayYmd(undefined, new Date(iso));
+let lastReplyFuRun = 0;
+/** Called when the plan or the changes feed is read (there is no timer in this app). At most once a minute; never throws. */
+export async function ensureReplyFollowUps() {
+  if (Date.now() - lastReplyFuRun < 60000) return;
+  lastReplyFuRun = Date.now();
+  try {
+    const owner = await one("SELECT id FROM users WHERE role='owner' AND active=1 ORDER BY id LIMIT 1");
+    if (owner) await replyFollowUps(await actorById(owner.id as number, "system"), { dry_run: false });
+  } catch (e) { console.error("reply follow-ups failed", e); }
 }

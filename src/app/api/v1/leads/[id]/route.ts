@@ -1,6 +1,12 @@
 import { route, id } from "@/lib/api";
-import { getLead, updateLead, setLeadTest, setLeadHistorical } from "@/lib/service/leads";
-export const GET = route<{ id: string }>(async ({ actor, params }) => getLead(actor, id(params.id)));
+import { getLead, updateLead, setLeadTest, setLeadHistorical, leadListExtras, nextStepOf } from "@/lib/service/leads";
+import { leadSequenceInfo } from "@/lib/service/sequences";
+// next_step is computed from the open tasks and the sequence. The lead's own next_action text is an old free-text note and is not a task.
+export const GET = route<{ id: string }>(async ({ actor, params }) => {
+  const r = await getLead(actor, id(params.id));
+  const [ex, seq] = await Promise.all([leadListExtras([r.lead.id as number]), leadSequenceInfo([r.lead.id as number])]);
+  return { ...r, next_step: nextStepOf(ex.nextTask.get(r.lead.id as number), seq.get(r.lead.id as number)) };
+});
 export const PATCH = route<{ id: string }>(async ({ actor, params, body }) => {
   const b = await body();
   const lid = id(params.id);

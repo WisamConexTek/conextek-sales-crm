@@ -19,7 +19,7 @@ const OUTREACH_LABEL = { not_contacted: "Not contacted yet", no_reply: "Contacte
 const TASK_LABEL = { open: "Has an open task", overdue: "Has an overdue task", none: "No open task" } as const;
 const ACTIVE_LABEL = { "7": "Active in the last 7 days", "30": "Active in the last 30 days", "90": "Active in the last 90 days", stale30: "Quiet for 30+ days", stale90: "Quiet for 90+ days" } as const;
 const CONTACT_LABEL = { has_email: "Has an email address", no_email: "No email address" } as const;
-const ATTENTION_LABEL = { unanswered: "Reply not answered yet", quiet: "Nothing planned, quiet 7+ days" } as const;
+const ATTENTION_LABEL = { unanswered: "Reply not answered yet", quiet: "Nothing planned, quiet 7+ days", warm_idle: "Interested or replied, nothing planned" } as const;
 const SORT_LABEL = { "": "Latest activity first", oldest: "Longest quiet first", added: "Newest leads first", due: "Next due first", company: "Company A–Z" } as const;
 const NEXT_LABEL = { overdue: "Next step overdue", due_today: "Next step due today", due_week: "Next step due this week", missing: "No next step" } as const;
 const SEQ_LABEL = { running: "Sequence running", paused: "Sequence paused", resting: "Resting", completed: "Sequence finished", stopped_reply: "Stopped by a reply", stopped_bounce: "Stopped by a bounce or opt-out", none: "Not in a sequence" } as const;
@@ -100,6 +100,7 @@ export default async function LeadsPage({ searchParams }: { searchParams: SP }) 
   // One-click views. Each replaces the filters with one clear question.
   const views: { label: string; params: Record<string, string>; icon: Parameters<typeof Icon>[0]["name"] }[] = [
     { label: "Needs a reply", params: { attention: "unanswered" }, icon: "reply" },
+    { label: "Warm, nothing planned", params: { attention: "warm_idle" }, icon: "alert" },
     { label: "Nothing planned", params: { attention: "quiet" }, icon: "moon" },
     { label: "Not contacted yet", params: { outreach: "not_contacted" }, icon: "mail" },
     { label: "Waiting for a reply", params: { outreach: "no_reply" }, icon: "clock" },
@@ -220,7 +221,8 @@ export default async function LeadsPage({ searchParams }: { searchParams: SP }) 
               const c = extra.contact.get(l.id), o = extra.outreach.get(l.id), t = extra.nextTask.get(l.id), cs = extra.campaigns.get(l.id), sq = seqInfo.get(l.id);
               const ns = nextStepOf(t, sq, today);
               // An open, contacted lead with nothing planned is a gap that should not exist.
-              const gap = ns.state === "none" && (o?.sent ?? 0) > 0 && !l.historical_only && !closed.has(l.stage) && !c?.optedOut && !(o?.replies);
+              const warm = ["replied", "interested"].includes(l.stage as string) || flag[l.stage] === "replied";
+              const gap = ns.state === "none" && !l.historical_only && !closed.has(l.stage) && !c?.optedOut && (warm || ((o?.sent ?? 0) > 0 && !(o?.replies)));
               const mk = l.market ? L.market[l.market] ?? l.market : null;
               const where = [l.country, mk && String(mk).toLowerCase() !== String(l.country ?? "").toLowerCase() ? mk : null].filter(Boolean).join(" · ");
               const kind = [l.industry ? L.industry[l.industry] ?? l.industry : null, l.segment ? L.segment[l.segment] ?? l.segment : null, l.service ? L.service[l.service] ?? l.service : null].filter(Boolean).join(" · ");
@@ -289,7 +291,7 @@ export default async function LeadsPage({ searchParams }: { searchParams: SP }) 
                         <div className="truncate text-xs text-slate-500" title={t.reason ?? undefined}>{t.assignee_name}{ns.note ? ` · ${ns.note}` : ""}</div>
                       </>
                     ) : ns.state === "resting" ? <span className="text-slate-600">{ns.text}</span>
-                      : gap ? <span className="font-semibold text-red-700">⚠ No next step</span>
+                      : gap ? <span className="font-semibold text-red-700">⚠ {warm ? "Nothing planned" : "No next step"}</span>
                       : <span className="text-slate-400">{sq?.sequence_status?.startsWith("stopped") ? `sequence stopped${sq.stop_reason ? ` (${sq.stop_reason})` : ""}` : "nothing planned"}</span>}
                   </td>
                   <td className="td whitespace-nowrap">

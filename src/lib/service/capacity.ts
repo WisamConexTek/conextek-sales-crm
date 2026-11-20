@@ -47,7 +47,10 @@ export async function sentOn(ymd: string) {
   const rows = await all(
     `SELECT ${SENDER_SQL} AS sender_id, COALESCE(se.campaign_id, (SELECT lc.campaign_id FROM lead_campaigns lc WHERE lc.lead_id=a.lead_id AND lc.status='active' ORDER BY lc.id DESC LIMIT 1)) AS campaign_id, COUNT(DISTINCT a.id) AS n
      FROM activities a LEFT JOIN send_events se ON se.activity_id=a.id
-     WHERE a.type='message' AND a.outcome='sent' AND a.is_demo=0 AND a.occurred_precision='time' AND a.occurred_at>=? AND a.occurred_at<? GROUP BY 1,2`, [from, to]);
+     WHERE a.type='message' AND a.outcome='sent' AND COALESCE(a.channel,'email')='email' AND a.is_demo=0 AND a.occurred_precision='time' AND a.occurred_at>=? AND a.occurred_at<? GROUP BY 1,2`, [from, to]);
+  // LinkedIn messages are not email: they never use the email cap. They have their own counter.
+  const li = await all(`SELECT COALESCE(a.sender_id,1) AS sender_id, COUNT(*) AS n FROM activities a WHERE a.type='message' AND a.outcome='sent' AND a.channel='linkedin' AND a.is_demo=0 AND a.occurred_precision='time' AND a.occurred_at>=? AND a.occurred_at<? GROUP BY 1`, [from, to]);
+  const linkedin = new Map(li.map((r) => [r.sender_id as number, Number(r.n)]));
   const per = new Map<number | null, number>();
   const bySender = new Map<number, { total: number; per: Map<number | null, number> }>();
   let total = 0;
@@ -57,7 +60,7 @@ export async function sentOn(ymd: string) {
     const b = bySender.get(sid) ?? bySender.set(sid, { total: 0, per: new Map() }).get(sid)!;
     b.total += n; b.per.set(c, (b.per.get(c) ?? 0) + n);
   }
-  return { total, per, bySender };
+  return { total, per, bySender, linkedin, linkedinTotal: [...linkedin.values()].reduce((a, b) => a + b, 0) };
 }
 
 export async function sentTodayTotal() {
@@ -136,7 +139,7 @@ export async function capacityData(ymd: string) {
        WHERE t.status NOT IN ('completed','cancelled') AND t.is_demo=0 AND COALESCE(t.scheduled_at,t.due_at)>=? AND COALESCE(t.scheduled_at,t.due_at)<?
          AND EXISTS (SELECT 1 FROM send_authorizations a WHERE a.message_version_id=mv.id AND a.kind='send' AND a.status='active')
        ORDER BY COALESCE(t.scheduled_at,t.due_at), t.id`, [lower, upper]),
-    all(`SELECT COALESCE(a.sender_id,1) AS sender_id, COUNT(*) AS n FROM activities a WHERE a.type='message' AND a.outcome='sent' AND a.message_kind='first_email' AND a.is_demo=0 AND a.occurred_precision='time' AND a.occurred_at>=? AND a.occurred_at<? GROUP BY 1`, [from, to]),
+    all(`SELECT COALESCE(a.sender_id,1) AS sender_id, COUNT(*) AS n FROM activities a WHERE a.type='message' AND a.outcome='sent' AND a.message_kind='first_email' AND COALESCE(a.channel,'email')='email' AND a.is_demo=0 AND a.occurred_precision='time' AND a.occurred_at>=? AND a.occurred_at<? GROUP BY 1`, [from, to]),
     seqSettings(),
   ]);
   const rank = (id: number) => { const i = set.priority.indexOf(id); return i === -1 ? 1e6 + id : i; };
@@ -183,7 +186,7 @@ export async function capacityFor(date?: string) {
       sender_id: x.sender.id, email: x.sender.email, display_name: x.sender.display_name, status: x.status,
       daily_cap: x.cap, unlimited, warmup: x.warmup, warmup_not_started: x.not_started, warmup_step_from: x.step_from,
       used: x.used, reserved: x.reserved, remaining: unlimited ? null : Math.max(0, (x.cap as number) - x.used - x.reserved),
-      first_email_floor: x.floor, first_emails_sent: x.used_first,
+      first_email_floor: x.floor, first_emails_sent: x.used_first, linkedin_sent: used.linkedin.get(x.sender.id) ?? 0,
       groups: CAP_GROUPS.map((g) => ({ group: g, label: CAP_GROUP_LABEL[g], reserved: x.groups[g].reserved, pushed_to_next_day: x.groups[g].pushed })),
       cap_reached: !unlimited && x.used >= (x.cap as number),
       campaigns: per.filter((c) => c.allowed || c.used || c.reserved || c.pushed_to_next_day),
@@ -213,8 +216,8 @@ export async function capacityFor(date?: string) {
     remaining: unlimited ? null : sendersOut.reduce((a, b) => a + (b.remaining ?? 0), 0),
     cap_reached: capped.length > 0 && !unlimited && capped.every((x) => x.used >= (x.daily_cap as number)),
     // used_unassigned is part of used (sends with no campaign), not in addition to it: used = the sum of every campaign's used + used_unassigned.
-    used_unassigned: used.per.get(null) ?? 0,
+    used_unassigned: used.per.get(null) ?? 0, linkedin_sent: used.linkedinTotal,
     priority_order: CAP_GROUPS.map((g, i) => ({ position: i + 1, group: g, label: CAP_GROUP_LABEL[g] })), late_daily_limit: (await seqSettings()).late_daily_limit,
-    rules: "Capacity is per sender (Asia/Hebron day). used = messages recorded as sent that day from that sender. reserved = approved (Owner send authorization active) tasks due that day, taking the sender's remaining capacity in this order: follow-ups inside their window (soonest window end first), overdue follow-ups up to 7 days late (oldest first), the protected first-email minimum (first_email_floor), late backfill items up to late_daily_limit, then the remaining first emails. Campaign priority (China, then US, then Gulf by default) applies inside each group. A follow-up only ever uses its own sender's capacity. Tasks that do not fit are listed in pushed_to_next_day and are blocked with daily_cap_reached. remaining = cap - used - reserved. A sender with a warm-up schedule has cap 0 before its first step.",
+    rules: "Capacity is per sender (Asia/Hebron day). used = messages recorded as sent that day from that sender. reserved = approved (Owner send authorization active) tasks due that day, taking the sender's remaining capacity in this order: follow-ups inside their window (soonest window end first), overdue follow-ups up to 7 days late (oldest first), the protected first-email minimum (first_email_floor), late backfill items up to late_daily_limit, then the remaining first emails. Campaign priority (China, then US, then Gulf by default) applies inside each group. Only EMAIL counts toward the cap; LinkedIn messages have their own counter (linkedin_sent). A follow-up only ever uses its own sender's capacity. Tasks that do not fit are listed in pushed_to_next_day and are blocked with daily_cap_reached. remaining = cap - used - reserved. A sender with a warm-up schedule has cap 0 before its first step.",
   };
 }

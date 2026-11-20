@@ -413,6 +413,16 @@ export function quietLeadFilter(alias = "l", days = 7): SqlPart {
   };
 }
 
+/** Interested or Replied, still contactable, and nothing open: the leads that have gone quiet after a reply. */
+export function warmIdleFilter(alias = "l"): SqlPart {
+  return {
+    sql: `${alias}.is_demo=0 AND ${alias}.historical_only=0 AND (${alias}.stage IN ('replied','interested') OR EXISTS (SELECT 1 FROM lists s WHERE s.kind='stage' AND s.key=${alias}.stage AND s.flag='replied'))
+      AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.lead_id=${alias}.id AND t.status NOT IN ('completed','cancelled'))
+      AND NOT EXISTS (SELECT 1 FROM contacts c WHERE c.lead_id=${alias}.id AND c.email_status='opted_out')`,
+    args: [],
+  };
+}
+
 /* ---------- reads ---------- */
 export const OUTREACH = ["not_contacted", "no_reply", "replied", "bounced", "opted_out"] as const;
 export type Outreach = (typeof OUTREACH)[number];
@@ -502,7 +512,7 @@ function leadWhere(actor: Actor, f: LeadFilters, skip: { stage?: boolean } = {})
   if (f.campaign === "none") where.push("NOT EXISTS (SELECT 1 FROM lead_campaigns lc WHERE lc.lead_id=l.id AND lc.status='active')");
   else if (f.campaign) (where.push("EXISTS (SELECT 1 FROM lead_campaigns lc WHERE lc.lead_id=l.id AND lc.campaign_id=? AND lc.status='active')"), args.push(f.campaign));
   if (f.attention) {
-    const a = f.attention === "unanswered" ? unansweredReplyFilter() : quietLeadFilter();
+    const a = f.attention === "unanswered" ? unansweredReplyFilter() : f.attention === "warm_idle" ? warmIdleFilter() : quietLeadFilter();
     where.push(`(${a.sql})`);
     args.push(...a.args);
   }
@@ -658,7 +668,7 @@ export async function getLead(actor: Actor, id: number) {
 
 /* ---------- the next step of a lead ---------- */
 export type NextStep = { task_id: number | null; label: string; action_type: string | null; step_number: number | null; step_total: number | null; due_on: string | null; window_end_on: string | null; state: "due" | "overdue" | "planned" | "blocked" | "resting" | "none"; days_overdue: number; note: string | null; text: string };
-const TYPE_LONG: Record<string, string> = { "Email 1": "First email", FU1: "Follow-up email 1", FU2: "Follow-up email 2", FU3: "Follow-up email 3", Reply: "Handle reply", "Email 1 draft": "First email draft", "FU draft": "Follow-up draft" };
+const TYPE_LONG: Record<string, string> = { "Reply FU": "Follow-up on the reply", "Email 1": "First email", FU1: "Follow-up email 1", FU2: "Follow-up email 2", FU3: "Follow-up email 3", Reply: "Handle reply", "Email 1 draft": "First email draft", "FU draft": "Follow-up draft" };
 const PREP_NOTE: Record<string, string> = { draft_needed: "draft needed", internal_review: "draft waiting for the Chief's review", user_approval_needed: "draft waiting for approval", ready_for_execution: "approved, ready to send", validation_needed: "blocked" };
 /**
  * One concrete next step per lead, computed live from its open task and its sequence: never from the free-text next_action.

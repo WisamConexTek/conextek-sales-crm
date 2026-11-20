@@ -1,4 +1,4 @@
-# ConexTek CRM — agent briefing (version 2026-11-17.1)
+# ConexTek CRM — agent briefing (version 2026-11-20.1)
 Base URL: the CRM's own address + /api/v1. Auth: header "Authorization: Bearer <your key>" (or "X-API-Key: <your key>"). Every response is {ok:true, data, request_id} or {ok:false, error, code, request_id}.
 Re-read this guide (GET /api/v1/guide) at the start of each run; if "version" changed, behaviour changed. Full reference for humans: /api-docs. Machine-readable: GET /api/v1/openapi.json (OpenAPI 3.1, no key needed).
 
@@ -56,6 +56,22 @@ GET /sequences (steps, weekend days, a preview, how many leads are enrolled). Ow
 Backfill for leads contacted before sequences existed: POST /sequences/backfill {dry_run:true} lists every contacted lead with no reply and what would be planned, and creates nothing. {dry_run:false} commits at most 40 leads per call; repeat until remaining is 0. Every overdue step becomes a late follow-up on its original thread, labelled LATE, with no age cutoff. Tasks start at draft_needed; nothing is sent or authorized. Leads in no campaign are included and flagged.
 Suppression list: GET /suppressions; POST /suppressions/import {entries:[{email | domain, kind: dnc|opt_out|bounce, occurred_at, source, note}], dry_run} (dry run by default, idempotent, reports matching contacts); DELETE /suppressions/{id}?reason= (Owner only).
 Compliance monitor: an account with the "compliance" preset reads everything and changes nothing. Every POST, PUT, PATCH or DELETE from it returns 403 with code read_only and is logged. GET /compliance/report?date= has four sections: follow-ups due and not sent (with the state: no draft, waiting for editorial review, waiting for send approval, approved but not sent, pushed by the daily cap), active contacted leads with no next step, stalled drafts, and replies not handled in time. GET /sends now also returns the subject and body as sent, the evidence, the step and the labels.
+
+## Recording sends: what changed on 2026-11-20.1
+POST /sends records a send that ALREADY happened, so the daily cap never blocks it (the change history keeps daily_cap_waived). GET /sends/eligibility still includes the cap: call it before you send anything new. Every other rule still applies when you record: an active, unused SEND authorization on that exact version, opt-out, bounce, a paused sender, suppression, and reply_received.
+History sends: if sent_at is EARLIER than the opt-out, suppression or reply that now blocks the lead (the CRM needs the time of that event), the send is recorded as history: the answer has history_only:true, no sequence step is planned and no follow-up task is created. A send made after the opt-out is still refused. Use the real sent_at from Sent Items, always with an offset.
+Capacity counts EMAIL only. LinkedIn messages never use the email cap; GET /capacity shows them in linkedin_sent (per sender and in total). Each recorded send counts once. used = the sum of every campaign's used + used_unassigned (used_unassigned is part of used, not on top of it).
+Safe recovery: POST /sends is idempotent by event_id. If the answer is status SENT_CONFIRMED_CRM_PENDING (stop_further_sends:true) the email WAS sent but the CRM record is incomplete: stop the run, do not resend, and call POST /sends/{event_id}/reconcile (safe to repeat) until the status is RECORDED.
+A recorded send closes only the task it belongs to. It never closes a "handle_reply" task (or any other non-send task: revisit, add_referred_contact, choose_alternate_contact, find_contact, review_same_company) unless that send answers a reply that came BEFORE it. If a task was closed by mistake, the Owner or a Chief can reopen it: POST /tasks/{id}/reopen {reason}.
+SEND approvals: POST /authorizations (kind "send") is refused with 409 (code recipient_blocked) when the recipient opted out, is suppressed, bounced, is invalid, or (for a sequence follow-up) has replied. POST /authorizations/revoke-blocked {dry_run} (Owner or Chief) lists, and with dry_run:false withdraws, active SEND approvals that became unusable. Record any send that really happened FIRST, then withdraw the rest: a withdrawn approval can no longer be used to record.
+
+## Warm leads that went quiet (2026-11-20.1)
+Sequence follow-ups stop when a prospect replies. A lead in Interested or Replied with no open task now gets one:
+- the last reply was never answered: a "Handle reply" task for the Inbox Manager;
+- our last message has had no answer for 5 working days (reply_followup_days): a "Reply FU" task (action_type send_reply_follow_up, display_type "Reply FU") for the Outreach Writer, due now, same thread (thread_subject), same sender, draft_needed. Draft it with POST /message-versions {task_id}, permitted_action "follow_up". It is drafted, reviewed and approved like any message, and recording its send closes it;
+- after 3 such follow-ups with no answer (reply_followup_max) a "Review" task goes to the Chief to decide.
+There is no timer: tasks are planned when GET /work/plan or GET /changes is read (at most once a minute) and when a manager calls POST /sequences/reply-follow-ups {dry_run} (dry run by default). GET /leads?attention=warm_idle lists Interested or Replied leads with nothing planned. Do not create these tasks by hand.
+next_action on a lead is an old free-text note. It is NOT a task and may be out of date. Use next_step (computed from the open tasks and the sequence) on GET /leads and GET /leads/{id}; a warm lead with next_step.state "none" has nothing planned.
 
 ## Ground rules (never break)
 1. The CRM never sends, schedules, scrapes or triggers AI. You send through the browser workflow; the CRM records it.

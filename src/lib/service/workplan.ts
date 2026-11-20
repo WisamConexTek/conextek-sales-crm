@@ -3,7 +3,7 @@ import { HttpError, isManager, type Actor } from "../auth";
 import { WORK_ROLES, WORK_ROLE_LABEL, type WorkRole } from "../constants";
 import { toLocalInput } from "../format";
 import { capacityData, allocate, capKind, CAP_GROUPS, CAP_GROUP_LABEL, type CapGroup, type CapKind } from "./capacity";
-import { roleOf, roleUsers, seqSettings } from "./sequences";
+import { roleOf, roleUsers, seqSettings, ensureReplyFollowUps } from "./sequences";
 import { liveTasks } from "./taskview";
 import { enrich, type TaskRow } from "./tasklist";
 
@@ -31,7 +31,7 @@ async function compute(date: string) {
     all("SELECT id,name,status FROM campaigns WHERE status='active' ORDER BY id"),
   ]);
   const tasks = (await liveTasks(rows)).map((t) => enrich(t, today));
-  const sendType = (t: TaskRow) => /^(Email 1|FU\d|Final email)$/.test(t.display_type);
+  const sendType = (t: TaskRow) => /^(Email 1|FU\d|Final email|Reply FU)$/.test(t.display_type);
   const reservedToday = new Set<number>(capToday ? capToday.senders.flatMap((s) => [...s.reservedTasks]) : []);
   const due = (t: TaskRow) => t.due_day ?? t.scheduled_day;
   const inDay = (t: TaskRow) => { const d = due(t); return !!d && d <= date && !reservedToday.has(t.id as number); };
@@ -112,6 +112,7 @@ export async function workPlan(actor: Actor, o: { date?: string | null; role?: s
     if (!mine) throw new HttpError(403, "Your account has no role in the work plan. Ask the Owner to map it in Settings.");
     role = mine;
   }
+  await ensureReplyFollowUps();
   const p = await compute(date);
   const senders = o.sender_id ? p.senders.filter((s) => s.sender.id === o.sender_id) : p.senders;
   const shortfalls = await syncShortfalls(date === addDays(today, 1) ? p : undefined);
