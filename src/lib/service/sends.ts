@@ -304,13 +304,19 @@ export async function revoke(actor: Actor, authId: number) {
 }
 
 /* ---------- eligibility ---------- */
-export async function checkEligibility(actor: Actor, versionId: number) {
+/**
+ * `recording: true` is used when a send that ALREADY happened is being written down. The daily cap is a rule for deciding whether to send,
+ * so it never blocks recording what really went out (it is reported in `cap_waived` instead). Every other rule still applies.
+ */
+export async function checkEligibility(actor: Actor, versionId: number, opts: { recording?: boolean } = {}) {
   const v = await one("SELECT * FROM message_versions WHERE id=?", [versionId]);
   if (!v) throw new HttpError(404, "Message version not found.");
   await assertLeadAccess(actor, v.lead_id as number);
-  const core = await eligibilityCore(v);
+  const full = await eligibilityCore(v);
+  const keep = full.codes.map((c) => !(opts.recording && c === "daily_cap_reached"));
+  const core = { ...full, codes: full.codes.filter((_, i) => keep[i]), reasons: full.reasons.filter((_, i) => keep[i]), cap_waived: full.codes.length !== full.codes.filter((_, i) => keep[i]).length };
   const reasons = [...(!can(actor, "message.record_sent") ? ["you do not have message.record_sent, so this send could not be recorded"] : []), ...core.reasons];
-  return { eligible: reasons.length === 0, reasons, codes: core.codes, warnings: core.warnings, authorization_id: core.authorization_id, message_version_id: versionId };
+  return { eligible: reasons.length === 0, reasons, codes: core.codes, warnings: core.warnings, authorization_id: core.authorization_id, message_version_id: versionId, cap_waived: core.cap_waived };
 }
 
 /**
@@ -587,7 +593,8 @@ export async function confirmSend(actor: Actor, input: unknown) {
   const v = await one("SELECT * FROM message_versions WHERE id=?", [d.message_version_id]);
   if (!v) throw new HttpError(400, "message_version_id: unknown version.");
   await assertLeadAccess(actor, v.lead_id as number);
-  const el = await checkEligibility(actor, d.message_version_id);
+  // The email is already out: the daily cap must not stop it being recorded (it still counts toward the day's total).
+  const el = await checkEligibility(actor, d.message_version_id, { recording: true });
   if (!el.eligible) { const e = new HttpError(409, `Not sent-eligible: ${el.reasons.join("; ")}.`); throw e; }
   // Atomic claim: only one worker can ever consume an authorization.
   const claim = await run("UPDATE send_authorizations SET status='used', used_at=? WHERE id=? AND status='active'", [now(), el.authorization_id]);
@@ -606,7 +613,7 @@ export async function confirmSend(actor: Actor, input: unknown) {
     throw e;
   }
   await run("UPDATE send_authorizations SET send_event_id=(SELECT id FROM send_events WHERE event_id=?) WHERE id=?", [d.event_id, el.authorization_id]);
-  await audit(actor, "confirm_send", "message_version", d.message_version_id, { event_id: d.event_id, authorization_id: el.authorization_id });
+  await audit(actor, "confirm_send", "message_version", d.message_version_id, { event_id: d.event_id, authorization_id: el.authorization_id, ...(el.cap_waived ? { daily_cap_waived: true } : {}) });
   return recordEvent(actor, d.event_id);
 }
 

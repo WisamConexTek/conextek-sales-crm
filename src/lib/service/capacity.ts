@@ -45,7 +45,7 @@ const SENDER_SQL = "COALESCE(a.sender_id, se.sender_id, 1)";
 export async function sentOn(ymd: string) {
   const [from, to] = dayRange(ymd);
   const rows = await all(
-    `SELECT ${SENDER_SQL} AS sender_id, COALESCE(se.campaign_id, (SELECT lc.campaign_id FROM lead_campaigns lc WHERE lc.lead_id=a.lead_id AND lc.status='active' ORDER BY lc.id DESC LIMIT 1)) AS campaign_id, COUNT(*) AS n
+    `SELECT ${SENDER_SQL} AS sender_id, COALESCE(se.campaign_id, (SELECT lc.campaign_id FROM lead_campaigns lc WHERE lc.lead_id=a.lead_id AND lc.status='active' ORDER BY lc.id DESC LIMIT 1)) AS campaign_id, COUNT(DISTINCT a.id) AS n
      FROM activities a LEFT JOIN send_events se ON se.activity_id=a.id
      WHERE a.type='message' AND a.outcome='sent' AND a.is_demo=0 AND a.occurred_precision='time' AND a.occurred_at>=? AND a.occurred_at<? GROUP BY 1,2`, [from, to]);
   const per = new Map<number | null, number>();
@@ -212,6 +212,7 @@ export async function capacityFor(date?: string) {
     daily_cap: totalCap, unlimited, used: used.total, reserved: reservedTotal,
     remaining: unlimited ? null : sendersOut.reduce((a, b) => a + (b.remaining ?? 0), 0),
     cap_reached: capped.length > 0 && !unlimited && capped.every((x) => x.used >= (x.daily_cap as number)),
+    // used_unassigned is part of used (sends with no campaign), not in addition to it: used = the sum of every campaign's used + used_unassigned.
     used_unassigned: used.per.get(null) ?? 0,
     priority_order: CAP_GROUPS.map((g, i) => ({ position: i + 1, group: g, label: CAP_GROUP_LABEL[g] })), late_daily_limit: (await seqSettings()).late_daily_limit,
     rules: "Capacity is per sender (Asia/Hebron day). used = messages recorded as sent that day from that sender. reserved = approved (Owner send authorization active) tasks due that day, taking the sender's remaining capacity in this order: follow-ups inside their window (soonest window end first), overdue follow-ups up to 7 days late (oldest first), the protected first-email minimum (first_email_floor), late backfill items up to late_daily_limit, then the remaining first emails. Campaign priority (China, then US, then Gulf by default) applies inside each group. A follow-up only ever uses its own sender's capacity. Tasks that do not fit are listed in pushed_to_next_day and are blocked with daily_cap_reached. remaining = cap - used - reserved. A sender with a warm-up schedule has cap 0 before its first step.",

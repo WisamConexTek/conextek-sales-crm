@@ -310,6 +310,25 @@ async function main() {
   const fu = await D.loadFollowUps();
   ok(fu.overdue >= 2 && fu.rows.length >= 1 && typeof fu.noNextStep === "number" && typeof fu.repliesWaiting === "number", "the dashboard counts overdue follow-ups per sender, leads with no next step and replies waiting");
 
+  console.log("16. Recording a send that already happened is never blocked by the daily cap");
+  await run("UPDATE senders SET daily_cap=1 WHERE id=1");
+  const cpA = await mk("Cap Alpha"), cpB = await mk("Cap Bravo");
+  const capSent = await Promise.all([cpA, cpB].map(async (l) => (await send(l, canton, "first_email", { noSend: true })).v));
+  const before = await CAP.capacityFor();
+  const used0 = before.senders.find((x) => x.sender_id === 1)!.used;
+  const over = await S.checkEligibility(owner, capSent[0], { recording: false });
+  const rec = await S.checkEligibility(owner, capSent[0], { recording: true });
+  ok(rec.eligible && !rec.codes.includes("daily_cap_reached") && (rec.cap_waived === (over.codes.includes("daily_cap_reached"))), "the cap is ignored when recording, and still applies when asking whether to send");
+  const r1 = await S.confirmSend(writer, { event_id: "ev-cap-1", message_version_id: capSent[0], sent_at: new Date(Date.now() - 3 * 3600000).toISOString(), evidence: "<cap1@outlook>" }) as Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
+  const r2 = await S.confirmSend(writer, { event_id: "ev-cap-2", message_version_id: capSent[1], sent_at: new Date(Date.now() - 2 * 3600000).toISOString(), evidence: "<cap2@outlook>" }) as Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
+  ok(r1.status === "RECORDED" && r2.status === "RECORDED" && r1.sequence.next_task_id && r2.sequence.next_task_id, "both over-cap sends are recorded and their follow-up tasks are created from the real times");
+  const after = await CAP.capacityFor();
+  const s1 = after.senders.find((x) => x.sender_id === 1)!;
+  ok(s1.used === used0 + 2 && after.used === used0 + 2 + (after.senders.filter((x) => x.sender_id !== 1).reduce((a, x) => a + x.used, 0)), "each recorded send counts exactly once in the day's total");
+  const byCampaign = after.campaigns.reduce((a, c) => a + c.used, 0) + after.used_unassigned;
+  ok(byCampaign === after.used, "used = every campaign's used + used_unassigned (no double counting)");
+  ok(over.codes.includes("daily_cap_reached") && Number((await one("SELECT COUNT(*) AS n FROM audit_log WHERE action='confirm_send' AND detail LIKE '%daily_cap_waived%'"))!.n) >= 1, "the cap really was reached, and the waiver is kept in the change history");
+
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 }
